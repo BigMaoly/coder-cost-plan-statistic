@@ -148,6 +148,10 @@ my-kimicode-statistic web
 
 ![剩余额度模式](pic/260908-13-quota-remaining.png)
 
+在「记录」页面中点击记录，可以看到对你这套餐**本次统计的消耗和 API 消耗估价**，以及对套餐**一个月总 token 的估计**。
+
+![额度估计记录](pic/260908-14-quota-record.png)
+
 
 
 
