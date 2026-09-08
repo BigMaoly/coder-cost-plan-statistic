@@ -92,6 +92,10 @@ my-kimicode-statistic web
 
 ![提供商与模型映射](pic/260908-04-provider-model-mapping.png)
 
+你可以把你不需要显示的模型按照任意名字聚合显示。
+
+![模型聚合](pic/260908-05-model-aggregate.png)
+
 
 
 
