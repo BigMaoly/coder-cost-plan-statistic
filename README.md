@@ -128,6 +128,8 @@ my-kimicode-statistic web
 
 ![模型价格模板](pic/260908-10-price-template.png)
 
+点击「导出」时，会在 `~/.config/my-kimicode-statistic/model-price` 路径下**按照每个分组一个文件**导出你的模型价格配置信息；备份按「最多保留 3 个相同配置」滚动删除。点击「导入」时会导入最新版本。
+
 
 
 
