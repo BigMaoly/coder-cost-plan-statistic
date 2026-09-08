@@ -42,5 +42,14 @@ node bin/cli.mjs --help
 
 ![主面板首页](pic/260908-01-home.png)
 
+点击「⟳ 刷新」按钮即可完成一键数据扫描刷新（多平台增量扫描 + 当日固化），目前支持统计：**Kimi Code**、**ZCode**、**DeepSeek Harness (dsh)**、**Codex CLI**。
+
+关于两个平台的说明：
+
+- **Claude Code**：Claude 官方的多数统计数据并不存在，只有通过 **CC Switch（ccswitch）** 路由方式连接使用的数据才会被统计；
+- **Codex**：通过你配置中的 `model_provider` 参数区分提供商；但如果 Codex 走 CC Switch 路由方式连接，可能无法识别出不同的提供商。
+
+![刷新与筛选](pic/260908-02-refresh-filter.png)
+
 
 
