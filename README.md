@@ -40,16 +40,40 @@ node bin/cli.mjs --help
 
 ## 界面预览
 
+启动：
+
+```bash
+my-kimicode-statistic web
+
+# 输出下面的时你的局域网可以访问的ip地址和端口
+
+统计面板已启动（后台运行，前台不阻塞）。可访问地址：
+  http://127.0.0.1:18201
+  http://192.168.1.1:18201   # 示例：局域网内其他设备可访问的本机地址
+停止服务：my-kimicode-statistic web stop
+```
+
+---
+
 ![主面板首页](pic/260908-01-home.png)
+
+每一个柱状体都可以点击查看详细使用情况。（注意：按 提供商 赛选状态时，无法点击柱状图查看详细）
+柱状图下方两个统计区域，可以通过点击“详细”查看饼状图。
+
+---
 
 点击「⟳ 刷新」按钮即可完成一键数据扫描刷新（多平台增量扫描 + 当日固化），目前支持统计：**Kimi Code**、**ZCode**、**DeepSeek Harness (dsh)**、**Codex CLI**。
 
 关于两个平台的说明：
 
-- **Claude Code**：Claude 官方的多数统计数据并不存在，只有通过 **CC Switch（ccswitch）** 路由方式连接使用的数据才会被统计；
-- **Codex**：通过你配置中的 `model_provider` 参数区分提供商；但如果 Codex 走 CC Switch 路由方式连接，可能无法识别出不同的提供商。
+- **Claude Code**：Claude 官方的多数统计数据的关键参数不存在，目前没有写适配器，只有通过 **CC Switch（ccswitch）** 路由方式连接使用的数据才会被统计；
+- **Codex**：可以直接统计，但是你切换提供商时，记得通过你配置中的 `model_provider` 参数区分提供商。但如果 Codex 走 CC Switch 路由方式连接，可能无法识别出不同的提供商。
 
 ![刷新与筛选](pic/260908-02-refresh-filter.png)
+
+## 设置说明
+
+![设置](pic/260908-03-settings.png)
 
 
 
