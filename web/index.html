@@ -1,0 +1,1010 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>my-kimicode-statistic · 用量统计</title>
+<!--
+  my-kimicode-statistic · 用量统计面板
+  - 交互与视觉以 demos/ui-preview.html 为实现基准（用户已确认）
+  - 数据来自本服务 JSON API；Chart.js 本地 vendored，无 CDN 依赖
+-->
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    color-scheme: dark;
+    --bg: #0a1120;
+    --panel: #101a2f;
+    --panel-2: #0d1526;
+    --border: #1f2c49;
+    --text: #e7eef8;
+    --muted: #8ba0bf;
+    --teal: #2dd4bf;
+    --teal-soft: rgba(45, 212, 191, .14);
+    --radius: 14px;
+  }
+
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background:
+      radial-gradient(900px 420px at 85% -8%, rgba(45, 212, 191, .10), transparent 60%),
+      radial-gradient(700px 360px at -10% 8%, rgba(56, 189, 248, .07), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 22px 18px 40px;
+  }
+
+  .wrap { max-width: 1100px; margin: 0 auto; }
+
+  /* ===== 顶栏 ===== */
+  .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center;
+    font-size: 20px; color: var(--teal);
+    background: linear-gradient(135deg, rgba(45, 212, 191, .25), rgba(56, 189, 248, .18));
+    border: 1px solid rgba(45, 212, 191, .4);
+  }
+  .brand h1 { font-size: 19px; font-weight: 700; letter-spacing: .2px; }
+  .subtitle { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+  .top-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); padding-bottom: 4px; }
+  .badge { padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--panel-2); }
+  .badge.teal { border-color: rgba(45, 212, 191, .4); color: var(--teal); background: var(--teal-soft); }
+  .icon-btn {
+    appearance: none; width: 28px; height: 28px; border-radius: 999px; display: grid; place-items: center;
+    font-size: 14px; color: var(--muted); cursor: pointer; transition: .15s;
+    background: var(--panel-2); border: 1px solid var(--border);
+  }
+  .icon-btn:hover { color: var(--teal); border-color: rgba(45, 212, 191, .55); }
+
+  /* ===== 工具栏 ===== */
+  .toolbar {
+    display: flex; justify-content: center; align-items: center; gap: 10px; flex-wrap: wrap;
+    background: linear-gradient(180deg, rgba(31, 44, 73, .35), rgba(16, 26, 47, .65));
+    border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 16px; margin-bottom: 16px;
+    box-shadow: 0 10px 30px rgba(2, 6, 16, .35);
+  }
+  .seg { display: inline-flex; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 3px; gap: 2px; }
+  .seg button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    font-size: 13px; font-family: inherit; padding: 6px 16px; border-radius: 8px; cursor: pointer; transition: .15s;
+  }
+  .seg button:hover { color: var(--text); }
+  .seg button.active {
+    background: linear-gradient(180deg, #24365c, #1a2947); color: #fff;
+    box-shadow: inset 0 0 0 1px rgba(94, 132, 197, .45);
+  }
+  .field { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  select {
+    font-family: inherit; font-size: 13px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 6px 10px; cursor: pointer;
+  }
+  select:hover:not(:disabled) { border-color: #2c3f66; }
+  select:disabled { opacity: .45; cursor: not-allowed; }
+  #providerSel, #modelSel { min-width: 170px; }
+  #toolSel { min-width: 132px; }
+  #yearSel { min-width: 96px; }
+  .divider { width: 1px; height: 22px; background: var(--border); }
+
+  .btn {
+    appearance: none; font-family: inherit; font-size: 13px; border-radius: 9px;
+    cursor: pointer; padding: 7px 14px; transition: .15s;
+  }
+  .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+  .btn.ghost:hover { color: var(--text); border-color: #2c3f66; }
+  .btn.primary {
+    border: 1px solid rgba(45, 212, 191, .5); color: #d9fff8;
+    background: linear-gradient(180deg, rgba(45, 212, 191, .28), rgba(45, 212, 191, .14));
+  }
+  .btn.primary:hover:not(:disabled) { background: linear-gradient(180deg, rgba(45, 212, 191, .4), rgba(45, 212, 191, .2)); }
+  .btn.primary:disabled { opacity: .6; cursor: wait; }
+  .btn.danger { background: transparent; border: 1px solid rgba(251, 113, 133, .45); color: #fb7185; }
+  .btn.danger:hover { background: rgba(251, 113, 133, .12); }
+  .btn .ico { display: inline-block; }
+  .btn.loading .ico { animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hide { display: none !important; }
+
+  /* ===== 面板 / 图表 ===== */
+  .panel {
+    background: linear-gradient(180deg, rgba(23, 34, 58, .55), rgba(13, 21, 38, .8));
+    border: 1px solid var(--border); border-radius: var(--radius);
+    box-shadow: 0 12px 34px rgba(2, 6, 16, .4);
+    padding: 16px 18px;
+  }
+  .chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .chart-head h2 { font-size: 15px; font-weight: 600; }
+  .muted { color: var(--muted); font-size: 12px; font-weight: 400; }
+  .chart-box { position: relative; height: 400px; }
+  .chart-missing {
+    height: 100%; display: grid; place-items: center; text-align: center;
+    color: var(--muted); font-size: 13px; line-height: 1.8;
+    border: 1px dashed var(--border); border-radius: 10px; padding: 20px;
+  }
+
+  /* ===== 下钻饼图区（点击柱状图 / 今日「详细」出现） ===== */
+  .drill-panel { margin-top: 16px; }
+  .drill-panel[hidden] { display: none; }
+  .pie-box { position: relative; height: 300px; }
+  .pie-box canvas, #usageChart { cursor: pointer; }
+  /* 饼图左下角信息块：当前整个饼图范围的总计 / 命中率 / 费用（竖排三行；无已计价量时费用行隐藏） */
+  .pie-stats {
+    position: absolute; left: 14px; bottom: 12px; z-index: 2;
+    display: flex; flex-direction: column; gap: 3px;
+    font-size: 12px; color: var(--muted); pointer-events: none;
+    background: rgba(13, 21, 38, .78); border: 1px solid var(--border);
+    border-radius: 9px; padding: 8px 12px;
+  }
+  .pie-stats .v { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  .btn-detail { font-size: 12px; padding: 4px 12px; margin-left: auto; }
+  .btn-detail.active {
+    border-color: rgba(45, 212, 191, .5); color: #d9fff8;
+    background: linear-gradient(180deg, rgba(45, 212, 191, .28), rgba(45, 212, 191, .14));
+  }
+
+  /* ===== 底部汇总卡片 ===== */
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+  .card h3 { font-size: 13.5px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .dot.today { background: var(--teal); box-shadow: 0 0 8px rgba(45, 212, 191, .8); }
+  .dot.win { background: #5b8def; box-shadow: 0 0 8px rgba(91, 141, 239, .8); }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+  .stat { background: rgba(148, 163, 184, .05); border: 1px solid rgba(148, 163, 184, .12); border-radius: 10px; padding: 9px 11px; }
+  .stat .k { font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+  .stat .v { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  .stat .v.rate { color: var(--teal); }
+
+  .footnote { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.9; }
+  .footnote b { color: var(--text); }
+
+  /* ===== 设置入口弹窗（统一设置入口，后续扩展更多设置项） ===== */
+  .settings-dialog {
+    width: min(640px, 92vw); max-height: 80vh; display: flex; flex-direction: column; overflow: hidden;
+    background: linear-gradient(180deg, #101a2f, #0c1425);
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+  }
+  .settings-body { padding: 16px 18px 18px; overflow-y: auto; }
+  .settings-item {
+    display: flex; align-items: center; gap: 12px;
+    border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+    cursor: pointer; background: var(--panel-2); transition: .15s;
+  }
+  .settings-item:hover { border-color: rgba(45, 212, 191, .5); background: var(--teal-soft); }
+  .si-ico {
+    width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
+    font-size: 17px; color: var(--teal); background: var(--teal-soft);
+    border: 1px solid rgba(45, 212, 191, .35); flex: none;
+  }
+  .si-text { flex: 1; min-width: 0; }
+  .si-name { font-size: 14px; font-weight: 600; }
+  .si-desc { font-size: 12px; color: var(--muted); margin-top: 3px; line-height: 1.6; }
+  .si-meta { font-size: 11.5px; color: var(--teal); flex: none; }
+  .si-arrow { color: var(--muted); font-size: 18px; flex: none; }
+
+  /* 开关：设置条目上的全局映射启停 */
+  .switch {
+    appearance: none; width: 38px; height: 21px; border-radius: 999px; flex: none; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel-2); position: relative; transition: .18s;
+    padding: 0;
+  }
+  .switch .knob {
+    position: absolute; top: 2px; left: 2px; width: 15px; height: 15px; border-radius: 50%;
+    background: var(--muted); transition: .18s;
+  }
+  .switch.on { border-color: rgba(45, 212, 191, .55); background: rgba(45, 212, 191, .22); }
+  .switch.on .knob { left: 19px; background: var(--teal); box-shadow: 0 0 8px rgba(45, 212, 191, .7); }
+
+  /* ===== 映射配置弹窗（近全屏） ===== */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 90;
+    background: rgba(4, 9, 20, .74); backdrop-filter: blur(3px);
+    display: flex; align-items: center; justify-content: center;
+    padding: 3vh 3vw;
+  }
+  .modal-mask[hidden] { display: none; }
+  .modal {
+    width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden;
+    background: linear-gradient(180deg, #101a2f, #0c1425);
+    border: 1px solid var(--border); border-radius: 16px;
+    box-shadow: 0 30px 80px rgba(0, 0, 0, .6);
+  }
+  .modal-head { display: flex; align-items: center; gap: 12px; padding: 14px 20px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .modal-head h2 { font-size: 16px; }
+  .modal-head .spacer { margin-left: auto; }
+  .modal-body { flex: 1; display: grid; grid-template-columns: 330px 1fr; min-height: 0; }
+
+  /* ===== 对账待决确认框（rebuild-rollup-protection） ===== */
+  .reconcile-body { padding: 14px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .reconcile-item {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px;
+    background: var(--panel-2); font-size: 12.5px; cursor: pointer;
+  }
+  .reconcile-item:hover { border-color: #2c3f66; }
+  .reconcile-item input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--teal); flex: none; }
+  .reconcile-item .rc-main { flex: 1; line-height: 1.7; }
+  .reconcile-item .rc-title { font-weight: 600; }
+  .reconcile-item .rc-vals { color: var(--muted); }
+  .reconcile-item .rc-vals b { color: var(--teal); font-weight: 600; }
+  .reconcile-foot { display: flex; gap: 10px; padding: 12px 20px; border-top: 1px solid var(--border); }
+
+  .map-list { border-right: 1px solid var(--border); padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; align-content: start; }
+  .map-item { border: 1px solid var(--border); border-radius: 11px; padding: 10px 12px; cursor: pointer; background: var(--panel-2); transition: .15s; }
+  .map-item:hover { border-color: #2c3f66; }
+  .map-item.active { border-color: rgba(45, 212, 191, .55); background: var(--teal-soft); }
+  .map-item.stale { border-color: rgba(248, 113, 113, .65); background: rgba(248, 113, 113, .08); }
+  .map-item.stale:hover { border-color: rgba(248, 113, 113, .9); }
+  .map-item .mi-meta.stale-note { color: #f87171; }
+  .map-item .mi-name { font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .map-item .mi-meta { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+  .mi-del {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    cursor: pointer; font-size: 13px; padding: 2px 4px; border-radius: 6px; flex: none;
+  }
+  .mi-del:hover { color: #fb7185; background: rgba(251, 113, 133, .12); }
+  /* 条目排序 ↑/↓ 与改组按钮（entry-sort-and-template-backup） */
+  .mi-move {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    cursor: pointer; font-size: 12px; padding: 2px 4px; border-radius: 6px; flex: none;
+    font-variant-numeric: tabular-nums;
+  }
+  .mi-move:hover { color: var(--teal); background: var(--teal-soft); }
+  .mi-move:disabled { opacity: .3; cursor: not-allowed; }
+  /* 模板列表工具条（多选 / 批量改组 / 导出 / 导入）与组分节 */
+  .tpl-toolbar { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+  .tpl-toolbar .btn { flex: 1 1 auto; font-size: 12px; padding: 5px 8px; }
+  .tpl-group { margin-top: 10px; }
+  .tpl-group-head {
+    font-size: 12px; font-weight: 650; color: var(--teal);
+    padding: 4px 6px; border-bottom: 1px solid var(--border); margin-bottom: 6px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .tpl-group-count { font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tpl-ck { flex: none; accent-color: var(--teal); cursor: pointer; }
+  .map-item .mi-name { font-size: 14px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .map-item .mi-name > span { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .map-editor { padding: 18px 22px; overflow-y: auto; }
+  .ed-empty { height: 100%; display: grid; place-items: center; text-align: center; color: var(--muted); font-size: 13px; line-height: 1.9; border: 1px dashed var(--border); border-radius: 12px; padding: 20px; }
+  .ed-section { margin-bottom: 22px; }
+  .ed-section > h3 { font-size: 13px; color: var(--text); font-weight: 600; margin-bottom: 8px; letter-spacing: .3px; }
+  .ed-hint { font-size: 12px; color: var(--muted); line-height: 1.8; margin-top: 8px; }
+  .ed-hint b { color: var(--teal); font-weight: 600; }
+  input[type="text"].ed-name {
+    font-family: inherit; font-size: 14px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 8px 12px; min-width: 280px;
+  }
+  input[type="text"].ed-name:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  input[type="text"].ed-name.small { min-width: 200px; font-size: 13px; padding: 6px 10px; }
+  .ed-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  select.ed-sel { min-width: 280px; }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px; border-radius: 999px; font-size: 12.5px;
+    border: 1px solid rgba(45, 212, 191, .4); background: var(--teal-soft); color: #d9fff8;
+  }
+  .chip.plain { border-color: var(--border); background: rgba(148, 163, 184, .08); color: var(--text); }
+  .chip button {
+    appearance: none; border: 0; background: transparent; color: var(--muted);
+    cursor: pointer; font-size: 13px; padding: 0 2px; line-height: 1;
+  }
+  .chip button:hover { color: #fb7185; }
+
+  .model-row { border: 1px solid var(--border); border-radius: 11px; padding: 12px; margin-top: 10px; background: rgba(148, 163, 184, .04); }
+  .model-row.price-missing { border-color: rgba(248, 113, 113, .65); background: rgba(248, 113, 113, .08); }
+  .model-row .price-missing-tag { font-size: 11px; color: #f87171; font-weight: 600; }
+  .model-row .mr-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .model-row .mr-tag { font-size: 11px; color: var(--muted); }
+  .ed-actions { display: flex; gap: 10px; margin-top: 4px; padding-top: 14px; border-top: 1px dashed var(--border); }
+
+  /* ===== 套餐设置（对齐 demos/260905-01-plan-settings/css/plan-settings.css）===== */
+  /* 数字输入：与 ed-name 同款外观 */
+  input[type="number"].ed-name {
+    font-family: inherit; font-size: 13px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 6px 10px; min-width: 110px;
+  }
+  input[type="number"].ed-name:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  input[type="number"].ed-name.small { min-width: 90px; }
+  /* 去掉数字输入的浏览器原生增减按钮，保持视觉稿风格统一 */
+  input[type="number"].ed-name::-webkit-outer-spin-button,
+  input[type="number"].ed-name::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type="number"].ed-name { -moz-appearance: textfield; appearance: textfield; }
+
+  /* 折叠式套餐窄条目（折叠头显示 名称 / 月费 / 总额度） */
+  .plan-item {
+    border: 1px solid var(--border); border-radius: 11px; margin-top: 10px;
+    background: rgba(148, 163, 184, .04); overflow: hidden;
+  }
+  .plan-head {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 9px 12px; cursor: pointer; transition: background .15s;
+  }
+  .plan-head:hover { background: rgba(148, 163, 184, .06); }
+  .plan-head .ph-arrow { color: var(--muted); font-size: 12px; transition: transform .15s; flex: none; }
+  .plan-item.open .ph-arrow { transform: rotate(90deg); }
+  .plan-head .ph-name { font-size: 13.5px; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .plan-head .ph-fee { margin-left: auto; font-size: 13px; color: var(--teal); font-variant-numeric: tabular-nums; flex: none; }
+  .plan-head .ph-quota { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  .plan-body { display: none; padding: 12px; border-top: 1px dashed var(--border); }
+  .plan-item.open .plan-body { display: block; }
+  .plan-body .ed-row { margin-bottom: 10px; }
+  .plan-body .ed-row:last-child { margin-bottom: 0; }
+  .plan-body .mr-tag { font-size: 11px; color: var(--muted); min-width: 60px; }
+
+  /* 币种图标 / 单位后缀：币种变化时仅更新 .cur-ico 的文本（￥ ↔ $） */
+  .unit-suffix { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .cur-ico { font-style: normal; color: var(--text); }
+
+  /* 周限额 → 积分总额度估算提示 */
+  .estimate { font-size: 12px; color: var(--muted); line-height: 1.8; margin-top: 2px; }
+  .estimate b { color: var(--teal); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ===== 分段计价时段行（tiered-pricing-cost-quota，对齐 demos/260906-01-tiered-cost-quota）===== */
+  /* 条目右侧固定组：开关与删除按钮靠右（margin-left:auto），开关切换状态不位移 */
+  .mr-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; flex: none; }
+  .tier-box {
+    margin: 8px 0 2px 0; padding: 10px 12px;
+    border: 1px dashed var(--border); border-radius: 10px;
+    background: rgba(45, 212, 191, .03);
+  }
+  .tier-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 0; }
+  .tier-row + .tier-row { border-top: 1px dashed rgba(148, 163, 184, .12); }
+  .tier-no {
+    flex: none; width: 18px; height: 18px; border-radius: 50%;
+    display: grid; place-items: center;
+    font-size: 11px; color: var(--teal); background: rgba(45, 212, 191, .12);
+  }
+  /* 时段行价格输入框：收窄（约保留 40% 宽），腾出的空间给右侧时间段 */
+  .tier-price { min-width: 54px !important; width: 54px; padding: 5px 6px; }
+  .tier-rest { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  /* 行尾恒靠右固定组（plan-quota-coef-tiering 布局定稿）：剩余时段复选框 + 删除按钮，
+     与勾选状态无关始终贴行右缘（替代旧的「第一个右组成员吃 margin-left:auto」做法） */
+  .tr-right { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; flex: none; }
+  .mi-del:disabled { opacity: .35; cursor: not-allowed; }
+  /* 星期选择器（区分星期开启时每条时段行右侧）：文字 + 七个数字点选，选中态高亮 */
+  .dow-picker { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .dow-num {
+    min-width: 20px; height: 20px; padding: 0 3px; border-radius: 6px;
+    border: 1px solid var(--border); background: rgba(148, 163, 184, .06);
+    color: var(--muted); font-size: 11px; line-height: 1; cursor: pointer;
+  }
+  .dow-num:hover { border-color: rgba(45, 212, 191, .45); color: var(--text); }
+  .dow-num.on { border-color: rgba(45, 212, 191, .55); background: rgba(45, 212, 191, .18); color: var(--teal); font-weight: 600; }
+  /* 模板导入按钮（套餐模型费用行右组，开关与删除之间） */
+  .tpl-import-btn { padding: 3px 10px; font-size: 12px; }
+  /* 自定义时间段输入：两个数字框 + 冒号，配色圆角与工具栏输入一致（无外部库） */
+  .time-box {
+    display: inline-flex; align-items: center; gap: 2px;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 4px 8px;
+  }
+  .time-box:focus-within { border-color: rgba(45, 212, 191, .5); }
+  .time-box .ti {
+    width: 22px; padding: 0; border: none; background: transparent;
+    color: var(--text); font-family: inherit; font-size: 13px; text-align: center;
+    font-variant-numeric: tabular-nums;
+  }
+  .time-box .ti:focus { outline: none; }
+  .time-box .ti::placeholder { color: rgba(139, 160, 191, .45); font-size: 11px; }
+  .ti-sep { color: var(--muted); font-size: 13px; }
+
+  /* ===== 套餐额度分段计价（plan-quota-coef-tiering；视觉对齐 demos/260907-01 css/plan-quota-coef.css）===== */
+  .cq-badge {
+    padding: 2px 8px; border-radius: 999px; font-size: 11px; margin-left: 6px;
+    border: 1px solid rgba(45, 212, 191, .35); background: var(--teal-soft); color: var(--teal);
+  }
+  .cq-entry { border-color: rgba(45, 212, 191, .22); }
+  /* 系数排：常驻第二排，不随分段开关消失；三项必填 */
+  .cq-coefs {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    margin-top: 10px; padding-top: 10px; border-top: 1px dashed rgba(148, 163, 184, .15);
+  }
+  .cq-tag { font-size: 11px; color: var(--teal); font-weight: 600; flex: none; }
+  .cq-item { display: inline-flex; align-items: center; gap: 5px; }
+  .cq-label { font-size: 11px; color: var(--muted); white-space: nowrap; }
+  .cq-req { font-size: 11px; color: #fbbf24; }
+  /* 系数 / 时段名称 / 倍率输入宽度（须压过 .ed-name.small 的 min-width:200px，见 demo 踩坑记录） */
+  .cq-num  { width: 76px !important; min-width: 0 !important; padding: 5px 8px; }
+  .cq-name { width: 92px !important; min-width: 0 !important; padding: 5px 8px; }
+  .cq-mult { width: 76px !important; min-width: 0 !important; padding: 5px 6px; }
+
+  /* ===== 右上角 toast ===== */
+  #toastHost { position: fixed; top: 16px; right: 16px; z-index: 99; display: flex; flex-direction: column; gap: 8px; }
+  .toast {
+    display: flex; align-items: flex-start; gap: 8px;
+    background: rgba(9, 20, 34, .96); border: 1px solid rgba(45, 212, 191, .4); color: #dcf7f1;
+    padding: 10px 14px; border-radius: 11px; font-size: 12.5px; line-height: 1.7; max-width: 380px;
+    box-shadow: 0 14px 34px rgba(0, 0, 0, .45);
+    opacity: 0; transform: translateY(-8px); transition: opacity .25s ease, transform .25s ease;
+  }
+  .toast.show { opacity: 1; transform: none; }
+  .toast .t-ico { color: var(--teal); flex: none; }
+
+  /* ===== 额度估计（tiered-pricing-cost-quota；视觉对齐 demos/260906-01 css/tiered-quota.css 第 2/3/5 节） ===== */
+  /* 弹窗层级：既有弹窗同层叠放（DOM 顺序），额度估计两级窗口依次抬高 */
+  .modal-mask.quota-mask { z-index: 91; }
+  .modal-mask.recs-mask { z-index: 92; }
+  .qp-menu { z-index: 95; }
+
+  /* 额度估计小窗口：预设条目 / 编辑子页 / 停止子页 */
+  .quota-dialog {
+    width: min(620px, 94vw); max-height: 82vh;
+    display: flex; flex-direction: column;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+    box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
+  }
+  .quota-body { padding: 14px 18px 18px; overflow-y: auto; }
+  .qp-toolbar { margin-bottom: 10px; }
+  .qp-item {
+    display: flex; align-items: center; gap: 10px;
+    border: 1px solid var(--border); border-radius: 11px;
+    background: rgba(148, 163, 184, .04);
+    padding: 10px 12px; margin-top: 8px; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .qp-item:hover { background: rgba(148, 163, 184, .08); }
+  .qp-main { flex: 1; min-width: 0; }
+  .qp-name { font-size: 13.5px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+  .qp-meta { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: 3px; }
+  .qp-status {
+    font-size: 11px; font-weight: 400; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+  }
+  .qp-status.running { color: var(--teal); border-color: rgba(45, 212, 191, .45); background: rgba(45, 212, 191, .1); }
+  .qp-status.invalid { color: #fb7185; border-color: rgba(251, 113, 133, .45); background: rgba(251, 113, 133, .1); }
+  .qp-run { flex: none; font-size: 12px; padding: 6px 12px; }
+  .qp-gear { flex: none; }
+  .qp-subhead { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .qp-subhead h3 { margin: 0; font-size: 14px; }
+  /* 提供商基础信息格（编辑页 / 停止页共用） */
+  .qp-info {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+    margin-top: 10px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: rgba(148, 163, 184, .04);
+  }
+  .qi-cell .k { font-size: 11px; color: var(--muted); }
+  .qi-cell .v { font-size: 13px; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  /* 读数模式（quota-remaining-mode）：编辑页节标题行贴行开关 + 口径关键字高亮（编辑/列表/停止三处共用） */
+  .ed-head-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .ed-head-row h3 {
+    margin: 0; font-size: 13px; color: var(--text); font-weight: 600; letter-spacing: .3px;
+    line-height: 1.4; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  }
+  .read-mode-tag {
+    font-size: 11px; font-weight: 600; padding: 0 6px; border-radius: 999px;
+    border: 1px solid; white-space: nowrap; line-height: 1.6; display: inline-flex; align-items: center;
+  }
+  .read-mode-tag.used { color: var(--teal); border-color: rgba(45, 212, 191, .45); background: rgba(45, 212, 191, .1); }
+  .read-mode-tag.remaining { color: #fbbf24; border-color: rgba(251, 191, 36, .45); background: rgba(251, 191, 36, .1); }
+  .switch:disabled { opacity: .45; cursor: not-allowed; }
+  /* 条目「设置」弹出小菜单 */
+  .qp-menu {
+    position: absolute; min-width: 108px;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .45);
+    padding: 4px; display: flex; flex-direction: column;
+  }
+  .qp-menu-item {
+    text-align: left; font-size: 12.5px; color: var(--text);
+    background: none; border: none; border-radius: 7px;
+    padding: 7px 12px; cursor: pointer;
+  }
+  .qp-menu-item:hover { background: rgba(148, 163, 184, .12); }
+  .qp-menu-item.danger { color: #fb7185; }
+
+  /* 快照记录大窗口：左侧分屏详情看板 + 右侧紧凑列表/筛选/分页 */
+  .recs-modal { width: min(1240px, 96vw); height: 92vh; }
+  .recs-body { flex: 1; display: flex; min-height: 0; }
+  .recs-detail {
+    flex: none; width: 340px; overflow-y: auto;
+    border-right: 1px solid var(--border);
+    padding: 14px 16px;
+    background: rgba(148, 163, 184, .03);
+  }
+  .rd-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+  .rd-head h3 { margin: 0; font-size: 14px; }
+  .rd-row {
+    display: flex; justify-content: space-between; gap: 12px;
+    padding: 7px 0; border-bottom: 1px dashed rgba(148, 163, 184, .12);
+    font-size: 12.5px;
+  }
+  .rd-row .k { color: var(--muted); flex: none; }
+  .rd-row .v { text-align: right; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .rd-row .v b { color: var(--teal); }
+  /* 行内说明图标：圆形感叹号 + 悬浮气泡（折算等价金额算法说明） */
+  .tip-info {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 14px; border-radius: 50%;
+    font-size: 9.5px; font-weight: 700; line-height: 1;
+    color: var(--muted); border: 1px solid var(--border);
+    cursor: help; margin-left: 6px; position: relative;
+    vertical-align: middle; user-select: none;
+  }
+  .tip-info:hover, .tip-info:focus { color: var(--teal); border-color: var(--teal); outline: none; }
+  .tip-pop {
+    position: absolute; bottom: calc(100% + 8px); right: -8px;
+    width: 292px; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 6px;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .5);
+    font-size: 11.5px; line-height: 1.7; color: var(--text); font-weight: 400;
+    text-align: left; white-space: normal; word-break: normal;
+    opacity: 0; visibility: hidden; transition: opacity .15s ease;
+    z-index: 60; cursor: default;
+  }
+  .tip-info:hover .tip-pop, .tip-info:focus .tip-pop { opacity: 1; visibility: visible; }
+  .tip-t { font-size: 12px; font-weight: 600; color: var(--teal); }
+  .tip-p { color: var(--muted); }
+  .tip-f {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    background: rgba(148, 163, 184, .08); border-radius: 6px; padding: 3px 8px;
+  }
+  /* 快照详情「套餐额度评估」区块（quota-coef-evaluation，视觉对齐 demo 260908-01） */
+  .rd-section {
+    margin-top: 12px; padding: 10px 12px 12px;
+    border: 1px solid rgba(45, 212, 191, .28); border-radius: 11px;
+    background: rgba(45, 212, 191, .045);
+  }
+  .rd-sec-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 2px; }
+  .rd-sec-head h4 { margin: 0; font-size: 13px; color: var(--text); display: inline-flex; align-items: center; }
+  .rd-sec-sub { font-size: 11px; color: var(--muted); line-height: 1.6; margin: 4px 0 8px; }
+  .qe-block { padding: 8px 0 4px; border-top: 1px dashed rgba(148, 163, 184, .14); }
+  .qe-block:first-of-type { border-top: none; }
+  .qe-title {
+    font-size: 11.5px; font-weight: 600; color: var(--teal);
+    letter-spacing: .3px; margin-bottom: 6px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .qe-title .qe-no {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; border-radius: 50%; flex: none;
+    font-size: 10px; color: #06251f;
+    background: var(--teal); font-weight: 700;
+  }
+  .qe-row {
+    display: flex; justify-content: space-between; gap: 10px;
+    font-size: 12px; padding: 3px 0; line-height: 1.55;
+  }
+  .qe-row .k { color: var(--muted); flex: none; }
+  .qe-row .v { text-align: right; font-variant-numeric: tabular-nums; word-break: break-all; }
+  .qe-row .v b { color: var(--teal); font-size: 13px; }
+  .qe-row .v .qe-unit { color: var(--muted); font-size: 11px; }
+  .qe-label-tip { display: inline-block; margin-left: 4px; }
+  .qe-note .qe-label-tip { margin-left: 4px; }
+  .qe-seg {
+    padding: 6px 9px; margin: 6px 0; border-radius: 8px;
+    border: 1px solid rgba(148, 163, 184, .16); background: rgba(148, 163, 184, .05);
+  }
+  .qe-seg .l1 {
+    display: flex; align-items: baseline; gap: 8px;
+    font-size: 12px; justify-content: space-between;
+  }
+  .qe-seg .names { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qe-seg .mult {
+    flex: none; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 11px; color: #fbbf24; font-weight: 600;
+  }
+  .qe-seg .l2 {
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 11px; color: var(--muted); margin-top: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  .qe-seg .l2 b { color: var(--teal); font-size: 12px; font-weight: 650; }
+  .qe-chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 8px; }
+  .qe-chip {
+    font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid rgba(148, 163, 184, .22); background: rgba(148, 163, 184, .07);
+    color: var(--text); white-space: nowrap;
+  }
+  .qe-chip b { color: var(--teal); font-weight: 650; }
+  .qe-alloc {
+    padding: 5px 9px; margin-top: 5px; border-radius: 8px;
+    background: rgba(148, 163, 184, .05);
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 11.5px; font-variant-numeric: tabular-nums;
+  }
+  .qe-alloc .an { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .qe-alloc .an b { color: var(--teal); }
+  .qe-alloc .av { flex: none; color: var(--muted); }
+  .qe-note { font-size: 11px; color: var(--muted); line-height: 1.7; margin-top: 8px; }
+  .qe-note b { color: var(--text); }
+  .qe-empty {
+    font-size: 11.5px; color: var(--muted); line-height: 1.7;
+    padding: 6px 9px; border-radius: 8px;
+    border: 1px dashed rgba(148, 163, 184, .2); background: rgba(148, 163, 184, .04);
+  }
+  .recs-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .recs-toolbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+  }
+  .recs-toolbar .spacer { flex: 1; }
+  .recs-checkall { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text); }
+  .recs-list { flex: 1; overflow-y: auto; padding: 8px 14px; }
+  .recs-item {
+    display: flex; align-items: center; gap: 12px;
+    padding: 7px 10px; border-radius: 9px; cursor: pointer;
+    font-size: 12.5px; transition: background .12s;
+  }
+  .recs-item:hover { background: rgba(148, 163, 184, .08); }
+  .recs-item.active { background: rgba(45, 212, 191, .1); }
+  .recs-check { flex: none; }
+  .ri-plan { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ri-price { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  .ri-mode {
+    flex: none; font-size: 11px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
+    max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ri-est { margin-left: auto; color: var(--teal); font-variant-numeric: tabular-nums; flex: none; }
+  .recs-pager {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-top: 1px solid var(--border);
+    font-size: 12.5px;
+  }
+  .recs-pager .field { display: flex; align-items: center; gap: 6px; }
+  .recs-jump { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .recs-jump .ed-name { min-width: 60px; width: 60px; padding: 4px 8px; }
+  .mr-tag { font-size: 12px; color: var(--muted); white-space: nowrap; }
+
+  @media (max-width: 860px) {
+    .recs-body { flex-direction: column; }
+    .recs-detail { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
+    .qp-info { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 760px) {
+    .cards { grid-template-columns: 1fr; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .chart-box { height: 380px; }
+    #providerSel, #modelSel { min-width: 140px; }
+    .modal-body { grid-template-columns: 1fr; }
+    .map-list { border-right: 0; border-bottom: 1px solid var(--border); max-height: 200px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">◈</div>
+      <div>
+        <h1>my-kimicode-statistic</h1>
+        <div class="subtitle">CLI 本地会话用量统计 · 多平台（Kimi Code / Codex / ZCode）</div>
+      </div>
+    </div>
+    <div class="top-meta">
+      <span class="badge teal">本地数据 · 实时口径</span>
+      <span class="badge" id="todayBadge">–</span>
+      <button type="button" class="btn ghost" id="quotaBtn"><span class="ico">◔</span> 额度估计</button>
+      <button type="button" class="icon-btn" id="settingsBtn" title="设置" aria-label="设置">⚙</button>
+    </div>
+  </header>
+
+  <!-- 工具栏：统计工具 / 视图切换 / 年份 / 级联筛选 / 刷新 -->
+  <section class="toolbar" id="toolbar">
+    <label class="field">
+      <span>统计工具</span>
+      <select id="toolSel" aria-label="统计工具"></select>
+    </label>
+
+    <div class="divider" aria-hidden="true"></div>
+
+    <div class="seg" id="viewSeg" role="group" aria-label="视图切换">
+      <button type="button" data-view="7d" class="active">7d</button>
+      <button type="button" data-view="30d">30d</button>
+      <button type="button" data-view="year">年</button>
+    </div>
+
+    <label class="field hide" id="yearField">
+      <span>年份</span>
+      <select id="yearSel" aria-label="年份"></select>
+    </label>
+
+    <div class="divider" aria-hidden="true"></div>
+
+    <label class="field">
+      <span>提供商</span>
+      <select id="providerSel" aria-label="提供商"></select>
+    </label>
+    <label class="field">
+      <span>模型</span>
+      <select id="modelSel" aria-label="模型" disabled></select>
+    </label>
+    <button type="button" class="btn ghost" id="clearBtn">清空筛选</button>
+
+    <div class="divider" aria-hidden="true"></div>
+
+    <button type="button" class="btn primary" id="refreshBtn"><span class="ico">⟳</span> 刷新</button>
+  </section>
+
+  <!-- 主图：双色堆叠柱状图 -->
+  <section class="panel">
+    <div class="chart-head">
+      <h2 id="chartTitle">最近 7 天 token 用量（不含今日）</h2>
+      <span class="muted" id="chartMeta"></span>
+    </div>
+    <div class="chart-box" id="chartBox">
+      <canvas id="usageChart" aria-label="token 用量堆叠柱状图"></canvas>
+    </div>
+  </section>
+
+  <!-- 汇总条：今日 / 窗口汇总（位于柱状图正下方、饼图下钻区上方） -->
+  <section class="cards">
+    <div class="panel card">
+      <h3><span class="dot today"></span>今日 <span class="muted" id="todayDate"></span><button type="button" class="btn ghost btn-detail" id="todayDetailBtn">详细</button></h3>
+      <div class="stats">
+        <div class="stat"><div class="k">输入</div><div class="v" id="today-input">–</div></div>
+        <div class="stat"><div class="k">输出</div><div class="v" id="today-output">–</div></div>
+        <div class="stat"><div class="k">总计</div><div class="v" id="today-total">–</div></div>
+        <div class="stat"><div class="k">命中率</div><div class="v rate" id="today-rate">–</div></div>
+      </div>
+    </div>
+    <div class="panel card">
+      <h3><span class="dot win"></span>窗口汇总 <span class="muted" id="winLabel"></span><button type="button" class="btn ghost btn-detail" id="winDetailBtn">详细</button></h3>
+      <div class="stats">
+        <div class="stat"><div class="k">输入</div><div class="v" id="win-input">–</div></div>
+        <div class="stat"><div class="k">输出</div><div class="v" id="win-output">–</div></div>
+        <div class="stat"><div class="k">总计</div><div class="v" id="win-total">–</div></div>
+        <div class="stat"><div class="k">命中率</div><div class="v rate" id="win-rate">–</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 下钻第一层：按提供商分布（点击柱状图 / 今日·窗口汇总「详细」出现） -->
+  <section class="panel drill-panel" id="providerPanel" hidden>
+    <div class="chart-head">
+      <h2 id="providerPieTitle">–</h2>
+      <span class="muted" id="providerPieMeta"></span>
+    </div>
+    <div class="chart-box pie-box">
+      <canvas id="providerPie" aria-label="按提供商分布饼图"></canvas>
+      <div class="pie-stats" id="providerPieStats">
+        <div>总计 <span class="v" id="providerPieStats-total">–</span></div>
+        <div>命中率 <span class="v" id="providerPieStats-rate">–</span></div>
+        <div>费用 <span class="v" id="providerPieStats-cost">–</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 下钻第二层：按模型分布（点击提供商扇区出现） -->
+  <section class="panel drill-panel" id="modelPanel" hidden>
+    <div class="chart-head">
+      <h2 id="modelPieTitle">–</h2>
+      <span class="muted">悬浮查看统计 · 点击扇区选中 / 再点取消</span>
+    </div>
+    <div class="chart-box pie-box">
+      <canvas id="modelPie" aria-label="按模型分布饼图"></canvas>
+      <div class="pie-stats" id="modelPieStats">
+        <div>总计 <span class="v" id="modelPieStats-total">–</span></div>
+        <div>命中率 <span class="v" id="modelPieStats-rate">–</span></div>
+        <div>费用 <span class="v" id="modelPieStats-cost">–</span></div>
+      </div>
+    </div>
+  </section>
+
+  <p class="footnote">
+    口径说明：输入 = 缓存命中（cacheRead）＋ 未命中（inputOther ＋ cacheCreation 缓存写入）；命中率 = 缓存命中输入 ÷ 总输入；总计 = 输入 ＋ 输出。
+    7d / 30d / 年三个视图均<b>不含今日</b>，今日用量见左侧「今日」卡片（未固化明细实时口径）。
+    <b>分日口径</b>：用量按模型请求<b>开始时间（本地时区）</b>计入当日；跨午夜长任务在按任务/会话归属日统计的平台（如官方控制台）中单日数值可能不同，属口径差异而非数据错误。
+    <b>统计工具</b>：日 / 月 / 年各口径按工具隔离，默认展示 kimi；可切换到其它已检测到的平台或「全部平台」汇总（同名提供商会自动标注 <b>名称(工具)</b> 区分，唯一名称不标注），切换工具时筛选与下钻自动复位。
+    <b>提供商统计映射</b>：右上角「⚙」→ 设置 →「提供商统计映射」可把不同工具 / 不同接入方式下的原始提供商与模型统一命名，仅在读取展示时归并汇总，不改变底层统计数据；条目上的开关可全局启停映射（配置保留）。单工具视图下统一提供商只汇总该工具绑定的部分，仅「全部平台」呈现跨工具完整汇总。
+    <b>下钻</b>：点击任一柱子（或今日卡片「详细」）出现该时段「按提供商分布」饼图，点击扇区继续下钻该提供商「按模型分布」；再点同一柱/扇区取消。窗口汇总卡片的「详细」展示当前整个窗口范围（多天 / 全年合并）的分布饼图。
+    「刷新」按钮执行一次各平台增量扫描并完成逐日固化、逐月归档与滚动清理。
+  </p>
+</div>
+
+<!-- 设置入口弹窗（统一设置入口，后续扩展更多设置项） -->
+<div class="modal-mask" id="settingsModal" hidden>
+  <div class="settings-dialog" role="dialog" aria-label="设置">
+    <div class="modal-head">
+      <h2>设置</h2>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="settingsCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="settings-body">
+      <div class="settings-item" id="settingsItemMapping" role="button" tabindex="0">
+        <div class="si-ico">⇄</div>
+        <div class="si-text">
+          <div class="si-name">提供商统计映射</div>
+          <div class="si-desc">把不同工具 / 不同接入方式下的原始提供商与模型统一命名，展示层归并汇总，不改变底层统计数据</div>
+        </div>
+        <span class="si-meta" id="settingsMappingMeta">–</span>
+        <button type="button" class="switch" id="mappingToggle" role="switch" aria-checked="false" title="全局启用 / 停用映射"><span class="knob"></span></button>
+        <span class="si-arrow">›</span>
+      </div>
+      <div class="settings-item" id="settingsItemPlan" role="button" tabindex="0">
+        <div class="si-ico">🗓</div>
+        <div class="si-text">
+          <div class="si-name">套餐设置</div>
+          <div class="si-desc">为映射提供商配置套餐（周期 / 费用 / 配额）、全局计费币种与模型直调价格</div>
+        </div>
+        <span class="si-meta" id="settingsPlanMeta">–</span>
+        <span class="si-arrow">›</span>
+      </div>
+      <div class="settings-item" id="settingsItemTemplate" role="button" tabindex="0">
+        <div class="si-ico">⛨</div>
+        <div class="si-text">
+          <div class="si-name">费用模板</div>
+          <div class="si-desc">维护可复用的模型价格模板（含分段与区分星期），可在套餐设置中一键导入</div>
+        </div>
+        <span class="si-meta" id="settingsTemplateMeta">–</span>
+        <span class="si-arrow">›</span>
+      </div>
+      <div class="ed-hint" style="padding:10px 2px 0">更多设置项后续加入，统一由此进入。</div>
+    </div>
+  </div>
+</div>
+
+<!-- 映射配置弹窗（近全屏） -->
+<div class="modal-mask" id="mapModal" hidden>
+  <div class="modal" role="dialog" aria-label="统计映射配置">
+    <div class="modal-head">
+      <h2>统计映射配置</h2>
+      <span class="muted">映射只影响展示层汇总命名，不改变底层扫描与统计数据</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="mapCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <aside class="map-list">
+        <button type="button" class="btn primary" id="mapAddBtn">＋ 添加提供商映射</button>
+        <div id="mapItems"></div>
+      </aside>
+      <section class="map-editor" id="mapEditor"></section>
+    </div>
+  </div>
+</div>
+
+<!-- 套餐设置弹窗（近全屏：左侧配置条目列表 + 右侧编辑器） -->
+<div class="modal-mask" id="planModal" hidden>
+  <div class="modal" role="dialog" aria-label="套餐设置">
+    <div class="modal-head">
+      <h2>套餐设置</h2>
+      <span class="muted">为映射提供商维护套餐与模型费用，作为后续配额统计 / 费用估算的基础数据</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="planCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <aside class="map-list">
+        <button type="button" class="btn primary" id="planAddBtn">＋ 添加套餐配置</button>
+        <div id="planItems"></div>
+      </aside>
+      <section class="map-editor" id="planEditor"></section>
+    </div>
+  </div>
+</div>
+
+<!-- 费用模板弹窗（cost-templates-and-weekday-pricing：近全屏，左模板列表 + 右编辑器；表单与套餐模型费用同构） -->
+<div class="modal-mask" id="templateModal" hidden>
+  <div class="modal" role="dialog" aria-label="费用模板">
+    <div class="modal-head">
+      <h2>费用模板</h2>
+      <span class="muted">可复用的价格配置，与套餐 / 映射完全独立；在套餐设置的模型费用行「导入」即可复制其价格</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="templateCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <aside class="map-list">
+        <button type="button" class="btn primary" id="tplAddBtn">＋ 添加费用模板</button>
+        <div class="tpl-toolbar">
+          <button type="button" class="btn ghost" id="tplMultiBtn">多选</button>
+          <button type="button" class="btn ghost" id="tplGroupBtn" hidden>批量改组</button>
+          <button type="button" class="btn ghost" id="tplExportBtn" title="按组导出全部模板到运行数据目录 model-price 文件夹">导出 JSON</button>
+          <button type="button" class="btn ghost" id="tplImportBtn" title="扫描 model-price 目录中的备份并合并导入">导入</button>
+        </div>
+        <div id="templateItems"></div>
+      </aside>
+      <section class="map-editor" id="templateEditor"></section>
+    </div>
+  </div>
+</div>
+
+<!-- 从模板导入小窗（套餐编辑器行内「导入」按钮）：选择模板 → 导入覆写该行价格草稿 -->
+<div class="modal-mask" id="tplImportModal" hidden>
+  <div class="settings-dialog" role="dialog" aria-label="从模板导入价格">    <div class="modal-head">
+      <h2>从模板导入价格</h2>
+      <span class="muted">仅导入价格配置，不改变当前模型名；导入后可继续调整，不保存即放弃</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="tplImportCloseBtn">取消 ✕</button>
+    </div>
+    <div class="reconcile-body">
+      <div id="tplImportList"></div>
+    </div>
+    <div class="reconcile-foot">
+      <button type="button" class="btn primary" id="tplImportGoBtn" disabled>导入所选</button>
+    </div>
+  </div>
+</div>
+
+<!-- 改组输入弹窗（模板分组：单条改组与多选批量改组共用，与面板统一风格的内置组件） -->
+<div class="modal-mask" id="tplGroupModal" hidden>
+  <div class="settings-dialog" role="dialog" aria-label="设置模板分组">
+    <div class="modal-head">
+      <h2 id="tplGroupTitle">设置 / 改组</h2>
+      <span class="muted">组名留空 = 默认组，最长 50 字符；改组不改变列表排序位置</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="tplGroupCloseBtn">取消 ✕</button>
+    </div>
+    <div class="reconcile-body">
+      <input type="text" id="tplGroupNameInput" placeholder="填写组名（留空 = 默认组）" maxlength="60" style="width:100%;box-sizing:border-box">
+      <div class="ed-hint" id="tplGroupError" style="color:#f87171;margin-top:8px;min-height:1em"></div>
+    </div>
+    <div class="reconcile-foot">
+      <button type="button" class="btn ghost" id="tplGroupCancelBtn">取消</button>
+      <button type="button" class="btn primary" id="tplGroupOkBtn">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 对账待决确认框（rebuild-rollup-protection）：维护后发现「新值大于沉淀」时弹出 -->
+<div class="modal-mask" id="reconcileModal" hidden>
+  <div class="settings-dialog" role="dialog" aria-label="对账差异确认">
+    <div class="modal-head">
+      <h2>发现统计差异待确认</h2>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="reconcileCancelBtn">取消 ✕</button>
+    </div>
+    <div class="reconcile-body">
+      <div class="ed-hint">重建对账发现以下「新扫描值大于既有沉淀」的条目，历史统计尚未改动。勾选后点「更新」按新值精确入账，或点「丢弃」永不再提示该条；先不处理可点「取消」，下次刷新会再次提示。</div>
+      <div id="reconcileList"></div>
+    </div>
+    <div class="reconcile-foot">
+      <button type="button" class="btn primary" id="reconcileApplyBtn">更新选中</button>
+      <button type="button" class="btn ghost danger" id="reconcileDiscardBtn">丢弃选中</button>
+    </div>
+  </div>
+</div>
+
+<!-- 额度估计小窗口（tiered-pricing-cost-quota）：预设列表 / 编辑子页 / 停止输入子页，body 由 app.js 渲染 -->
+<div class="modal-mask quota-mask" id="quotaModal" hidden>
+  <div class="quota-dialog" role="dialog" aria-label="额度估计">
+    <div class="modal-head">
+      <h2>额度估计</h2>
+      <span class="muted">用「官方已用额度变化量 ÷ 同期 token 消耗」反推套餐总额度对应的 token 总量</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="quotaRecsBtn"><span class="ico">🗂</span> 记录</button>
+      <button type="button" class="btn ghost" id="quotaCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="quota-body" id="quotaBody"></div>
+  </div>
+</div>
+
+<!-- 统计结果快照记录大窗口：近全屏；左侧分屏详情看板 + 右侧紧凑列表/筛选/分页 -->
+<div class="modal-mask recs-mask" id="recsModal" hidden>
+  <div class="modal recs-modal" role="dialog" aria-label="统计结果快照记录">
+    <div class="modal-head">
+      <h2>统计结果快照记录</h2>
+      <span class="muted">快照式：写入后与套餐 / 价格 / 映射配置解耦，配置变化不影响已写入记录</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="recsCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="recs-body">
+      <aside class="recs-detail" id="recsDetail" hidden></aside>
+      <section class="recs-main">
+        <div class="recs-toolbar" id="recsToolbar"></div>
+        <div class="recs-list" id="recsList"></div>
+        <div class="recs-pager" id="recsPager"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<div id="toastHost" aria-live="polite"></div>
+
+<!-- Chart.js：本地 vendored，缺失时不依赖 CDN -->
+<script src="./chart.umd.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

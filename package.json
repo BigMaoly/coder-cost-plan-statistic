@@ -1,0 +1,33 @@
+{
+  "name": "@dev-tools/my-kimicode-statistic",
+  "version": "0.17.0",
+  "description": "CLI 本地会话用量统计（多平台）：扫描 kimi/zcode 等本机用量写入 SQLite，本地 Web 面板按 统计工具/提供商/模型/日期 多维度查看，支持增量扫描与滚动固化归档",
+  "type": "module",
+  "files": [
+    "bin",
+    "src",
+    "web",
+    "README.md"
+  ],
+  "bin": {
+    "my-kimicode-statistic": "bin/cli.mjs"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node --test \"tests/*.test.js\""
+  },
+  "keywords": [
+    "kimi-code",
+    "zcode",
+    "codex",
+    "usage",
+    "statistics",
+    "sqlite"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^15.0.0"
+  }
+}
