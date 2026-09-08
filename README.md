@@ -6,17 +6,17 @@
 
 ```bash
 # 方式一：克隆仓库后全局链接（推荐）
-git clone <本仓库地址>
-cd <仓库目录>
+git clone https://github.com/BigMaoly/coder-cost-plan-statistic.git
+cd coder-cost-plan-statistic
 npm install          # 安装依赖
 npm link             # 生成全局命令 my-kimicode-statistic
 
 # 方式二：从本地目录直接全局安装
-cd <仓库目录>
+cd coder-cost-plan-statistic
 npm install -g .
 
 # 方式三：不安装，直接用 node 运行
-cd <仓库目录>
+cd coder-cost-plan-statistic
 node bin/cli.mjs --help
 ```
 
