@@ -3328,287 +3328,130 @@
       '<span class="recs-jump">跳至 <input type="number" class="ed-name small" id="recsJump" min="1" max="' + data.pages + '" value="' + data.page + '"> 页</span>';
   }
 
-  /* ================= 套餐额度评估区块（quota-coef-evaluation） =================
-   * 纯函数引擎：以快照固化的 s.eval 为唯一输入（快照式记录，不回查任何配置表）。
-   * 公式（demo 260908-01 定稿）：额度价值 v = 1 ÷ c̄，总量 = Q × v；
-   * 总量模式 ② dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t)（假设每个时段内模型比例相同，未分段模型 ×1 折进），
-   * ③ E = Σ pₜ·dₜ（pₜ 聚合时段占比；无时段归属的用量折入「基础 ×1」桶）。
-   * 时段归属按行定义四元组 key（startMin|endMin|isRest|weekdays）对齐，时段名称仅展示。
-   * 零值防护：c̄ / dₜ / E 为 0 → 对应估计显示「系数为 0，不可估」，不渲染 Infinity / NaN。 */
+  /* ================= 套餐额度评估区块（quota-coef-evaluation / quota-eval-calibration） =================
+   * 估算引擎已抽到 web/quota-eval.js（window.QuotaEval，纯函数、无 DOM、可单测）；
+   * 本文件只负责渲染。下面这组别名保持既有渲染代码的写法不变，避免大范围改名。
+   * 零值防护：c̄ / dₜ / 综合抵扣为 0 → 对应估计显示「系数为 0，不可估」，不渲染 Infinity / NaN。 */
+  const QE = window.QuotaEval;
+  const qeCoef = QE.coef, qeMult = QE.mult, qePct = QE.pct, qePoints = QE.points;
 
-  /** 时段行定义身份四元组（与 quota.js 写入侧 coefSegmentKey 同构） */
-  const qeSegKey = (t) => (t.startMin ?? '') + '|' + (t.endMin ?? '') + '|' + (t.isRest ? 1 : 0) + '|' + (t.weekdays ?? '');
-
-  const qeCoef = (n) => String(parseFloat(Number(n).toFixed(4)));
-  const qeMult = (m) => '×' + qeCoef(m);
-  const qePct = (p) => String(parseFloat(Number(p).toFixed(1)));
-  const qePoints = (n) => Number(n).toLocaleString('en-US');
-  const qeHHMM = (min) => (min == null ? '' : String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0'));
   const qeTokRange = (lo, hi) => (lo === hi ? fmtFull(lo) : fmtFull(lo) + ' ~ ' + fmtFull(hi));
   const qeNotEstimable = '<span class="qe-unit">系数为 0，不可估</span>';
-  /** 输入 : 输出 化简显示（10 : 1、7.2 : 1） */
-  const qeInOut = (a, b) => {
-    if (!(b > 0)) return '—';
-    const r = a / b;
-    return (Number.isInteger(r) ? String(r) : r.toFixed(1)) + ' : 1';
-  };
-  /** 时段行展示名：名称优先；未命名 rest → 剩余时段；未命名区间 → HH:MM~HH:MM */
-  const qeTierCap = (t) => t.name || (t.isRest ? '剩余时段' : qeHHMM(t.startMin) + '~' + qeHHMM(t.endMin));
 
-  /** 周限制月区间（与 plan.js estimatePointsRange 同构）：floor(周期÷7)×周额度 ~ ceil(周期÷7)×周额度 */
-  function qePointsRange(cycleDays, weeklyPoints) {
-    const days = Math.max(1, cycleDays || 31);
-    return { lo: Math.floor(days / 7) * weeklyPoints, hi: Math.ceil(days / 7) * weeklyPoints };
+  /* ================= 感叹号气泡浮层（fix-quota-tooltip-occlusion） =================
+   * 展示期间把 .tip-pop 节点搬入 body 级单例浮层容器（position: fixed），坐标由
+   * getBoundingClientRect 计算并按候选评分择优：不遮自身图标 > 完整容纳 > 避开其它
+   * 触发图标 > 上方优先、右缘锚定（design D1/D2/D3）——免疫 .recs-detail 滚动容器
+   * 的 overflow 裁剪；收起时搬回原 .tip-info（原父已被重渲染移除则直接丢弃）。
+   * 无 JS 时不生效，气泡回退为既有纯 CSS :hover 行为。 */
+
+  const tipLayer = document.createElement('div');
+  tipLayer.className = 'tip-float-layer';
+  document.body.appendChild(tipLayer);
+  let tipState = null;      // { trigger, pop } 当前展示状态
+  let tipHideTimer = null;  // mouseout 延迟收起：跨图标与气泡间的 8px 空隙不闪断
+
+  function tipCancelHide() { if (tipHideTimer) { clearTimeout(tipHideTimer); tipHideTimer = null; } }
+  function tipScheduleHide() { tipCancelHide(); tipHideTimer = setTimeout(hideTipPop, 120); }
+
+  /** 收起：节点搬回原父；触发图标已脱离文档（详情重渲染）则丢弃浮层内容 */
+  function hideTipPop() {
+    tipCancelHide();
+    if (!tipState) return;
+    const { trigger, pop } = tipState;
+    pop.classList.remove('open');
+    pop.style.left = '';
+    pop.style.top = '';
+    if (trigger.isConnected) trigger.appendChild(pop);
+    tipState = null;
   }
 
-  /** 快照固化的套餐额度口径 Q（写入时已按周 / 月 / 百分比映射字段，读取端直接判别） */
-  function qeQuotaSpec(quota) {
-    if (quota.quotaMode === 'percent') {
-      return { lo: 10000, hi: 10000, unit: '0.01%', isRange: false, percent: true };
-    }
-    if (quota.limitPeriod === 'week') {
-      const days = quota.cycleDays || 31;
-      const r = qePointsRange(quota.cycleDays, quota.weeklyPoints);
-      if (!(r.lo > 0)) r.lo = r.hi; // 防御：计费周期不足一周时下限为 0（与 estimateQuota 同款）
-      return {
-        lo: r.lo, hi: r.hi, unit: '分', isRange: r.lo !== r.hi, percent: false,
-        caption: '周限制 ' + qePoints(quota.weeklyPoints) + ' 分/周 × ' + Math.floor(days / 7) + '~' + Math.ceil(days / 7) + ' 周'
-      };
-    }
-    return { lo: quota.totalPoints, hi: quota.totalPoints, unit: '分', isRange: false, percent: false };
-  }
+  /** 矩形相交判定（边界相切不算压盖） */
+  const tipRectHit = (a, b) => !(a.right <= b.left + 0.5 || a.left >= b.right - 0.5 ||
+    a.bottom <= b.top + 0.5 || a.top >= b.bottom - 0.5);
 
-  /** 单模型加权基础系数 c̄ᵢ（分/K 或 0.01%/K）：按该模型 token 结构（命中/未命中/输出）加权 */
-  function qeModelCBar(coef, tokens) {
-    const total = tokens.hit + tokens.miss + tokens.output;
-    if (!(total > 0)) return 0;
-    return (tokens.hit * coef.inHit + tokens.miss * coef.inMiss + tokens.output * coef.out) / total;
-  }
-
-  /** 模型逐时段占比：pₜ = 时段三分量 ÷ 各时段合计（按模型内归一化——segments 为 ts>=启动
-   *  逐行扫描口径，与 tokens 差值（diff4）合计可不等，设计文档 §6.1 双口径约定：占比在展示端
-   *  归一化。按 tiers 配置顺序排列，未命中时段键或零分量行跳过）。
-   *  返回 {pcts: [{key, name, cap, mult, pct}], covered}（covered = 时段合计 ÷ 模型窗口 token，封顶 100，仅展示） */
-  function qeSegmentPcts(model) {
-    const total = model.tokens.hit + model.tokens.miss + model.tokens.output;
-    const segs = Array.isArray(model.segments) ? model.segments : [];
-    if (!segs.length || !(total > 0) || !Array.isArray(model.tiers)) return { pcts: [], covered: 0 };
-    const byKey = new Map(segs.map((x) => [x.key, x]));
-    const pcts = [];
-    let segSum = 0;
-    for (const t of model.tiers) {
-      const s = byKey.get(qeSegKey(t));
-      if (!s) continue;
-      const segTotal = (s.hit || 0) + (s.miss || 0) + (s.output || 0);
-      if (!(segTotal > 0)) continue;
-      segSum += segTotal;
-      pcts.push({ key: s.key, name: s.name || null, cap: qeTierCap(t), mult: t.multiplier, segTotal });
-    }
-    for (const p of pcts) p.pct = (p.segTotal / segSum) * 100;
-    return { pcts, covered: Math.min(100, (segSum / total) * 100) };
-  }
-
-  /* ══ 引擎 · 模型模式（单模型）══ */
-  function qeEvalModel(ev) {
-    const m = ev.models[0];
-    if (!m || !m.coef) return null; // 防御：无系数不渲染（正常由写入门槛保证）
-    const q = qeQuotaSpec(ev.quota);
-    if (!(q.lo > 0)) return null;
-    const tk = m.tokens;
-    const total = tk.hit + tk.miss + tk.output;
-    if (!(total > 0)) return null;
-    const cBar = qeModelCBar(m.coef, tk);
-    const zero = !(cBar > 0);
-    const v = zero ? null : 1 / cBar; // 额度价值（K / 分 或 K / 0.01%）
-    const std = {
-      cBar, v, zero,
-      tLo: v != null ? q.lo * v * 1e3 : null, // Q × v = K token → 原始 token 数
-      tHi: v != null ? q.hi * v * 1e3 : null
-    };
-    // ② 分时段总量估计（按倍率分组，同倍率共用一条、多名称共用）：vₜ = v ÷ mₜ
-    let segGroups = null;
-    if (Array.isArray(m.tiers) && m.tiers.length) {
-      const byMult = new Map(); // 倍率 → 组（保持配置首次出现顺序）
-      for (const t of m.tiers) {
-        let g = byMult.get(t.multiplier);
-        if (!g) { g = { mult: t.multiplier, captions: [] }; byMult.set(t.multiplier, g); }
-        const cap = qeTierCap(t) + (t.isRest ? '（剩余时段）' : '');
-        if (!g.captions.includes(cap)) g.captions.push(cap);
-      }
-      segGroups = [...byMult.values()].map((g) => {
-        const zeroG = zero || !(g.mult > 0); // 零倍率时段：抵扣为 0，不可估
-        const vT = zeroG ? null : v / g.mult;
-        return {
-          mult: g.mult, multText: qeMult(g.mult), nameText: g.captions.join(' / '), zero: zeroG, vT,
-          tLo: vT != null ? q.lo * vT * 1e3 : null,
-          tHi: vT != null ? q.hi * vT * 1e3 : null
-        };
-      });
-    }
-    // ③ 综合时段占比估计（需固化占比；占比按模型内归一化）：m̄ = Σ pₜ·mₜ
-    let mix = null;
-    if (segGroups) {
-      const { pcts, covered } = qeSegmentPcts(m);
-      if (pcts.length) {
-        const mBar = pcts.reduce((a, p) => a + (p.pct / 100) * p.mult, 0);
-        const zeroM = zero || !(mBar > 0);
-        const vMix = zeroM ? null : v / mBar;
-        mix = {
-          mBar, coveredPct: covered, zero: zeroM, vMix,
-          tLo: vMix != null ? q.lo * vMix * 1e3 : null,
-          tHi: vMix != null ? q.hi * vMix * 1e3 : null,
-          chips: pcts.map((p) => ({ cap: p.cap, pct: p.pct })),
-          allocs: pcts.map((p) => ({
-            cap: p.cap, pct: p.pct, multText: qeMult(p.mult),
-            tLo: vMix != null ? q.lo * vMix * (p.pct / 100) * 1e3 : null,
-            tHi: vMix != null ? q.hi * vMix * (p.pct / 100) * 1e3 : null
-          }))
-        };
+  /** 放置评分：4 候选（上/下 × 左/右锚定）→ 视口钳制（8px 边距）→ 择优落下 */
+  function placeTipPop(tip, pop) {
+    const M = 8;
+    const r = tip.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    const h = pop.offsetHeight;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const others = [...document.querySelectorAll('.tip-info')]
+      .filter((t) => t !== tip)
+      .map((t) => t.getBoundingClientRect())
+      .filter((o) => o.width > 0 && o.height > 0 && o.bottom > 0 && o.top < vh);
+    const cands = [];
+    for (const above of [true, false]) {
+      let top = above ? r.top - h - M : r.bottom + M;
+      for (const rightAnchor of [true, false]) {
+        const left = Math.min(Math.max(M, rightAnchor ? r.right + M - w : r.left - M), vw - M - w);
+        const fitsV = above ? top >= M : top + h <= vh - M;
+        top = Math.min(Math.max(M, top), Math.max(M, vh - M - h)); // 放不下钳到边界（CSS 内滚兜底）
+        const rect = { left, top, right: left + w, bottom: top + h };
+        cands.push({
+          left, top,
+          score: (tipRectHit(rect, r) ? 0 : 4000) +   // 硬约束：不遮自身触发图标
+            (fitsV ? 2000 : 0) +                      // 完整容纳优先于钳制
+            (others.some((o) => tipRectHit(rect, o)) ? 0 : 1000) + // 避开其它触发图标
+            (above ? 100 : 0) + (rightAnchor ? 10 : 0) // 视觉习惯：上方优先、右缘锚定
+        });
       }
     }
-    const hit = tk.hit + tk.miss;
-    return {
-      mode: 'model', percent: q.percent, unit: q.percent ? '0.01%/K' : '分/K', q,
-      coef: m.coef, tokens: tk, inOut: qeInOut(hit, tk.output), hitRate: hit > 0 ? tk.hit / hit : 0,
-      std, segGroups, mix,
-      hint: !segGroups ? '该模型未开启分段倍率（仅基础系数），无分时段与综合占比估计。' : null
-    };
+    cands.sort((a, b) => b.score - a.score);
+    pop.style.left = Math.round(cands[0].left) + 'px';
+    pop.style.top = Math.round(cands[0].top) + 'px';
   }
 
-  /* ══ 引擎 · 总量模式（多模型按占比加权；每个时段内模型比例相同）══ */
-  function qeEvalTotal(ev) {
-    const q = qeQuotaSpec(ev.quota);
-    if (!(q.lo > 0)) return null;
-    const withCoef = ev.models.filter((m) => m.coef);
-    if (!withCoef.length) return null; // 防御兜底（正常由写入门槛保证）
-    const grand = ev.models.reduce((a, m) => a + m.tokens.hit + m.tokens.miss + m.tokens.output, 0);
-    if (!(grand > 0)) return null;
-    const tokens = ev.models.reduce((a, m) => ({
-      hit: a.hit + m.tokens.hit, miss: a.miss + m.tokens.miss, output: a.output + m.tokens.output
-    }), { hit: 0, miss: 0, output: 0 });
-    // 逐模型：占比 pᵢ（快照固化 token 结构）、加权系数 c̄ᵢ、时段混合倍率 m̄ᵢ（未分段 = 1）
-    const parts = withCoef.map((m) => {
-      const tkTotal = m.tokens.hit + m.tokens.miss + m.tokens.output;
-      const tiers = Array.isArray(m.tiers) && m.tiers.length ? m.tiers : null;
-      const sp = tiers ? qeSegmentPcts(m) : { pcts: [], covered: 0 };
-      const mBar = sp.pcts.length
-        ? sp.pcts.reduce((a, p) => a + (p.pct / 100) * p.mult, 0)
-        : 1;
-      return { model: m.model, pct: (tkTotal / grand) * 100, cBar: qeModelCBar(m.coef, m.tokens), tiers, pcts: sp.pcts, mBar };
-    });
-    const excluded = ev.models.filter((m) => !m.coef).map((m) => m.model);
-    const cMix = parts.reduce((a, p) => a + (p.pct / 100) * p.cBar, 0);
-    const zero = !(cMix > 0);
-    const v = zero ? null : 1 / cMix;
-    const std = {
-      cMix, v, zero,
-      tLo: v != null ? q.lo * v * 1e3 : null,
-      tHi: v != null ? q.hi * v * 1e3 : null,
-      parts
-    };
-    // ② 时段并集：按行定义四元组 key 对齐各模型倍率行；dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t)（无该行 / 未分段模型 ×1 折进）
-    const union = [];
-    for (const p of parts) {
-      if (!p.tiers) continue;
-      for (const t of p.tiers) {
-        const key = qeSegKey(t);
-        let u = union.find((x) => x.key === key);
-        if (!u) { u = { key, entries: [] }; union.push(u); }
-        u.entries.push({ part: p, mult: t.multiplier, cap: qeTierCap(t), name: t.name || null });
-      }
-    }
-    let segGroups = null;
-    let mix = null;
-    if (union.length) {
-      const rows = union.map((u) => {
-        let d = 0;
-        for (const p of parts) {
-          const hitE = u.entries.find((e) => e.part === p);
-          d += (p.pct / 100) * p.cBar * (hitE ? hitE.mult : 1);
-        }
-        const names = [];
-        for (const e of u.entries) if (e.name && !names.includes(e.name)) names.push(e.name);
-        return {
-          key: u.key, d,
-          nameText: names.join(' / '),
-          capText: [...new Set(u.entries.map((e) => e.cap))].join(' / '),
-          modelTip: u.entries.map((e) => e.part.model + ' ' + qeMult(e.mult)).join(' · ')
-        };
-      }).sort((a, b) => b.d - a.d);
-      // 综合抵扣相同的时段合并为一条记录（多名称共用）
-      const byD = new Map();
-      for (const r of rows) {
-        let g = byD.get(r.d);
-        if (!g) { g = { d: r.d, nameTexts: [], modelTips: [] }; byD.set(r.d, g); }
-        for (const n of r.nameText.split(' / ')) if (n && !g.nameTexts.includes(n)) g.nameTexts.push(n);
-        if (!g.modelTips.includes(r.modelTip)) g.modelTips.push(r.modelTip);
-      }
-      segGroups = [...byD.values()].map((g) => {
-        const zeroG = zero || !(g.d > 0);
-        const vT = zeroG ? null : 1 / g.d;
-        return {
-          d: g.d, zero: zeroG, vT,
-          nameText: g.nameTexts.join(' / '),
-          modelTip: g.modelTips.join(' · '),
-          tLo: vT != null ? q.lo * vT * 1e3 : null,
-          tHi: vT != null ? q.hi * vT * 1e3 : null
-        };
-      });
-      // ③ E = Σ pₜ·dₜ（pₜ = Σ pᵢ·pᵢ,ₜ 聚合时段占比）+ 基础桶（无时段归属用量按整体占比 ×1）
-      const dByKey = new Map(rows.map((r) => [r.key, r.d]));
-      const agg = new Map();
-      let coveredW = 0;
-      for (const p of parts) {
-        for (const sp of p.pcts) {
-          const w = (p.pct / 100) * (sp.pct / 100);
-          coveredW += w;
-          const a = agg.get(sp.key);
-          if (a) { a.pct += w * 100; continue; }
-          const u = union.find((x) => x.key === sp.key);
-          const names = [];
-          for (const e of u.entries) if (e.name && !names.includes(e.name)) names.push(e.name);
-          agg.set(sp.key, {
-            pct: w * 100, d: dByKey.get(sp.key) ?? 0,
-            cap: names.join(' / ') || [...new Set(u.entries.map((e) => e.cap))].join(' / ')
-          });
-        }
-      }
-      const baseW = 1 - coveredW; // 无时段归属（未分段 / 窗口内无命中 / 未配置系数）模型的占比
-      const dBase = cMix; // 基础桶综合抵扣 = 整体模型占比 × 各自基础系数（×1）
-      let E = [...agg.values()].reduce((a, x) => a + (x.pct / 100) * x.d, 0);
-      if (baseW > 1e-9) E += baseW * dBase;
-      const zeroE = zero || !(E > 0);
-      const vMix = zeroE ? null : 1 / E;
-      const segAllocOf = (cap, pct, d) => ({
-        cap, pct, dText: qeCoef(d),
-        tLo: vMix != null ? q.lo * vMix * (pct / 100) * 1e3 : null,
-        tHi: vMix != null ? q.hi * vMix * (pct / 100) * 1e3 : null
-      });
-      mix = {
-        E, zero: zeroE, vMix, coveredPct: (1 - baseW) * 100,
-        tLo: vMix != null ? q.lo * vMix * 1e3 : null,
-        tHi: vMix != null ? q.hi * vMix * 1e3 : null,
-        segAllocs: [...agg.values()].sort((a, b) => b.pct - a.pct)
-          .map((a) => segAllocOf(a.cap, a.pct, a.d))
-          .concat(baseW > 1e-9 ? [segAllocOf('基础（×1 · 未配置系数 / 无时段数据）', baseW * 100, dBase)] : []),
-        modelAllocs: parts.map((p) => ({
-          model: p.model, pct: p.pct, mBarText: qeMult(p.mBar),
-          tLo: vMix != null ? q.lo * vMix * (p.pct / 100) * 1e3 : null,
-          tHi: vMix != null ? q.hi * vMix * (p.pct / 100) * 1e3 : null
-        }))
-      };
-    }
-    const hit = tokens.hit + tokens.miss;
-    const coveredPct = parts.reduce((a, p) => a + p.pct, 0);
-    return {
-      mode: 'total', percent: q.percent, unit: q.percent ? '0.01%/K' : '分/K', q,
-      tokens, inOut: qeInOut(hit, tokens.output), hitRate: hit > 0 ? tokens.hit / hit : 0,
-      std, segGroups, mix,
-      hint: excluded.length
-        ? '模型 ' + excluded.join(' / ') + ' 未配置分段抵扣系数，未参与加权（' + qePct(coveredPct) + '% 用量计入）。'
-        : null
-    };
+  /** 展示：搬移节点 → 浮层内测量 → 放置评分 → 显示 */
+  function showTipPop(tip) {
+    if (tipState?.trigger === tip) return;
+    hideTipPop();
+    const pop = tip.querySelector('.tip-pop');
+    if (!pop) return;
+    tipState = { trigger: tip, pop };
+    tipLayer.appendChild(pop);
+    pop.classList.add('open');
+    pop.style.left = '0px';
+    pop.style.top = '0px';
+    placeTipPop(tip, pop);
   }
+
+  /* 委托监听（capture）：悬浮与键盘聚焦同一入口；mouseleave 走 120ms 延迟收起 */
+  document.addEventListener('mouseover', (e) => {
+    const tip = e.target.closest('.tip-info');
+    if (tip) {
+      if (tipState?.trigger === tip) tipCancelHide();
+      else showTipPop(tip);
+      return;
+    }
+    if (e.target.closest('.tip-float-layer')) tipCancelHide(); // 移入气泡本体：取消收起
+  }, true);
+  document.addEventListener('mouseout', (e) => {
+    if (!tipState) return;
+    if (e.target.closest('.tip-info') || e.target.closest('.tip-float-layer')) tipScheduleHide();
+  }, true);
+  document.addEventListener('focusin', (e) => {
+    const tip = e.target.closest('.tip-info');
+    if (tip) showTipPop(tip);
+  }, true);
+  document.addEventListener('focusout', (e) => {
+    if (tipState && e.target.closest('.tip-info') === tipState.trigger) tipScheduleHide();
+  }, true);
+  /* 滚动 / 缩放：重定位到触发图标当前位置（含 hover 自动滚动入屏的场景）；
+   * 触发图标已脱离文档或滚出视口则收起（spec「收起或重定位」取重定位为主） */
+  function tipRelocate() {
+    if (!tipState) return;
+    const r = tipState.trigger.getBoundingClientRect();
+    if (!tipState.trigger.isConnected || r.width === 0 || r.bottom < 0 || r.top > window.innerHeight) {
+      hideTipPop();
+      return;
+    }
+    placeTipPop(tipState.trigger, tipState.pop);
+  }
+  document.addEventListener('scroll', tipRelocate, true);
+  window.addEventListener('resize', tipRelocate);
 
   /** 行内悬浮说明气泡（同 tcTip 模式：title + 行数组；f=true 为公式行） */
   function qeTip(title, lines) {
@@ -3619,19 +3462,16 @@
   }
 
   /** 区块总公式气泡（口径已定稿） */
+  /** 计算口径气泡（quota-eval-calibration：尺度由官方读数差值 ΔB 反解，系数只作比例） */
   function qeFormulaTip() {
     return qeTip('套餐额度评估 · 计算口径', [
-      { t: '符号：Q 总额度（积分制 = 月积分，周限制折算 Q下~Q上；百分比制 = 100% = 1万 × 0.01%）；A₁/A₂ 输入命中 / 未命中；B 输出；K₁/K₂/K₃ 基础抵扣系数（分/K，百分比制 0.01%/K）；mₜ 时段倍率；pₜ 时段占比；pᵢ 模型 token 占比。额度价值 v = 每 1 积分（或每 0.01%）价值的 K 数（自适应 M）。' },
-      { t: '【模型模式】' },
-      { t: '① c̄ = (A₁·K₁ + A₂·K₂ + B·K₃) ÷ (A + B)；v = 1 ÷ c̄；T_std = Q × v', f: true },
-      { t: '② vₜ = v ÷ mₜ；Tₜ = Q × vₜ（同倍率时段合并一条）', f: true },
-      { t: '③ m̄ = Σ pₜ·mₜ；v_mix = v ÷ m̄；T_mix = Q × v_mix；落位 = T_mix × pₜ', f: true },
-      { t: '【总量模式】按本次模型占比加权（未来同比例使用，且每个时段内模型比例相同）：' },
-      { t: '① c̄ᵢ 同上；c̄_mix = Σ pᵢ·c̄ᵢ；v = 1 ÷ c̄_mix；T_std = Q × v', f: true },
-      { t: '② dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t)（未分段模型 ×1 折进）；vₜ = 1 ÷ dₜ；Tₜ = Q × vₜ', f: true },
-      { t: '③ E = Σ pₜ·dₜ（按时段占比加权综合抵扣）；v_mix = 1 ÷ E；T_mix = Q × v_mix', f: true },
-      { t: '③ 落位：时段 = T_mix × pₜ；模型 = T_mix × pᵢ', f: true },
-      { t: '注：输入输出比与命中率隐含在 A₁/A₂/B 中，与「折算等价金额」同口径；系数或倍率为 0 的估计显示「不可估」。' }
+      { t: '符号：Q 总额度（积分制 = 月积分，周限制折算 Q下~Q上；百分比制 = 100% = 1万 × 0.01%）；ΔB 官方读数差值（本次窗口实际消耗）；A₁/A₂ 输入命中 / 未命中；B 输出；N = A₁+A₂+B；K₁/K₂/K₃ 基础抵扣系数（**只取比例**）；mₜ 时段倍率；pₜ 时段占比；pᵢ 模型 token 占比；𝔼 输出当量 = W ÷ K₃。' },
+      { t: '核心：各厂家除数并不统一（÷1000 / ÷10000 / 不除），故绝对尺度由 ΔB 反解，不靠系数绝对值。' },
+      { t: '统一通式：T(m) = Q · N · m̄ ÷ (ΔB · m)　m = 1 基准 / mₜ 时段 / m̄ 本次分布', f: true },
+      { t: '【模型模式】m̄ = Σ pₜ·mₜ + p₀（p₀ = 未归桶占比，按 ×1 计）；① T_obs = Q · N ÷ ΔB；② Tₜ = T₀ ÷ mₜ（T₀ = T_obs × m̄）；③ 落位 = T_obs × pₜ', f: true },
+      { t: '【总量模式】W = Σ c̄ᵢ·Nᵢ；c̄_mix = W ÷ N；m̄ = Σ Wᵢ·m̄ᵢ ÷ W（精确式）；dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t)（未分段模型 ×1 折进）；② Tₜ = T₀ × c̄_mix ÷ dₜ', f: true },
+      { t: '体检：实测单位消耗 c_obs = ΔB ÷ (𝔼 ÷ 1000)；反解厂家除数 D_impl = W · m̄ ÷ ΔB（应接近 1 / 1000 / 10000）', f: true },
+      { t: '① 实测口径 ≡ 基础信息区「估算总 token」（官方读数反推）；系数为 0 只影响系数相关行，不影响总量。' }
     ]);
   }
 
@@ -3639,14 +3479,22 @@
     (tip ? '<span class="qe-label-tip">' + tip + '</span>' : '') +
     '</span><span class="v">' + v + '</span></div>';
 
-  /** 顶部「计算输入」小节（对齐 demo：行内只保留短标签与结果，结构明细收 tip） */
+  /** 数值去除多余尾零（ΔB / 系数等非整数展示） */
+  const qeNum = (n) => (n == null || !isFinite(n)) ? '—' : String(parseFloat(Number(n).toFixed(4)));
+
+  /** 顶部「计算输入」小节（行内只保留短标签与结果，结构明细收 tip） */
   function qeInputsHtml(view) {
+    const qUnit = view.percent ? '0.01%' : '分';
+    // 实测额度价值 v_obs = N ÷ ΔB：只依赖 token 与官方读数，与基础系数无关
+    // K 量纲补全（D5）：fmtFull <1000 无后缀时行内补 K，已带 K/M/B 后缀则直接接额度单位（避免 KK）
+    const vUnit = (s) => (/[0-9]$/.test(s) ? 'K' : '') + '/' + qUnit;
     const vText = view.std.v != null
-      ? '<b>≈ ' + fmtFull(view.std.v) + (view.percent ? '/0.01%' : '/分') + '</b>'
-      : qeNotEstimable;
-    const vTip = qeTip('额度价值 v', [
-      { t: 'v = 1 ÷ c̄（单位：K token / ' + (view.percent ? '0.01%' : '分') + '）', f: true },
-      { t: '总量 = 总额度 Q × v；K/M 自适应（≥1000K 显示 M）' }
+      ? '<b>≈ ' + fmtFull(view.std.v) + vUnit(fmtFull(view.std.v)) + '</b>'
+      : '<span class="qe-unit">无法校准</span>';
+    const vTip = qeTip('实测额度价值 v_obs', [
+      { t: 'v_obs = N ÷ ΔB（按本次 token 结构实测）', f: true },
+      { t: 'N = 窗口 token 三分量合计；ΔB = 官方读数差值；K/M 自适应（≥1000K 显示 M）' },
+      { t: '系数只作比例、绝对尺度由官方读数反解 → 本行不依赖基础系数，系数为 0 时照常显示' }
     ]);
     let html = '<div class="qe-block"><div class="qe-title"><span class="qe-no">入</span>计算输入（快照固化）</div>';
     if (view.mode === 'model') {
@@ -3662,13 +3510,36 @@
         ' <span class="muted">c̄ ' + qeCoef(p.cBar) + '</span></span>').join('') +
         '<span class="qe-label-tip">' + qeTip('模型占比 pᵢ 与 各自加权系数 c̄ᵢ', [
           { t: 'pᵢ = 模型 i 的 token 占比（快照固化，未配置系数的模型不参与加权）', f: true },
-          { t: 'c̄ᵢ = (A₁·K₁ + A₂·K₂ + B·K₃) ÷ (A + B)，按该模型自己的 token 结构加权', f: true }
+          { t: 'c̄ᵢ = (A₁·K₁ + A₂·K₂ + B·K₃) ÷ (A + B)，按该模型自己的 token 结构加权', f: true },
+          { t: '系数只作权重：① 实测总量与模型占比无关，② 各时段行的相对关系才用它' }
         ]) + '</span></div>' +
         qeRow('整体 输入 : 输出 ／ 命中率', view.inOut + ' ／ ' + (view.hitRate * 100).toFixed(1) + '%',
           qeTip('整体 token 结构（各模型合并口径）', [
             { t: 'A₁ ' + fmtFull(view.tokens.hit) + ' · A₂ ' + fmtFull(view.tokens.miss) + ' · B ' + fmtFull(view.tokens.output) },
             { t: '整体命中率 = A₁ ÷ (A₁ + A₂)', f: true }
           ]));
+    }
+    // 官方读数差值（校准锚）：缺失/不可得时整块走「无法校准」
+    html += qeRow('官方读数差值 ΔB',
+      view.delta
+        ? '<b>' + qePoints(view.delta.value) + '</b> <span class="qe-unit">' + qUnit +
+          (view.delta.source === 'derived' ? '（由既有列反推）' : '') + '</span>'
+        : '<span class="qe-unit">不可得</span>',
+      qeTip('官方读数差值 ΔB', [
+        { t: 'ΔB = 本次窗口官方读数的差值（已用模式：结束 − 起始；剩余模式：起始剩余 − 结束剩余）', f: true },
+        view.delta && view.delta.source === 'derived'
+          ? { t: '本快照为本能力上线前生成（无固化的 ΔB）→ 由既有列反解 ΔB ≈ N × Q上 ÷ 估算总 token上，误差 ≤ 5e-5' }
+          : { t: '写入时按原值固化（不经过百分比四舍五入，故比由消耗占比反推更精确）' },
+        { t: '厂家除数（÷1000 / ÷10000 / 不除）不参与计算，尺度由本值反解' }
+      ]));
+    // 实测单位消耗（按输出当量口径）：仅当 ΔB 与 K₃ 都可得出
+    if (view.std.cObs != null) {
+      html += qeRow('实测单位消耗', qeCoef(view.std.cObs) + ' <span class="qe-unit">' + qUnit + ' / K 输出当量</span>',
+        qeTip('实测单位消耗 c_obs', [
+          { t: 'c_obs = ΔB ÷ (𝔼 ÷ 1000) = ' + qeNum(view.delta.value) + ' ÷ (' + fmtFull(view.std.Eout) + ' ÷ 1000)', f: true },
+          { t: '𝔼 = W ÷ K₃ = 输出当量 token（把命中/未命中按系数比例折算成等价输出 token）' },
+          { t: '含义：每 1000 个「输出当量 token」实测扣掉多少额度' }
+        ]));
     }
     return html + qeRow(view.percent ? '额度价值（每 0.01%）' : '额度价值（每 1 分）', vText, vTip) + '</div>';
   }
@@ -3687,58 +3558,91 @@
     return html;
   }
 
-  /** 交叉验证括注：③ 与既有「估算总 token」（官方读数反推）在系数口径一致时应吻合 */
-  function qeCrossNote(s, tLo) {
-    if (tLo == null || typeof s.estTotal !== 'object') return '';
-    const lo = s.estTotal.lo;
-    if (!(lo > 0) || Math.abs(tLo - lo) / lo >= 0.02) return '';
-    return '<div class="qe-note">交叉验证：与「估算总 token」（官方读数反推 ' + fmtMaybeRange(s.estTotal, fmtFull) +
-      '）吻合——套餐系数配置与官方扣分口径一致。</div>';
+  /** 偏差告警：① 实测口径与基础信息区「估算总 token」（官方读数反推）应一致；
+   *  校准路径下二者同源（相对偏差 ~0），正常静默；偏差 ≥ 2% 时提示核对读数 / 周额度 / 计费周期 */
+  function qeCrossWarn(s, std) {
+    if (!std || std.tLo == null) return '';
+    const est = s.estTotal;
+    const lo = est && typeof est === 'object' ? est.lo : est;
+    if (!(lo > 0)) return '';
+    const dev = Math.abs(std.tLo - lo) / lo;
+    if (dev < 0.02) return '';
+    return '<div class="qe-note">核对提示：与「估算总 token」（官方读数反推 ' + fmtMaybeRange(s.estTotal, fmtFull) +
+      '）相差 ' + (dev * 100).toFixed(1) + '%（≥2%）—— 请核对本次读数、周额度或计费周期。</div>';
   }
 
   /** 快照详情「套餐额度评估」区块（s.eval 存在时渲染；返回 '' 整块不出现） */
   function evalSectionHtml(s) {
     const ev = s.eval;
     if (!ev || !Array.isArray(ev.models) || !ev.models.length) return '';
-    const view = ev.mode === 'total' ? qeEvalTotal(ev) : qeEvalModel(ev);
+    // 引擎需要快照列的 estTotal（仅用于旧评估数据反解 ΔB）
+    const ctx = { estTotal: s.estTotal };
+    const view = ev.mode === 'total' ? QE.evalTotal(ev, ctx) : QE.evalModel(ev, ctx);
     if (!view) return '';
     const head = '<div class="rd-sec-head"><h4>套餐额度评估</h4>' + qeFormulaTip() + '</div>' +
       '<div class="rd-sec-sub">' + (view.mode === 'model'
-        ? '本套餐配置了「套餐额度分段计价」；按快照固化的单模型 token 结构与时段占比、基础抵扣系数估算。'
-        : '总量模式：本次统计跨多个模型。按固化的<b>逐模型 token 占比</b>加权（假设未来同比例使用，且每个时段内模型比例都相同——未分段模型折进每个时段）。') +
+        ? '本套餐配置了「套餐额度分段计价」；系数按<b>比例</b>使用，绝对尺度由官方读数差值 ΔB 反解（与厂家除数是 1000 / 10000 / 不除无关）。'
+        : '总量模式：本次统计跨多个模型。① 实测总量只由 Q、ΔB 与 token 总量决定；② 各时段行的相对关系按<b>逐模型 token 占比</b>加权（未分段模型折进每个时段）。') +
       '</div>';
 
-    /* ① 标准总量估计 */
-    const stdZero = view.std.zero;
-    const vTipLine = view.std.v != null
-      ? 'v = 1 ÷ c̄ = ' + fmtFull(view.std.v) + (view.percent ? '/0.01%' : '/分')
-      : 'v = 1 ÷ c̄（c̄ = 0，不可估）';
+    // ΔB 不可得 → 只显示计算输入 + 无法校准提示（规范：SHALL NOT 渲染估计数值）
+    if (!view.delta) {
+      return '<div class="rd-section">' + head + qeInputsHtml(view) +
+        '<div class="qe-empty">' + esc(view.hint || '无法校准：官方读数差值不可得。') + '</div></div>';
+    }
+
+    /* ① 标准总量估计（实测口径） */
+    const std = view.std;
+    const quotaUnit = view.percent ? '0.01%' : '分';
     let b1 = '<div class="qe-block"><div class="qe-title"><span class="qe-no">①</span>标准总量估计' +
-      (view.mode === 'total' ? '（按模型占比加权）' : '（基础系数）') +
-      qeTip('① 标准总量 T_std', [
-        { t: view.mode === 'total' ? 'c̄_mix = Σ pᵢ·c̄ᵢ' : 'c̄ = (A₁·K₁ + A₂·K₂ + B·K₃) ÷ (A + B)', f: true },
-        { t: vTipLine, f: true },
-        { t: 'T_std = Q × v', f: true }
+      (view.mode === 'total' ? '（实测口径 · 与模型占比无关）' : '（实测口径）') +
+      qeTip('① 标准总量 T_obs（实测口径）', [
+        { t: 'T_obs = Q × N ÷ ΔB —— 与厂家除数、系数绝对值都无关', f: true },
+        { t: 'R = ' + fmtFull(view.tokens.hit + view.tokens.miss + view.tokens.output) + '（窗口 token 合计）· ΔB = ' + qeNum(view.delta.value) + ' ' + quotaUnit, f: true },
+        { t: '基准（倍率 ×1）= T_obs × m̄ = ' + qeCoef(view.mBar), f: true },
+        { t: '本行 ≡ 基础信息区「估算总 token」（官方读数反推）' }
       ].concat(view.q.isRange ? [{ t: '周限制时 Q 为区间 → 结果为区间（保守 ~ 乐观）' }] : [])) + '</div>' +
       qeQRowHtml(view);
     if (view.mode === 'model') {
       const cf = view.coef;
-      b1 += qeRow('加权抵扣系数 c̄', qeCoef(view.std.cBar) + ' <span class="qe-unit">' + view.unit + '</span>',
-        qeTip('加权抵扣系数 c̄', [
+      b1 += qeRow('加权抵扣系数 c̄',
+        (std.zero ? qeNotEstimable : qeCoef(std.cBar)) + ' <span class="qe-unit">系数单位 / token</span>',
+        qeTip('加权抵扣系数 c̄（只作权重与体检）', [
           { t: 'c̄ = (A₁·K₁ + A₂·K₂ + B·K₃) ÷ (A + B)', f: true },
           { t: '= (' + fmtFull(view.tokens.hit) + '×' + qeCoef(cf.inHit) + ' + ' + fmtFull(view.tokens.miss) + '×' + qeCoef(cf.inMiss) +
             ' + ' + fmtFull(view.tokens.output) + '×' + qeCoef(cf.out) + ') ÷ ' +
             fmtFull(view.tokens.hit + view.tokens.miss + view.tokens.output), f: true },
-          { t: 'K₁ 命中 · K₂ 未命中 · K₃ 输出（基础抵扣系数）' }
+          { t: 'K₁ 命中 · K₂ 未命中 · K₃ 输出（基础抵扣系数，只取比例）' },
+          { t: '本行不参与 ①②③ 的数值（系数等比缩放时总量不变，仅「反解厂家除数」同比变化）' }
         ]));
     } else {
-      b1 += qeRow('综合加权系数 c̄_mix', qeCoef(view.std.cMix) + ' <span class="qe-unit">' + view.unit + '</span>',
-        qeTip('综合加权系数 c̄_mix', [
-          { t: 'c̄_mix = Σ pᵢ·c̄ᵢ = ' + view.std.parts.map((p) => qePct(p.pct) + '%×' + qeCoef(p.cBar)).join(' + '), f: true }
+      b1 += qeRow('综合加权系数 c̄_mix',
+        (std.zero ? qeNotEstimable : qeCoef(std.cMix)) + ' <span class="qe-unit">系数单位 / token</span>',
+        qeTip('综合加权系数 c̄_mix（只作权重与体检）', [
+          { t: 'c̄_mix = Σ pᵢ·c̄ᵢ = ' + std.parts.map((p) => qePct(p.pct) + '%×' + qeCoef(p.cBar)).join(' + '), f: true },
+          { t: '本行不参与 ① 实测总量；② 各时段行的 dₜ 由它派生' }
         ]));
     }
-    b1 += qeRow('标准总量', stdZero ? qeNotEstimable : '≈ <b>' + qeTokRange(view.std.tLo, view.std.tHi) + '</b>',
-      qeTip('标准总量 T_std', [{ t: 'T_std = Q × v', f: true }])) + '</div>';
+    b1 += qeRow('标准总量', '≈ <b>' + qeTokRange(std.tLo, std.tHi) + '</b>',
+      qeTip('标准总量 T_obs（实测口径）', [
+        { t: 'T_obs = Q × N ÷ ΔB = ' + qeNum(view.delta.value) + ' 口径下的实测总量', f: true },
+        { t: '与「估算总 token」同源：两者由同一份读数反推' }
+      ])) +
+      qeRow('基准（倍率 ×1）', '≈ <b>' + qeTokRange(std.baseLo, std.baseHi) + '</b>',
+        qeTip('基准总量 T₀（倍率全按 ×1）', [
+          { t: 'T₀ = T_obs × m̄ = ' + fmtFull(std.tLo) + ' × ' + qeCoef(view.mBar), f: true },
+          { t: '语义：假设所有用量都落在倍率 ×1 的地方；② 各时段行由它按倍率折算' }
+        ]));
+    if (std.dImpl != null) {
+      // 只显示数值：不再尾随「整齐值 ✓ / 非整齐值」文字（判定口径见气泡，悬停可查）
+      b1 += qeRow('反解厂家除数（自检）', qeNum(std.dImpl),
+        qeTip('反解厂家除数 D_impl（体检指标）', [
+          { t: 'D_impl = W × m̄ ÷ ΔB = ' + qeNum(std.dImpl), f: true },
+          { t: '含义：把本套餐的系数按厂家口径还原时，隐含的除数（智谱 / 火山常见 10000、小米不除 = 1）' },
+          { t: '不是整齐值 → 系数单位 / 除数口径 / 读数窗口可能有一处不匹配（不影响 ①②③ 的数值）' }
+        ]));
+    }
+    b1 += '</div>';
 
     /* ② 分时段总量估计（同倍率共用一条；总量模式综合抵扣 dₜ） */
     let b2 = '';
@@ -3748,13 +3652,11 @@
         (view.mode === 'total'
           ? qeTip('② 分时段总量 Tₜ（假设整月都落在该时段，时段内模型比例同本次）', [
               { t: 'dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t)（未分段模型 ×1 折进）', f: true },
-              { t: 'vₜ = 1 ÷ dₜ', f: true },
-              { t: 'Tₜ = Q × vₜ', f: true }
+              { t: 'Tₜ = T₀ × c̄_mix ÷ dₜ（T₀ = ① 基准）', f: true }
             ])
           : qeTip('② 分时段总量 Tₜ（假设整月都落在该时段）', [
-              { t: '实际抵扣 = c̄ × mₜ', f: true },
-              { t: 'vₜ = v ÷ mₜ', f: true },
-              { t: 'Tₜ = Q × vₜ', f: true }
+              { t: 'Tₜ = T₀ ÷ mₜ（T₀ = ① 基准 = T_obs × m̄）', f: true },
+              { t: '含义：把「倍率全按 ×1」的基准，按该时段倍率整体缩放' }
             ])) + '</div>';
       b2 += view.segGroups.map((g) => {
         const rangeText = g.zero ? qeNotEstimable : '≈ <b>' + qeTokRange(g.tLo, g.tHi) + '</b>';
@@ -3763,9 +3665,8 @@
             '</span><span class="mult">' + esc(g.multText) + '</span></div>' +
             '<div class="l2"><span>' + (g.zero ? 'vₜ ' + qeNotEstimable : 'vₜ ' + fmtFull(g.vT) + (view.percent ? '/0.01%' : '/分') +
               '<span class="qe-label-tip">' + qeTip('时段 ' + g.nameText, [
-                { t: '实际抵扣 = c̄ × ' + qeCoef(g.mult) + ' = ' + qeCoef(view.std.cBar * g.mult) + ' ' + view.unit, f: true },
-                { t: 'vₜ = v ÷ ' + qeMult(g.mult) + ' = ' + fmtFull(g.vT), f: true },
-                { t: 'Tₜ = Q × vₜ', f: true }
+                { t: 'Tₜ = T₀ ÷ ' + qeMult(g.mult) + ' = ' + fmtFull(g.tLo), f: true },
+                { t: 'vₜ = 该时段每 1 个额度单位 ≈ 多少 token = Tₜ ÷ Q', f: true }
               ]) + '</span>') + '</span>' +
             '<span>' + rangeText + '</span></div></div>';
         }
@@ -3773,71 +3674,62 @@
         return '<div class="qe-seg"><div class="l1"><span class="names">' + esc(g.nameText) +
           '<span class="qe-label-tip">' + qeTip('各模型时段倍率 · ' + g.nameText, [
             { t: '各模型倍率：' + esc(g.modelTip), f: true },
-            { t: 'dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t) = ' + qeCoef(g.d) + ' ' + view.unit, f: true },
-            { t: 'vₜ = 1 ÷ dₜ = ' + (g.vT != null ? fmtFull(g.vT) : '不可估') + (view.percent ? '/0.01%' : '/分') + '；Tₜ = Q × vₜ', f: true }
+            { t: 'dₜ = Σ pᵢ·c̄ᵢ·mᵢ(t) = ' + qeCoef(g.d) + '（系数单位）', f: true },
+            { t: 'Tₜ = T₀ × c̄_mix ÷ dₜ = ' + (g.tLo != null ? fmtFull(g.tLo) : '不可估'), f: true }
           ]) + '</span></div>' +
           '<div class="l2"><span>' + (g.zero ? 'dₜ ' + qeNotEstimable : 'dₜ ' + qeCoef(g.d) + ' · vₜ ' + fmtFull(g.vT)) + '</span>' +
           '<span>' + rangeText + '</span></div></div>';
       }).join('') + '</div>';
     }
 
-    /* ③ 综合占比估计 */
+    /* ③ 综合占比估计（本次分布落位；总量 = ① 实测口径） */
     let b3 = '';
     if (view.mix) {
       const m = view.mix;
+      const totalRow = qeRow('总量（= ① 实测总量）', '≈ <b>' + qeTokRange(m.tLo, m.tHi) + '</b>',
+        qeTip('本次分布总量', [
+          { t: 'T_now = Q × N ÷ ΔB —— m = m̄ 时与 ① 同口径（倍率在分子分母上抵消）', f: true },
+          { t: '故本行与 ① 数值相同；③ 的信息量在下面的「落位分解」' }
+        ]));
+      const chips = '<div class="qe-chips">' + m.chips.map((c) =>
+        '<span class="qe-chip">' + esc(c.cap) + ' <b>' + qePct(c.pct) + '%</b></span>').join('') + '</div>';
       if (view.mode === 'model') {
-        b3 = '<div class="qe-block"><div class="qe-title"><span class="qe-no">③</span>综合时段占比估计（按本次分布）' +
-          qeTip('③ 综合总量 T_mix（按本次时段分布）', [
-            { t: 'm̄ = Σ pₜ·mₜ = ' + qeCoef(m.mBar) + '（占比按模型内归一化）', f: true },
-            { t: m.vMix != null ? 'v_mix = v ÷ m̄ = ' + fmtFull(m.vMix) : 'v_mix = v ÷ m̄（不可估）', f: true },
-            { t: 'T_mix = Q × v_mix', f: true },
-            { t: '时段覆盖 ' + qePct(m.coveredPct) + '%' }
-          ]) + '</div>' +
-          '<div class="qe-chips">' + m.chips.map((c) =>
-            '<span class="qe-chip">' + esc(c.cap) + ' <b>' + qePct(c.pct) + '%</b></span>').join('') + '</div>' +
-          qeRow('综合总量', m.zero ? qeNotEstimable : '≈ <b>' + qeTokRange(m.tLo, m.tHi) + '</b>',
-            qeTip('综合总量 T_mix', [
-              { t: m.vMix != null ? 'v_mix = v ÷ m̄ = ' + fmtFull(m.vMix) : 'v_mix = v ÷ m̄（不可估）', f: true },
-              { t: 'T_mix = Q × v_mix', f: true }
-            ])) +
+        b3 = '<div class="qe-block"><div class="qe-title"><span class="qe-no">③</span>综合占比估计（本次分布落位）' +
+          qeTip('③ 本次分布落位', [
+            { t: '总量：m = m̄（按本次时段分布）→ 等于 ① 实测总量', f: true },
+            { t: 'm̄ = Σ pₜ·mₜ + p₀ = ' + qeCoef(m.mBar) + '（占比按模型内归一化；未归桶 ' + qePct((m.p0 || 0) * 100) + '% 按 ×1 计）', f: true },
+            { t: '落位 = 总量 × pₜ（该时段占比）', f: true }
+          ]) + '</div>' + chips + totalRow +
           '<div class="qe-note">时段落位' +
-            '<span class="qe-label-tip">' + qeTip('时段落位', [{ t: '落位 = T_mix × pₜ（该时段占比）', f: true }]) + '</span></div>' +
+            '<span class="qe-label-tip">' + qeTip('时段落位', [{ t: '落位 = 总量 × pₜ', f: true }]) + '</span></div>' +
           m.allocs.map((a) => '<div class="qe-alloc"><span class="an">' + esc(a.cap) +
             '（' + qePct(a.pct) + '% · ' + esc(a.multText) + '）</span>' +
             '<span class="av">' + (a.tLo == null ? '—' : '≈ ' + qeTokRange(a.tLo, a.tHi)) + '</span></div>').join('');
       } else {
-        b3 = '<div class="qe-block"><div class="qe-title"><span class="qe-no">③</span>综合占比估计（含时段混合）' +
-          qeTip('③ 综合总量 T_mix（按本次模型 × 时段分布）', [
-            { t: 'E = Σ pₜ·dₜ（按时段占比加权 ② 的综合抵扣）', f: true },
-            { t: m.vMix != null ? 'v_mix = 1 ÷ E = ' + fmtFull(m.vMix) : 'v_mix = 1 ÷ E（不可估）', f: true },
-            { t: 'T_mix = Q × v_mix', f: true },
-            { t: '时段覆盖 ' + qePct(m.coveredPct) + '%' }
-          ]) + '</div>' +
-          qeRow('综合抵扣 E', qeCoef(m.E) + ' <span class="qe-unit">' + view.unit + '</span>',
-            qeTip('综合抵扣 E', [{ t: 'E = Σ pₜ·dₜ（pₜ = 聚合时段占比 Σ pᵢ·pᵢ,ₜ）', f: true }])) +
-          qeRow('综合总量', m.zero ? qeNotEstimable : '≈ <b>' + qeTokRange(m.tLo, m.tHi) + '</b>',
-            qeTip('综合总量 T_mix', [
-              { t: m.vMix != null ? 'v_mix = 1 ÷ E = ' + fmtFull(m.vMix) : 'v_mix = 1 ÷ E（不可估）', f: true },
-              { t: 'T_mix = Q × v_mix', f: true }
-            ])) +
+        b3 = '<div class="qe-block"><div class="qe-title"><span class="qe-no">③</span>综合占比估计（本次分布落位）' +
+          qeTip('③ 本次模型 × 时段分布落位', [
+            { t: '总量：m = m̄（精确式 Σ Wᵢ·m̄ᵢ ÷ W）→ 等于 ① 实测总量', f: true },
+            { t: '时段落位 = 总量 × pₜ（pₜ = 聚合时段占比 Σ pᵢ·pᵢ,ₜ，沿用「每时段内模型比例相同」假设，仅用于展示）', f: true },
+            { t: '模型落位 = 总量 × pᵢ', f: true }
+          ]) + totalRow +
           '<div class="qe-note">时段落位' +
             '<span class="qe-label-tip">' + qeTip('时段统计与落位', [
               { t: 'pₜ = 聚合时段占比 = Σ pᵢ·pᵢ,ₜ', f: true },
-              { t: '落位 = T_mix × pₜ；无时段归属的模型用量按基础 ×1 折进', f: true }
+              { t: '落位 = 总量 × pₜ；无时段归属的模型用量按基础 ×1 折进', f: true }
             ]) + '</span></div>' +
           m.segAllocs.map((a) => '<div class="qe-alloc"><span class="an">' + esc(a.cap) +
             '（' + qePct(a.pct) + '% · dₜ ' + esc(a.dText) + '）</span>' +
             '<span class="av">' + (a.tLo == null ? '—' : '≈ ' + qeTokRange(a.tLo, a.tHi)) + '</span></div>').join('') +
           '<div class="qe-note">模型落位' +
             '<span class="qe-label-tip">' + qeTip('模型落位', [
-              { t: '落位 = T_mix × pᵢ', f: true },
+              { t: '落位 = 总量 × pᵢ', f: true },
               { t: 'm̄ᵢ 为各模型自身时段混合倍率（信息标注）' }
             ]) + '</span></div>' +
           m.modelAllocs.map((a) => '<div class="qe-alloc"><span class="an">' + esc(a.model) +
             '（' + qePct(a.pct) + '% · m̄ ' + esc(a.mBarText) + '）</span>' +
             '<span class="av">' + (a.tLo == null ? '—' : '≈ ' + qeTokRange(a.tLo, a.tHi)) + '</span></div>').join('');
       }
-      b3 += qeCrossNote(s, m.tLo) + '</div>';
+      b3 += qeCrossWarn(s, std) + '</div>';
     }
 
     return '<div class="rd-section">' + head +
@@ -3847,6 +3739,7 @@
   }
 
   function renderRecsDetail() {
+    hideTipPop(); // 详情重渲染前先收起浮层气泡，防止搬移节点与 innerHTML 重建竞争
     const host = $('recsDetail');
     const s = recs.data.items.find((x) => x.id === recs.detailId);
     if (!s) { host.hidden = true; host.innerHTML = ''; return; }

@@ -506,7 +506,7 @@
   .recs-modal { width: min(1240px, 96vw); height: 92vh; }
   .recs-body { flex: 1; display: flex; min-height: 0; }
   .recs-detail {
-    flex: none; width: 340px; overflow-y: auto;
+    flex: none; width: 408px; overflow-y: auto; /* 详情看板宽度 +20%（340 → 408）：评估区块长行不再挤压换行 */
     border-right: 1px solid var(--border);
     padding: 14px 16px;
     background: rgba(148, 163, 184, .03);
@@ -548,6 +548,15 @@
   .tip-f {
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     background: rgba(148, 163, 184, .08); border-radius: 6px; padding: 3px 8px;
+  }
+  /* 浮层态气泡（fix-quota-tooltip-occlusion）：展示期间 .tip-pop 搬入 body 级单例容器，
+     fixed 定位坐标由 JS 计算——免疫滚动容器 overflow 裁剪；无 JS 时保留上方原生 CSS 行为回退 */
+  .tip-float-layer { position: fixed; top: 0; left: 0; pointer-events: none; z-index: 96; } /* 高于 modal(91/92) 与 qp-menu(95)，低于 toast(99) */
+  .tip-float-layer .tip-pop { pointer-events: auto; }
+  .tip-pop.open {
+    position: fixed; bottom: auto; right: auto;   /* 覆盖锚定：left/top 由 JS 内联计算 */
+    opacity: 1; visibility: visible;
+    max-height: calc(100vh - 16px); overflow-y: auto;  /* 上下都放不下时的兜底：内部滚动 */
   }
   /* 快照详情「套餐额度评估」区块（quota-coef-evaluation，视觉对齐 demo 260908-01） */
   .rd-section {
@@ -1005,6 +1014,8 @@
 
 <!-- Chart.js：本地 vendored，缺失时不依赖 CDN -->
 <script src="./chart.umd.js"></script>
+<!-- 套餐额度估算引擎（纯函数、无 DOM）：必须在 app.js 之前加载 -->
+<script src="./quota-eval.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

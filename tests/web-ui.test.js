@@ -58,6 +58,47 @@ test('模板分组 UI：组分节、多选开关、批量改组、单条改组�
   assert.match(appJs, /function confirmTplGroup\(/, '应存在改组弹窗确认函数');
 });
 
+test('套餐额度评估区块：校准口径契约（quota-eval-calibration）', async () => {
+  // 引擎抽为独立脚本（纯函数、可单测），必须在 app.js 之前加载
+  const qeJs = readFileSync(join(webRoot, 'quota-eval.js'), 'utf8');
+  const iQe = indexHtml.indexOf('<script src="./quota-eval.js">');
+  const iApp = indexHtml.indexOf('<script src="./app.js">');
+  assert.ok(iQe > 0 && iApp > 0 && iQe < iApp, 'quota-eval.js 应在 app.js 之前引入');
+  assert.match(qeJs, /window\.QuotaEval = \(function \(\) \{/, '引擎应挂 window.QuotaEval');
+  assert.doesNotMatch(qeJs, /document\.|fetch\(/, '引擎 SHALL NOT 触碰 DOM / 网络');
+  // 估计引擎不再留在 app.js（单一来源）
+  assert.doesNotMatch(appJs, /function qeEvalModel\(|function qeEvalTotal\(|function qeSegmentPcts\(/,
+    '引擎函数应已迁出 app.js');
+  assert.match(appJs, /QE\.evalModel\(ev, ctx\)|QE\.evalTotal\(ev, ctx\)/, '区块应调用 QuotaEval 引擎并传入 estTotal 上下文');
+  // 区块文案：实测口径 + 基准对照行 + 落位分解 + 自检
+  assert.match(appJs, /①<\/span>标准总量估计/, '① 标题应存在');
+  assert.match(appJs, /（实测口径）/, '① 应标注实测口径');
+  assert.match(appJs, /基准（倍率 ×1）/, '应显示基准（倍率 ×1）对照行');
+  assert.match(appJs, /综合占比估计（本次分布落位）/, '③ 应改为落位分解');
+  assert.match(appJs, /总量（= ① 实测总量）/, '③ 总量行应明示等于 ①');
+  assert.match(appJs, /反解厂家除数（自检）/, '应显示反解厂家除数自检行');
+  assert.match(appJs, /官方读数差值 ΔB/, '应显示 ΔB 行');
+  // 系数单位纠正：SHALL NOT 再把基础系数标为 分/K 或 0.01%/K
+  assert.doesNotMatch(appJs, /系数单位.*分\/K/, '不应把系数标为分/K');
+  assert.match(appJs, /系数单位 \/ token/, '系数单位应为「系数单位 / token」');
+  // 交叉验证括注反转为偏差告警（吻合时静默）
+  assert.doesNotMatch(appJs, /交叉验证：与「估算总 token」/, '旧的「吻合」括注应已移除');
+  assert.match(appJs, /function qeCrossWarn\(/, '应存在偏差告警函数');
+  // 无法校准态
+  assert.match(appJs, /无法校准/, '应有无法校准提示分支');
+});
+
+test('快照详情看板：宽度 408px（+20%）、自检行只显示数值', () => {
+  // 详情看板由 340px 放宽至 408px（340 × 1.2），评估区块长行不再挤压换行
+  assert.match(indexHtml, /\.recs-detail \{[^}]*width: 408px/,
+    '.recs-detail 宽度应为 408px');
+  // 「反解厂家除数（自检）」行 SHALL NOT 再尾随「整齐值 ✓ / 非整齐值」文字（判定口径留在悬浮气泡内）
+  assert.match(appJs, /反解厂家除数（自检）/, '自检行本身应保留');
+  assert.doesNotMatch(appJs, /nice \? '整齐值|'非整齐值'/, '不应再显示整齐值 / 非整齐值判定文字');
+  assert.doesNotMatch(appJs, /const nice = \[1, 10, 100,/, '自检判定变量应已移除');
+  assert.match(appJs, /不是整齐值 →/, '气泡内应保留判定口径说明');
+});
+
 test('模板导出 / 导入按钮与端点', () => {
   assert.match(indexHtml, /id="tplExportBtn"/, '应有导出 JSON 按钮');
   assert.match(indexHtml, /id="tplImportBtn"/, '应有导入按钮');

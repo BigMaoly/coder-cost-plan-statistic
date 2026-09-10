@@ -1051,7 +1051,9 @@ test('评估固化·模型模式分段：区分星期 + 跨午夜 + rest 的时�
     stopQuotaPreset(db, id, 30, { refresh: () => {} });
     const row = snapshotRows(db)[0];
     const ev = JSON.parse(row.eval_json);
-    assert.equal(ev.v, 1);
+    // 评估数据版本 2（quota-eval-calibration）：新增顶层 officialDelta；读取侧按字段存在性判断
+    assert.equal(ev.v, 2);
+    assert.equal(ev.officialDelta, 20);   // 起始读数 10、结束读数 30 → ΔB = 20（原值，非占比反推）
     assert.equal(ev.mode, 'model');
     // 额度口径：周限制 weeklyPoints = plan.totalPoints（该字段存的即是周额度），totalPoints 为空
     assert.deepEqual(ev.quota, { quotaMode: 'points', limitPeriod: 'week', weeklyPoints: 100, totalPoints: null, cycleDays: 31 });
@@ -1251,8 +1253,9 @@ test('评估读取：listQuotaSnapshots 透出 eval 与写入内容一致；坏 
 
     const { items } = listQuotaSnapshots(db);
     assert.deepEqual(items[0].eval, {
-      v: 1,
+      v: 2,
       mode: 'total',
+      officialDelta: 20,          // 起始读数 10、结束读数 30（quota-eval-calibration 新增顶层字段）
       quota: { quotaMode: 'points', limitPeriod: 'month', weeklyPoints: null, totalPoints: 1000, cycleDays: 30 },
       models: [
         { model: 'm1', tokens: { hit: 1000, miss: 2000, output: 500 }, coef: { inHit: 0.2, inMiss: 0.4, out: 1.2 }, tiers: null, segments: null }
@@ -1267,6 +1270,97 @@ test('评估读取：listQuotaSnapshots 透出 eval 与写入内容一致；坏 
     // 旧行（eval_json 为 NULL）容错 → null
     db.prepare("UPDATE quota_snapshots SET eval_json = NULL WHERE id = ?").run(rowId);
     assert.equal(listQuotaSnapshots(db).items[0].eval, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+/* ================= 官方读数差值固化与基础信息锚定（quota-eval-calibration 2.1 / 2.2） ================= */
+
+/**
+ * 固定夹具：月限额积分制（总额度 1000、周期 30 天、月费 50），单模型 m1（无分段），
+ * 窗口内一条明细（inputOther 2000 / cacheRead 1000 / output 500），读数 10 → 20（ΔB = 10 或 20）。
+ * 期望值全部由口径公式手算得出（不取自运行结果），用于锚定「基础快照信息不受影响」。
+ */
+function evalFixDb() {
+  const { root, db } = tempDb();
+  seedMapping(db);
+  savePlanConfig(db, {
+    mapName: '火山引擎',
+    plans: [{ name: '积分包', cycleDays: 30, monthlyFee: 50, quotaMode: 'points', limitPeriod: 'month', totalPoints: 1000 }],
+    currentPlan: '积分包',
+    prices: []
+  });
+  savePlanQuotaCoefs(db, '火山引擎', [{ planName: '积分包', model: 'm1', inHit: 0.2, inMiss: 0.4, out: 1.2, coefTiered: 0 }]);
+  return { root, db };
+}
+
+test('2.1 固化 officialDelta：模型模式与总量模式下均等于窗口读数差值原值，且 v = 2', () => {
+  for (const modelMode of [true, false]) {
+    const { root, db } = evalFixDb();
+    try {
+      const today = todayKey();
+      const { id } = mkPreset(db, { mapName: '火山引擎', officialUsed: 10, modelMode, model: modelMode ? 'm1' : null });
+      startQuotaPreset(db, id, { now: atLocal(today, '00:01') });
+      insertRecord(db, { model: 'm1', tsMs: atLocal(today, '01:00'), localDate: today, inputOther: 2000, cacheRead: 1000, output: 500 });
+      stopQuotaPreset(db, id, 30, { refresh: () => {} });
+
+      const ev = JSON.parse(snapshotRows(db)[0].eval_json);
+      assert.equal(ev.v, 2, '评估数据版本应为 2');
+      assert.equal(ev.mode, modelMode ? 'model' : 'total');
+      assert.equal(ev.officialDelta, 20, 'officialDelta 应为结束读数 − 起始读数（原值 20，不是占比反推值）');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test('2.1 剩余值读数模式下 officialDelta 取「起始剩余 − 结束剩余」的正向差值', () => {
+  const { root, db } = evalFixDb();
+  try {
+    const today = todayKey();
+    const { id } = mkPreset(db, { mapName: '火山引擎', officialUsed: 100, remainingMode: true, modelMode: true, model: 'm1' });
+    startQuotaPreset(db, id, { now: atLocal(today, '00:01') });
+    insertRecord(db, { model: 'm1', tsMs: atLocal(today, '01:00'), localDate: today, inputOther: 2000, cacheRead: 1000, output: 500 });
+    stopQuotaPreset(db, id, 80, { refresh: () => {} });   // 剩余 100 → 80 → 消耗 20
+
+    const ev = JSON.parse(snapshotRows(db)[0].eval_json);
+    assert.equal(ev.officialDelta, 20);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('2.2 基础快照信息不受影响：五列取值与口径公式手算结果逐项相等', () => {
+  const { root, db } = evalFixDb();
+  try {
+    const today = todayKey();
+    const { id } = mkPreset(db, { mapName: '火山引擎', officialUsed: 10, modelMode: false });
+    startQuotaPreset(db, id, { now: atLocal(today, '00:01') });
+    insertRecord(db, { model: 'm1', tsMs: atLocal(today, '01:00'), localDate: today, inputOther: 2000, cacheRead: 1000, output: 500 });
+    stopQuotaPreset(db, id, 30, { refresh: () => {} });
+
+    const row = snapshotRows(db)[0];
+    // ΔA = 3500；ΔB = 20；pLo = pHi = round4(20 / 1000) = 0.02
+    assert.equal(row.tokens_json, JSON.stringify({ inputHit: 1000, inputMiss: 2000, output: 500 }));
+    assert.equal(row.consume_pct_lo, 2);                       // round2(0.02 × 100)
+    assert.equal(row.consume_pct_hi, 2);
+    assert.equal(row.est_total_lo, 175000);                    // round(3500 ÷ 0.02)
+    assert.equal(row.est_total_hi, 175000);
+    assert.equal(row.equiv_cost_lo, null);                     // 等价金额仅模型模式产出
+    assert.equal(row.equiv_cost_hi, null);
+    assert.equal(row.quota_text, '1000 积分/月');
+    assert.equal(row.price, 50);
+    // token 等值价格：本夹具未配置任何价格 → 缺价模型列出、金额全 0、partial 为真
+    const tc = JSON.parse(row.token_costs_json);
+    assert.equal(tc.mode, 'total');
+    assert.deepEqual(tc.amounts, { hit: 0, miss: 0, output: 0, total: 0 });
+    assert.equal(tc.partial, true);
+    assert.deepEqual(tc.byModel, []);
+    assert.deepEqual(tc.unpricedModels, [{ model: 'm1', tokens: { hit: 1000, miss: 2000, output: 500, total: 3500 } }]);
+    // 固化新增字段 SHALL NOT 参与上述任一列：token 结构仅由窗口明细决定，与读数无关
+    assert.equal(JSON.parse(row.eval_json).officialDelta, 20);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

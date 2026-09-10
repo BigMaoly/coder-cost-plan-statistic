@@ -245,10 +245,14 @@ const coefSegmentKey = (t) => `${t.startMin ?? ''}|${t.endMin ?? ''}|${t.isRest 
  * - 窗口差值为 0 的模型不进入 models[]；相关模型均无「差值 > 0 且存在系数条目」→ 返回 null（写 NULL）。
  * - 归属分桶按行定义四元组键（coefSegmentKey），未命名 / 同名时段行不塌缩、不重复累计占比；
  *   完全重复定义的行同键同倍率，合并属良性。模型未开启分段或窗口内无命中明细 → segments 为 null。
+ * - 官方读数差值 officialDelta（quota-eval-calibration）：顶层固化本次窗口消耗的额度原值，
+ *   供读取侧反解真实单位消耗（各厂家除数 ÷1000 / ÷10000 / 不除不统一）；SHALL NOT 参与
+ *   tokens_json / consume_pct_* / est_total_* / equiv_cost_* / token_costs_json 任一列的计算。
  * 纯读取计算：不写 usage_* / cost_* 表，不触碰扫描与增量固化（防重复统计铁律不受影响）。
+ * @param {number} deltaB 本次窗口官方读数差值（与套餐额度同口径：积分制为分、百分比制为 0.01% 个数）
  * @returns {string|null} eval_json（JSON 字符串）或 null
  */
-function calcEvalJson(db, mapName, plan, { isModel, model, rows, byModel, startByModel, startMs }) {
+function calcEvalJson(db, mapName, plan, { isModel, model, rows, byModel, startByModel, startMs, deltaB }) {
   const coefByModel = new Map(
     loadPlanQuotaCoefs(db)
       .filter((c) => c.mapName === mapName && c.planName === plan.name)
@@ -321,7 +325,13 @@ function calcEvalJson(db, mapName, plan, { isModel, model, rows, byModel, startB
     : plan.limitPeriod === 'week'
       ? { quotaMode: 'points', limitPeriod: 'week', weeklyPoints: plan.totalPoints, totalPoints: null, cycleDays: plan.cycleDays }
       : { quotaMode: 'points', limitPeriod: 'month', weeklyPoints: null, totalPoints: plan.totalPoints, cycleDays: plan.cycleDays };
-  return JSON.stringify({ v: 1, mode: isModel ? 'model' : 'total', quota, models: items });
+  return JSON.stringify({
+    v: 2,                                   // 评估数据版本：2 起含顶层 officialDelta（读取侧按字段存在性判断，不依赖本值）
+    mode: isModel ? 'model' : 'total',
+    officialDelta: deltaB ?? null,           // 本次窗口官方读数差值原值（校准锚）
+    quota,
+    models: items
+  });
 }
 
 /** 快照行 → 对外驼峰结构（tokens_json 解析为三分量对象） */
@@ -634,7 +644,7 @@ export function stopQuotaPreset(db, id, b2, { refresh } = {}) {
   // 门槛不满足（相关模型均无系数条目或无正差值）→ null（随快照写 NULL）
   const evalJson = calcEvalJson(db, p.map_name, plan, {
     isModel, model: p.model, rows: acc.rows, byModel: acc.byModel,
-    startByModel: start.byModel, startMs: start.startMs
+    startByModel: start.byModel, startMs: start.startMs, deltaB
   });
 
   const snapshotId = runInTransaction(db, () => {

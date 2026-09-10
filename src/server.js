@@ -1188,9 +1188,12 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         });
       }
 
-      // 静态文件（白名单内，防目录穿越）
+      // 静态文件（白名单内，防目录穿越）：quota-eval.js 为套餐额度估算引擎（纯函数，app.js 依赖它）
       if (req.method === 'GET') {
-        const allow = { '/': 'index.html', '/index.html': 'index.html', '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js' };
+        const allow = {
+          '/': 'index.html', '/index.html': 'index.html',
+          '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js'
+        };
         const file = allow[path];
         if (file) {
           try {
