@@ -2650,6 +2650,9 @@
     }, 4200);
   }
 
+  // 模型评分页（score.js）复用同一套提示：暴露到 window，避免第二套 toast 实现与样式漂移
+  window.showToast = showToast;
+
   function bindEvents() {
     // 统计工具切换：各平台模型画像不同，筛选与下钻复位后按新工具重渲染
     toolSel.addEventListener('change', () => {
@@ -2860,6 +2863,34 @@
   // 范围值格式化：数值直接格式化；{lo,hi} 格式化为 "lo~hi"（周限额套餐的范围字段）
   const fmtMaybeRange = (v, f) => (v && typeof v === 'object') ? f(v.lo) + '~' + f(v.hi) : f(v);
   const quotaMoney = (v) => billingIcon + money(v); // 金额随全局币种图标
+  // 单位金额 token 产出（quota-token-per-money）：toks ÷ amount = 每 1 单位套餐货币
+  // 对应多少 token；分子或分母非正时返回 null（不渲染气泡，杜绝 0 / NaN / Infinity）
+  const tokPerMoney = (toks, amount) => (toks > 0 && amount > 0 ? fmtFull(toks / amount) : null);
+  /** 估算总 token 包月比值：估算总额度 ÷ 包月金额 = 每 1 单位套餐货币每月的 token 数。
+   *  快照详情气泡与记录窗口条目第一列共享本口径（recs-item-value-display）。
+   *  区间估算同步显示区间比值（lo=hi 折叠为单值）；币符快照固化币种优先、
+   *  无 tokenCosts（旧记录）回退全局币种；缺估算总额度或包月金额 ≤ 0 返回 null。
+   *  纯前端展示计算，SHALL NOT 改变快照数据与统计口径。 */
+  function estRatioOf(s) {
+    const tc = s.tokenCosts;
+    const icon = tc ? (CURRENCY_ICONS[tc.currency] || '￥') : billingIcon;
+    const est = s.estTotal;
+    if (est == null || !(s.price > 0)) return null;
+    const isObj = est && typeof est === 'object';
+    const lo = isObj ? est.lo : est;
+    const hi = isObj ? est.hi : est;
+    const isRange = isObj && lo !== hi;
+    const rLo = tokPerMoney(lo, s.price);
+    const rHi = tokPerMoney(hi, s.price);
+    if (!rLo || !rHi) return null;
+    const ratioText = isRange ? rLo + ' ~ ' + rHi : rLo;
+    return {
+      icon,
+      ratioText,
+      formula: (isRange ? fmtFull(lo) + ' ~ ' + fmtFull(hi) : fmtFull(lo)) +
+        ' ÷ ' + icon + money(s.price) + ' ≈ ' + ratioText + '/' + icon,
+    };
+  }
 
   /* ----- 通用小菜单（条目「设置」按钮：删除/编辑 等） ----- */
 
@@ -3304,15 +3335,24 @@
 
   function renderRecsList() {
     const items = recs.data.items;
-    $('recsList').innerHTML = items.length ? items.map((s) =>
-      '<div class="recs-item' + (recs.detailId === s.id ? ' active' : '') + '" data-id="' + s.id + '">' +
+    $('recsList').innerHTML = items.length ? items.map((s) => {
+      // 右侧三列（recs-item-value-display）：每 1 单位套餐货币每月 token 数（口径同详情
+      // 页 estRatioOf）→ 包月费用（数值快照固化、币符随全局计费币种）→ 估计每月总 token
+      // （不带 ≈ / tokens 字样）。无比值（缺估算总额度 / 包月金额 ≤ 0）时第一列留空占位。
+      const r = estRatioOf(s);
+      return '<div class="recs-item' + (recs.detailId === s.id ? ' active' : '') + '" data-id="' + s.id + '">' +
         '<input type="checkbox" class="recs-check" data-check="' + s.id + '"' + (recs.selected.has(s.id) ? ' checked' : '') + '>' +
         '<span class="ri-plan">' + esc(s.planName) + '</span>' +
-        '<span class="ri-price">' + quotaMoney(s.price) + '/月</span>' +
         '<span class="ri-mode">' + (s.mode === 'model' ? esc(s.model) : '总量') + '</span>' +
-        '<span class="ri-est">≈ ' + fmtMaybeRange(s.estTotal, fmtFull) + ' tokens</span>' +
+        '<span class="ri-cells">' +
+          (r ? '<span class="ri-cell ri-cell-ratio">' + r.ratioText + '/' + r.icon + '</span>'
+             : '<span class="ri-cell ri-cell-ratio"></span>') +
+          '<span class="ri-cell ri-cell-price">' + quotaMoney(s.price) + '/月</span>' +
+          '<span class="ri-cell ri-cell-tok">' + fmtMaybeRange(s.estTotal, fmtFull) + '</span>' +
+        '</span>' +
         '<button type="button" class="icon-btn qp-gear" data-rgear="' + s.id + '" title="设置" aria-label="设置">⚙</button>' +
-      '</div>').join('')
+      '</div>';
+    }).join('')
       : '<div class="ed-hint" style="padding:18px">没有匹配的快照记录。</div>';
   }
 
@@ -3348,16 +3388,24 @@
   const tipLayer = document.createElement('div');
   tipLayer.className = 'tip-float-layer';
   document.body.appendChild(tipLayer);
+  // CSS 原地回退门控（design D1）：JS 浮层在场即标记 html.tip-js，使 index.html 中
+  // html:not(.tip-js) 前缀的原地 :hover/:focus 显示规则失效——气泡收起搬回原位后
+  // 不得以未钳制的原地样式复显（点击固定场景的裁剪根源）；无 JS 时该类不存在，回退保留
+  document.documentElement.classList.add('tip-js');
   let tipState = null;      // { trigger, pop } 当前展示状态
   let tipHideTimer = null;  // mouseout 延迟收起：跨图标与气泡间的 8px 空隙不闪断
 
   function tipCancelHide() { if (tipHideTimer) { clearTimeout(tipHideTimer); tipHideTimer = null; } }
   function tipScheduleHide() { tipCancelHide(); tipHideTimer = setTimeout(hideTipPop, 120); }
 
-  /** 收起：节点搬回原父；触发图标已脱离文档（详情重渲染）则丢弃浮层内容 */
-  function hideTipPop() {
+  /** 收起：节点搬回原父；触发图标已脱离文档（详情重渲染）则丢弃浮层内容。
+   *  force=true 强制收起（切换展示其它图标 / 详情重渲染前置收起 / 触发图标脱离文档）。
+   *  常规收起时若触发图标仍持有焦点（点击固定 focus-pin）则保持展示——气泡留在
+   *  边界钳制的浮层内，绝不退回未钳制的原地样式（design D2） */
+  function hideTipPop(force) {
     tipCancelHide();
     if (!tipState) return;
+    if (!force && tipState.trigger === document.activeElement) return; // 点击固定：焦点在图标上不收起
     const { trigger, pop } = tipState;
     pop.classList.remove('open');
     pop.style.left = '';
@@ -3407,7 +3455,7 @@
   /** 展示：搬移节点 → 浮层内测量 → 放置评分 → 显示 */
   function showTipPop(tip) {
     if (tipState?.trigger === tip) return;
-    hideTipPop();
+    hideTipPop(true); // 切换展示其它图标：pinned 状态也强制收起，避免阻塞切换
     const pop = tip.querySelector('.tip-pop');
     if (!pop) return;
     tipState = { trigger: tip, pop };
@@ -3437,6 +3485,9 @@
     if (tip) showTipPop(tip);
   }, true);
   document.addEventListener('focusout', (e) => {
+    // 时序注记（design D2）：focusout 派发时 activeElement 尚未变更，「点击固定」判定
+    // 不放这里，而是经 tipScheduleHide 延迟 120ms 后在 hideTipPop 执行时刻判定——
+    // 届时焦点已移交新目标，pin 条件不成立，气泡正常收起
     if (tipState && e.target.closest('.tip-info') === tipState.trigger) tipScheduleHide();
   }, true);
   /* 滚动 / 缩放：重定位到触发图标当前位置（含 hover 自动滚动入屏的场景）；
@@ -3445,7 +3496,7 @@
     if (!tipState) return;
     const r = tipState.trigger.getBoundingClientRect();
     if (!tipState.trigger.isConnected || r.width === 0 || r.bottom < 0 || r.top > window.innerHeight) {
-      hideTipPop();
+      hideTipPop(true); // 触发图标已脱离文档 / 滚出视口：强制收起，不做点击固定保留
       return;
     }
     placeTipPop(tipState.trigger, tipState.pop);
@@ -3739,7 +3790,7 @@
   }
 
   function renderRecsDetail() {
-    hideTipPop(); // 详情重渲染前先收起浮层气泡，防止搬移节点与 innerHTML 重建竞争
+    hideTipPop(true); // 详情重渲染前先强制收起浮层气泡，防止搬移节点与 innerHTML 重建竞争
     const host = $('recsDetail');
     const s = recs.data.items.find((x) => x.id === recs.detailId);
     if (!s) { host.hidden = true; host.innerHTML = ''; return; }
@@ -3779,6 +3830,31 @@
       if (!(tok > 0)) return ''; // 零消耗项省略括注
       return ' <span class="muted">(' + tcIcon + money(tc.amounts[key]) + ')</span>' + tcPartialTip;
     };
+    // 消耗·合计比值气泡：本次 token 总消耗 ÷ 本次总金额 = 每 1 单位套餐货币的 token 数。
+    // 旧记录 / 未配置价格（tcNoteTail 非 null）沿用既有提示气泡；零值不渲染；
+    // partial（部分模型缺价）照常显示并追加口径警示——金额仅含已计价模型
+    let tcRatioTip = '';
+    if (tcNoteTail === null && tc && tc.amounts) {
+      const ratio = tokPerMoney(s.tokens.total, tc.amounts.total);
+      if (ratio) {
+        const lines = [
+          { t: fmtFull(s.tokens.total) + ' ÷ ' + tcIcon + money(tc.amounts.total) + ' ≈ ' + ratio + '/' + tcIcon, f: true },
+          { t: '每 1 单位套餐货币本次对应 ' + ratio + ' token；比值越大，本次消耗越划算。' }
+        ];
+        if (tc.partial) lines.push({ t: '口径警示：本次总金额仅含已配置价格模型，实际每单位货币 token 数高于所显示比值。' });
+        tcRatioTip = qeTip('本次消耗性价比', lines);
+      }
+    }
+    // 估算总 token 包月比值气泡：估算总额度 ÷ 包月金额 = 每 1 单位套餐货币每月的 token 数。
+    // 口径与记录窗口条目第一列共享 estRatioOf（recs-item-value-display），文案格式保持现状
+    let estRatioTip = '';
+    const estRatio = estRatioOf(s);
+    if (estRatio) {
+      estRatioTip = qeTip('套餐包月性价比', [
+        { t: estRatio.formula, f: true },
+        { t: '每 1 单位套餐货币每月估计可用 ' + estRatio.ratioText + ' token（估算总额度 ÷ 包月金额）。' }
+      ]);
+    }
     host.innerHTML =
       '<div class="rd-head"><h3>快照详情 #' + s.id + '</h3>' +
         '<button type="button" class="icon-btn" id="rdClose" title="关闭看板" aria-label="关闭看板">✕</button></div>' +
@@ -3788,14 +3864,14 @@
       row('消耗·输入(命中)', fmtFull(s.tokens.hit) + tcNote('hit', s.tokens.hit)) +
       row('消耗·输入(未命中)', fmtFull(s.tokens.miss) + tcNote('miss', s.tokens.miss)) +
       row('消耗·输出', fmtFull(s.tokens.output) + tcNote('output', s.tokens.output)) +
-      row('消耗·合计', fmtFull(s.tokens.total) + tcNote('total', s.tokens.total)) +
+      row('消耗·合计', fmtFull(s.tokens.total) + tcNote('total', s.tokens.total) + tcRatioTip) +
       row('套餐', esc(s.planName)) +
       row('提供商', esc(s.provider)) +
       row('套餐价格', quotaMoney(s.price) + ' /月') +
       row('限额周期', s.limitPeriod || '—') +
       row('套餐总量', esc(s.quotaText || '—')) +
       row('本次消耗占月额度', fmtMaybeRange(s.consumePct, (v) => v.toFixed(2) + '%')) +
-      row('估算总 token（每月估计总量）', '<b>≈ ' + fmtMaybeRange(s.estTotal, fmtFull) + '</b>') +
+      row('估算总 token（每月估计总量）', '<b>≈ ' + fmtMaybeRange(s.estTotal, fmtFull) + '</b>' + estRatioTip) +
       (s.equivMoney != null
         ? row('折算等价金额', '<b>' + fmtMaybeRange(s.equivMoney, quotaMoney) + '</b>' + equivMoneyTipHtml())
         : '') +

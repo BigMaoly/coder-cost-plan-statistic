@@ -105,3 +105,102 @@ test('模板导出 / 导入按钮与端点', () => {
   assert.match(appJs, /\/api\/model-templates\/export/, '应调用导出端点');
   assert.match(appJs, /\/api\/model-templates\/import/, '应调用导入端点');
 });
+
+/* ===== v15 模型评分页（model-scorecard）前端契约 ===== */
+
+const scoreJs = readFileSync(join(webRoot, 'score.js'), 'utf8');
+
+test('模型评分入口与独立页面骨架', () => {
+  assert.match(indexHtml, /id="scoreBtn"/, '顶栏应有「模型评分」按钮');
+  assert.match(indexHtml, /<section id="scorePage" hidden>/, '应有模型评分页面区块（默认 hidden）');
+  assert.match(indexHtml, /id="scoreBackBtn"/, '页面应有返回按钮');
+  assert.match(indexHtml, /id="scoreCriteriaModal"/, '应有评分标准子窗口壳');
+  assert.match(indexHtml, /id="scoreModelsModal"/, '应有模型信息子窗口壳');
+  assert.match(indexHtml, /id="scoreMainChart"/, '应有主图 canvas');
+  assert.match(indexHtml, /id="scoreGridWrap"/, '应有小图区容器');
+  assert.match(indexHtml, /body\.score-view #scorePage/, '应用 body.score-view 控制页面显隐');
+  assert.match(indexHtml, /<script src="\.\/score\.js"><\/script>/, '应引入 score.js');
+  assert.match(appJs, /window\.showToast = showToast;/, 'app.js 应把 showToast 暴露给评分页复用');
+});
+
+test('模型评分页路由与数据端点', () => {
+  assert.match(scoreJs, /#\/model-score/, '应有 hash 路由 #/model-score');
+  assert.match(scoreJs, /hashchange/, '应跟随 hashchange 进出页面');
+  for (const ep of ['/api/score', '/api/score/criteria', '/api/score/models', '/api/score/reset']) {
+    assert.ok(scoreJs.includes("'" + ep + "'") || scoreJs.includes("'" + ep + "/"), '应调用 ' + ep);
+  }
+  assert.ok(scoreJs.includes("'/api/score/' + resource + '/order'"), '条目排序应调用 <resource>/order 全量重排端点');
+  assert.ok(scoreJs.includes("'/api/score/criterion-groups/order'"), '标准分组排序应调用 criterion-groups/order');
+  assert.ok(scoreJs.includes("'/api/score/model-groups/order'"), '模型分组排序应调用 model-groups/order');
+});
+
+test('模型评分页关键渲染契约（单位定标 / 未评分不进图 / 脚注）', () => {
+  assert.match(scoreJs, /unit === 'pct'/, '横轴定标应区分百分比与数值');
+  assert.match(scoreJs, /未评分（不在图中）/, '主图应提示未评分模型数量');
+  assert.match(scoreJs, /valueLabels|scValueLabels/, '柱端应有数值标签');
+  assert.match(scoreJs, /scoreboard\(/, '应有「按分值降序」的排行计算');
+  assert.match(indexHtml, /本条最大值/, '页面脚注应写明数值类标准的口径');
+});
+
+/* ===== 记录窗口条目三列展示（recs-item-value-display） ===== */
+
+test('记录窗口条目三列布局与比值口径契约', () => {
+  // 结构：套餐名（限宽省略）+ 模型标签靠左紧跟；右侧三列 = 每单位货币 token 数 →
+  // 包月费用 → 总 token 量；旧左侧价格列（.ri-price）与旧 .ri-est 移除
+  assert.ok(appJs.includes("'<span class=\"ri-cells\">'"), '条目应渲染三列容器 .ri-cells');
+  assert.ok(appJs.includes('ri-cell-ratio'), '第一列应为每单位货币每月 token 数');
+  assert.ok(appJs.includes('ri-cell-price'), '第二列应为包月费用');
+  assert.ok(appJs.includes('ri-cell-tok'), '第三列应为估计每月总 token');
+  assert.ok(!appJs.includes('ri-price'), '左侧旧价格列 .ri-price 应移除');
+  assert.ok(!appJs.includes('ri-est'), '旧 .ri-est 估计列应移除');
+  // 比值列接 estRatioOf 共享口径（与详情气泡同源），不带感叹号
+  assert.ok(appJs.includes("'<span class=\"ri-cell ri-cell-ratio\">' + r.ratioText + '/' + r.icon"),
+    '比值列应显示 <比值>/<币符>（快照固化币种优先）');
+  assert.ok(appJs.includes("'<span class=\"ri-cell ri-cell-ratio\"></span>'"),
+    '无比值（缺估算总额度 / 包月金额 ≤ 0）时第一列应留空占位保持对齐');
+  // 总量列不带 ≈ 前缀与 tokens 字样
+  assert.ok(appJs.includes("'<span class=\"ri-cell ri-cell-tok\">' + fmtMaybeRange(s.estTotal, fmtFull)"),
+    '总量列应直接显示 K/M/B 数值（无 ≈ / tokens）');
+  // 样式：Grid 定宽三列（逐行对齐）+ 配色 + 窄屏压缩
+  assert.match(indexHtml, /grid-template-columns: minmax\(150px, auto\) minmax\(92px, auto\) minmax\(112px, auto\)/,
+    '.ri-cells 应为三列 Grid 定宽对齐');
+  assert.match(indexHtml, /\.ri-cell-ratio \{ color: var\(--muted\); \}/, '比值列应为 muted 配色');
+  assert.match(indexHtml, /\.ri-cell-tok \{ color: var\(--teal\); \}/, '总量列应为 teal 配色');
+  assert.match(indexHtml, /\.ri-plan \{\s*font-weight: 600; flex: 0 1 auto; max-width: 42%;/,
+    '套餐名应限宽省略（flex: 0 1 auto; max-width: 42%）');
+});
+
+
+/* ===== 快照详情单位金额 token 比值气泡 + 点击固定气泡裁剪修复（quota-detail-token-per-money-tips-and-tip-pop-clip-fix） ===== */
+
+test('感叹号气泡浮层：tip-js 门控 + focus-pin 强制收起路径', () => {
+  // CSS 原地回退显示规则必须带 html:not(.tip-js) 门控——JS 浮层在场时不竞争展示，
+  // 否则气泡收起搬回原位后 :focus 残留会以未钳制原地样式复显被边界裁剪
+  assert.match(indexHtml, /html:not\(\.tip-js\) \.tip-info:hover \.tip-pop,/, '原地回退规则应加 html:not(.tip-js) 门控');
+  assert.match(indexHtml, /html:not\(\.tip-js\) \.tip-info:focus \.tip-pop \{ opacity: 1; visibility: visible; \}/, ':focus 回退规则同样门控');
+  // JS 浮层初始化必须同步打上 tip-js 标记（与 CSS 门控配套）
+  assert.match(appJs, /document\.documentElement\.classList\.add\('tip-js'\)/, '浮层初始化应给 documentElement 加 tip-js 类');
+  // focus-pin：常规收起遇焦点固定则保留（气泡留在钳制浮层）；三条强制路径 hideTipPop(true)
+  assert.match(appJs, /function hideTipPop\(force\)/, 'hideTipPop 应有 force 参数');
+  assert.ok(appJs.includes('if (!force && tipState.trigger === document.activeElement) return;'),
+    '常规收起应保留点击固定（focus-pin）状态');
+  assert.ok(appJs.includes('hideTipPop(true); // 切换展示其它图标'), 'showTipPop 切换展示应强制收起');
+  assert.ok(appJs.includes('hideTipPop(true); // 详情重渲染前先强制收起'), '详情重渲染前置收起应为强制');
+  assert.ok(appJs.includes('hideTipPop(true); // 触发图标已脱离文档'), '图标脱离文档/滚出视口应强制收起');
+});
+
+test('快照详情单位金额 token 比值气泡（tokPerMoney 纯前端计算）', () => {
+  assert.match(appJs, /const tokPerMoney = \(toks, amount\) =>/, '应有 tokPerMoney 辅助');
+  assert.ok(appJs.includes('toks > 0 && amount > 0 ? fmtFull(toks / amount) : null'),
+    '分子/分母非正应返回 null（杜绝 0 / NaN / Infinity）');
+  assert.ok(appJs.includes("qeTip('本次消耗性价比', lines)"), '消耗·合计行应渲染比值气泡');
+  assert.ok(appJs.includes('实际每单位货币 token 数高于所显示比值'), 'partial 快照比值气泡应带口径警示行');
+  assert.ok(appJs.includes("qeTip('套餐包月性价比'"), '估算总 token 行应渲染包月比值气泡');
+  assert.ok(appJs.includes('function estRatioOf(s)'),
+    '包月比值口径应提取为 estRatioOf 共享函数（recs-item-value-display：详情气泡与记录条目共用）');
+  assert.ok(appJs.includes('tc ? (CURRENCY_ICONS[tc.currency] || \'￥\') : billingIcon'),
+    '包月比值币符应快照固化币种优先、旧记录回退全局币种');
+  assert.ok(appJs.includes('if (est == null || !(s.price > 0)) return null;'),
+    '缺估算总额度或包月金额 ≤ 0 应返回 null（不渲染比值）');
+});
+

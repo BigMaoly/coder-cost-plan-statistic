@@ -542,7 +542,10 @@
     opacity: 0; visibility: hidden; transition: opacity .15s ease;
     z-index: 60; cursor: default;
   }
-  .tip-info:hover .tip-pop, .tip-info:focus .tip-pop { opacity: 1; visibility: visible; }
+  /* 原地回退显示规则加 html:not(.tip-js) 门控：JS 浮层在场（html.tip-js）时本规则不生效——
+     否则气泡收起搬回原位后，:focus 残留会以未钳制的原地样式复显、被容器/视口边界裁剪（点击固定场景） */
+  html:not(.tip-js) .tip-info:hover .tip-pop,
+  html:not(.tip-js) .tip-info:focus .tip-pop { opacity: 1; visibility: visible; }
   .tip-t { font-size: 12px; font-weight: 600; color: var(--teal); }
   .tip-p { color: var(--muted); }
   .tip-f {
@@ -550,7 +553,8 @@
     background: rgba(148, 163, 184, .08); border-radius: 6px; padding: 3px 8px;
   }
   /* 浮层态气泡（fix-quota-tooltip-occlusion）：展示期间 .tip-pop 搬入 body 级单例容器，
-     fixed 定位坐标由 JS 计算——免疫滚动容器 overflow 裁剪；无 JS 时保留上方原生 CSS 行为回退 */
+     fixed 定位坐标由 JS 计算——免疫滚动容器 overflow 裁剪；JS 在场时上方原地 CSS 回退
+     经 html:not(.tip-js) 门控失效，仅无 JS 时回退为既有纯 CSS 行为 */
   .tip-float-layer { position: fixed; top: 0; left: 0; pointer-events: none; z-index: 96; } /* 高于 modal(91/92) 与 qp-menu(95)，低于 toast(99) */
   .tip-float-layer .tip-pop { pointer-events: auto; }
   .tip-pop.open {
@@ -648,14 +652,30 @@
   .recs-item:hover { background: rgba(148, 163, 184, .08); }
   .recs-item.active { background: rgba(45, 212, 191, .1); }
   .recs-check { flex: none; }
-  .ri-plan { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ri-price { color: var(--muted); font-variant-numeric: tabular-nums; flex: none; }
+  .ri-plan {
+    font-weight: 600; flex: 0 1 auto; max-width: 42%; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .ri-mode {
     flex: none; font-size: 11px; color: var(--muted);
     border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px;
     max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
-  .ri-est { margin-left: auto; color: var(--teal); font-variant-numeric: tabular-nums; flex: none; }
+  /* 右侧三列（recs-item-value-display）：每单位货币 token 数 → 包月费用 → 总 token 量；
+     Grid 定宽列保证逐行逐列对齐（minmax 允许长区间值撑宽而不截断） */
+  .ri-cells {
+    margin-left: auto; flex: none;
+    display: grid; grid-template-columns: minmax(150px, auto) minmax(92px, auto) minmax(112px, auto);
+    align-items: center;
+  }
+  .ri-cell {
+    padding-left: 20px; text-align: right; white-space: nowrap;
+    font-variant-numeric: tabular-nums; font-size: 12.5px;
+  }
+  .ri-cell:first-child { padding-left: 0; }
+  .ri-cell-ratio { color: var(--muted); }
+  .ri-cell-price { color: var(--text); }
+  .ri-cell-tok { color: var(--teal); }
   .recs-pager {
     display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
     padding: 10px 14px; border-top: 1px solid var(--border);
@@ -670,15 +690,166 @@
     .recs-body { flex-direction: column; }
     .recs-detail { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
     .qp-info { grid-template-columns: 1fr; }
+    .ri-cells { grid-template-columns: minmax(118px, auto) minmax(80px, auto) minmax(86px, auto); }
+    .ri-cell { padding-left: 12px; font-size: 12px; }
+  }
+
+  /* ===== 模型评分页（model-scorecard, v15）=====
+     页面切换：进入评分页时给 body 加 .score-view（首页各区块整体隐藏），
+     #scorePage 在标记里带 hidden（无 JS 时不可见），可见性由这里的两条规则决定。 */
+  #scorePage { display: none; }
+  body.score-view #scorePage { display: block; }
+  body.score-view .wrap > :not(#scorePage) { display: none; }
+
+  .sc-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .sc-brand { display: flex; align-items: center; gap: 12px; }
+  .sc-brand h2 { font-size: 19px; font-weight: 700; letter-spacing: .2px; }
+  .sc-sub { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+  .sc-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sc-toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-left: auto; }
+  .sc-chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .sc-chart-head h2 { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .sc-ord {
+    display: inline-grid; place-items: center; width: 20px; height: 20px; flex: none;
+    border-radius: 6px; background: rgba(148, 163, 184, .12); border: 1px solid var(--border);
+    font-size: 11px; color: var(--muted); font-weight: 600;
+  }
+  .sc-unit { display: inline-block; flex: none; font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: rgba(148, 163, 184, .07); }
+  .sc-unit.pct { border-color: rgba(45, 212, 191, .4); color: #7ff3e3; background: var(--teal-soft); }
+  .sc-unit.num { border-color: rgba(167, 139, 250, .45); color: #cbb8ff; background: rgba(167, 139, 250, .14); }
+  .sc-meta { font-size: 12px; color: var(--muted); margin-bottom: 10px; line-height: 1.8; }
+  .sc-meta b { color: var(--text); font-weight: 600; }
+  .sc-chart-box { position: relative; height: 420px; }
+  .sc-chart-box.sc-empty { display: grid; place-items: center; height: 220px; }
+  .sc-desc-tip { position: relative; cursor: help; flex: none; font-size: 12px; color: var(--muted); border-bottom: 1px dashed var(--border); padding-bottom: 1px; }
+  .sc-desc-tip::after {
+    content: attr(data-tip); position: absolute; right: 0; top: calc(100% + 8px); z-index: 40;
+    width: 320px; white-space: pre-line; background: rgba(9, 16, 30, .98); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.75; color: #c3d2e8;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .55); opacity: 0; pointer-events: none; transition: opacity .15s;
+  }
+  .sc-desc-tip:hover::after { opacity: 1; }
+  .sc-mini-sec { margin-bottom: 18px; }
+  .sc-mini-sec > h3 { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; }
+  .sc-mini-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+  .sc-mini-card { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px 8px; background: rgba(148, 163, 184, .035); cursor: pointer; transition: .15s; }
+  .sc-mini-card:hover { border-color: #2c3f66; }
+  .sc-mini-card.active { border-color: rgba(45, 212, 191, .55); background: var(--teal-soft); }
+  .sc-mini-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .sc-mini-name { font-size: 13px; font-weight: 600; flex: 1; min-width: 0; }
+  .sc-mini-box { position: relative; }
+  .sc-mini-foot { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.6; }
+  .sc-mini-foot b { color: var(--text); font-weight: 600; }
+  .sc-mini-empty { height: 100%; display: grid; place-items: center; text-align: center; font-size: 12px; color: var(--muted); border: 1px dashed var(--border); border-radius: 10px; }
+
+  /* 子窗口（评分标准 / 模型信息）：复用面板既有 modal / map-editor 骨架 */
+  .sc-side { border-right: 1px solid var(--border); padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .sc-side-head { font-size: 12px; color: var(--muted); flex: none; }
+  .sc-side-foot { margin-top: auto; padding-top: 12px; border-top: 1px dashed var(--border); flex: none; }
+  .sc-group { border: 1px solid var(--border); border-radius: 11px; background: var(--panel-2); overflow: hidden; flex: none; }
+  .sc-group-head { display: flex; align-items: center; gap: 5px; padding: 7px 9px; background: rgba(148, 163, 184, .06); border-bottom: 1px solid var(--border); }
+  .sc-group-idx { font-size: 11px; color: var(--muted); width: 12px; flex: none; }
+  .sc-group-name { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; font-weight: 600; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 4px 6px; }
+  .sc-group-name:hover { border-color: var(--border); }
+  .sc-group-name:focus { outline: none; border-color: rgba(45, 212, 191, .5); background: var(--panel); }
+  .sc-group-count { font-size: 11px; color: var(--muted); flex: none; }
+  .sc-items { padding: 6px; display: flex; flex-direction: column; gap: 3px; }
+  .sc-item { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+  .sc-item:hover { background: rgba(148, 163, 184, .07); }
+  .sc-item.active { border-color: rgba(45, 212, 191, .5); background: var(--teal-soft); }
+  .sc-item-idx { font-size: 11px; color: var(--muted); width: 12px; flex: none; }
+  .sc-item-name { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sc-item-meta { font-size: 11px; color: var(--muted); flex: none; }
+  .sc-item-empty { font-size: 12px; color: var(--muted); padding: 5px 8px; }
+  .sc-ord-btn {
+    appearance: none; flex: none; width: 22px; height: 22px; line-height: 1; display: inline-grid; place-items: center;
+    border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--muted); font-size: 11px; cursor: pointer; transition: .15s;
+  }
+  .sc-ord-btn:hover { color: var(--teal); border-color: rgba(45, 212, 191, .5); }
+  .sc-ord-btn.sc-del:hover { color: #fb7185; border-color: rgba(251, 113, 133, .5); }
+  .sc-ed-title { font-size: 15px; font-weight: 650; margin-bottom: 16px; display: flex; align-items: baseline; flex-wrap: wrap; }
+  .sc-field { margin-bottom: 16px; }
+  .sc-field > label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+  .sc-field select, .sc-field textarea, .sc-input {
+    font-family: inherit; font-size: 13px; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 9px; padding: 8px 12px;
+  }
+  .sc-field select { min-width: 280px; }
+  .sc-field textarea { width: 100%; resize: vertical; line-height: 1.75; }
+  .sc-field select:focus, .sc-field textarea:focus, .sc-input:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  .sc-hint { font-size: 12px; color: var(--muted); line-height: 1.8; margin-top: 8px; }
+  .sc-hint b { color: var(--teal); font-weight: 600; }
+  .sc-err { color: #fb7185; font-size: 12.5px; min-height: 19px; }
+  .sc-actions-row { display: flex; gap: 10px; margin-top: 4px; padding-top: 14px; border-top: 1px dashed var(--border); }
+  .sc-preview { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+  .sc-preview-item { display: flex; align-items: center; gap: 8px; padding: 4px 9px; border-radius: 8px; background: rgba(148, 163, 184, .05); font-size: 12.5px; }
+  .sc-preview-rank { width: 16px; flex: none; text-align: center; font-size: 11px; color: var(--muted); }
+  .sc-preview-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sc-preview-val { flex: none; font-weight: 600; color: #7ff3e3; font-variant-numeric: tabular-nums; }
+  .sc-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: rgba(148, 163, 184, .04); }
+  .sc-row select { min-width: 210px; flex: 1; }
+  .sc-row input[type="number"] { width: 130px; font-variant-numeric: tabular-nums; }
+  .sc-row input[type="number"]::-webkit-outer-spin-button,
+  .sc-row input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+  .sc-row-state { font-size: 11.5px; color: var(--muted); flex: none; }
+  .sc-row-state.ok { color: #7ff3e3; }
+  .sc-row-state.err { color: #fb7185; }
+  .sc-footnote { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.9; }
+  .sc-footnote b { color: var(--text); }
+  .sc-btn-block { display: block; width: 100%; }
+
+  /* ===== 按模型筛选条 ===== */
+  .sc-filter-panel { padding: 10px 14px; }
+  .sc-filter-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .sc-filter-label { font-size: 12.5px; font-weight: 600; color: var(--text); flex: none; }
+  .sc-filter-row .seg button { min-width: 48px; font-weight: 650; letter-spacing: .5px; }
+  .sc-filter-hint { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .sc-filter-hint:empty { display: none; }
+
+  /* 多选下拉（分组 → 模型，组头三态复选框） */
+  .sc-msel { position: relative; }
+  .sc-msel-btn { min-width: 176px; justify-content: center; }
+  .sc-msel-btn.has-sel { color: var(--teal); border-color: rgba(45, 212, 191, .5); }
+  .sc-msel-panel {
+    position: absolute; top: calc(100% + 8px); left: 0; z-index: 60;
+    width: 320px; max-width: calc(100vw - 40px); max-height: 420px; overflow-y: auto;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 18px 44px rgba(0, 0, 0, .55);
+    padding: 8px;
+  }
+  .sc-msel-group {
+    border: 1px solid var(--border); border-radius: 10px; overflow: hidden;
+    background: var(--panel); margin-bottom: 6px;
+  }
+  .sc-msel-group:last-child { margin-bottom: 0; }
+  .sc-msel-ghead {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer;
+    background: rgba(148, 163, 184, .06); border-bottom: 1px solid var(--border);
+  }
+  .sc-msel-ghead:hover { background: rgba(148, 163, 184, .11); }
+  .sc-msel-gname { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; }
+  .sc-msel-gcount { font-size: 11px; color: var(--muted); flex: none; font-variant-numeric: tabular-nums; }
+  .sc-msel-items { padding: 5px 6px; display: flex; flex-direction: column; gap: 2px; }
+  .sc-msel-item {
+    display: flex; align-items: center; gap: 8px; padding: 5px 8px;
+    border-radius: 7px; cursor: pointer; font-size: 12.5px;
+  }
+  .sc-msel-item:hover { background: rgba(148, 163, 184, .07); }
+  .sc-msel-iname { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 勾选的模型名：统一衬底（中性灰）保证彩色文字在深色底上清晰可读 */
+  .sc-msel-item.checked { background: rgba(148, 163, 184, .18); }
+  .sc-msel-item.checked:hover { background: rgba(148, 163, 184, .24); }
+  .sc-msel-item.checked .sc-msel-iname { font-weight: 650; }
+  .sc-msel-panel input[type="checkbox"] {
+    width: 14px; height: 14px; flex: none; margin: 0; cursor: pointer;
+    accent-color: var(--teal);
   }
 
   @media (max-width: 760px) {
-    .cards { grid-template-columns: 1fr; }
-    .stats { grid-template-columns: repeat(2, 1fr); }
-    .chart-box { height: 380px; }
-    #providerSel, #modelSel { min-width: 140px; }
-    .modal-body { grid-template-columns: 1fr; }
-    .map-list { border-right: 0; border-bottom: 1px solid var(--border); max-height: 200px; }
+    .sc-chart-box { height: 360px; }
+    .sc-mini-grid { grid-template-columns: 1fr; }
+    .sc-filter-hint { margin-left: 0; width: 100%; }
+    .sc-msel-btn { min-width: 0; flex: 1; }
   }
 </style>
 </head>
@@ -698,6 +869,7 @@
       <span class="badge teal">本地数据 · 实时口径</span>
       <span class="badge" id="todayBadge">–</span>
       <button type="button" class="btn ghost" id="quotaBtn"><span class="ico">◔</span> 额度估计</button>
+      <button type="button" class="btn ghost" id="scoreBtn"><span class="ico">◫</span> 模型评分</button>
       <button type="button" class="icon-btn" id="settingsBtn" title="设置" aria-label="设置">⚙</button>
     </div>
   </header>
@@ -813,6 +985,108 @@
     <b>下钻</b>：点击任一柱子（或今日卡片「详细」）出现该时段「按提供商分布」饼图，点击扇区继续下钻该提供商「按模型分布」；再点同一柱/扇区取消。窗口汇总卡片的「详细」展示当前整个窗口范围（多天 / 全年合并）的分布饼图。
     「刷新」按钮执行一次各平台增量扫描并完成逐日固化、逐月归档与滚动清理。
   </p>
+
+  <!-- ============ 模型评分页（model-scorecard, v15）============
+       本区块只是骨架，图表 / 列表 / 表单等动态内容全部由 score.js 渲染；
+       可见性由 body.score-view 与 #scorePage 的两条 CSS 规则控制（进页面时 JS 只切 .score-view）。 -->
+  <section id="scorePage" hidden>
+    <header class="sc-head">
+      <div class="sc-brand">
+        <button type="button" class="btn ghost" id="scoreBackBtn" title="返回首页">← 返回</button>
+        <div>
+          <h2>模型评分</h2>
+          <div class="sc-sub">按评分标准横向对比各模型分值　·　数据可在「评分标准」「模型信息」里维护</div>
+        </div>
+      </div>
+      <div class="sc-actions">
+        <span class="badge" id="scoreCount">–</span>
+        <button type="button" class="btn ghost" id="scoreCriteriaBtn"><span class="ico">⚖</span> 评分标准</button>
+        <button type="button" class="btn primary" id="scoreModelsBtn">＋ 模型信息</button>
+        <button type="button" class="btn ghost" id="scoreResetBtn" title="清空当前评分数据并写回内置数据（不可撤销）">↺ 恢复内置数据</button>
+      </div>
+    </header>
+
+    <!-- 按模型筛选：模式切换（OR/AND）→ 模型多选下拉 → 清空；面板内容与交互由 score.js 渲染 -->
+    <section class="panel sc-filter-panel">
+      <div class="sc-filter-row">
+        <span class="sc-filter-label">按模型筛选</span>
+        <div class="seg" role="group" aria-label="匹配模式">
+          <button type="button" id="scoreModeOr" class="active" title="OR：选中的模型里只要任意一个在该标准下有分值，该标准就显示">OR</button>
+          <button type="button" id="scoreModeAnd" title="AND：选中的模型必须全部在该标准下有分值，该标准才显示">AND</button>
+        </div>
+        <div class="sc-msel" id="scoreMsel">
+          <button type="button" class="btn ghost sc-msel-btn" id="scoreMselBtn" aria-haspopup="listbox">按模型筛选（未选）</button>
+          <div class="sc-msel-panel" id="scoreMselPanel" hidden></div>
+        </div>
+        <button type="button" class="btn ghost" id="scoreClearFilter" title="清空模型勾选并恢复 OR 模式" disabled>✕ 清空</button>
+        <span class="sc-filter-hint" id="scoreFilterHint"></span>
+      </div>
+    </section>
+
+    <!-- 主图：第一个分组的第一个评分标准，按分值从高到低 -->
+    <section class="panel">
+      <div class="sc-chart-head">
+        <h2 id="scoreMainTitle">–</h2>
+        <div class="sc-toolbar">
+          <span class="sc-desc-tip" id="scoreDescTip">ⓘ 悬浮看说明</span>
+          <div class="seg" role="group" aria-label="切换评分标准">
+            <button type="button" id="scorePrevBtn" title="上一个评分标准">‹</button>
+            <button type="button" id="scoreNextBtn" title="下一个评分标准">›</button>
+          </div>
+          <label class="field"><span>评分标准</span><select id="scoreCritSel" aria-label="评分标准"></select></label>
+        </div>
+      </div>
+      <div class="sc-meta" id="scoreMainMeta"></div>
+      <div class="sc-chart-box" id="scoreMainBox"><canvas id="scoreMainChart" aria-label="各模型分值横向柱状图"></canvas></div>
+    </section>
+
+    <!-- 全部评分标准：每条一张小图，点小图切主图 -->
+    <section class="panel">
+      <div class="sc-chart-head">
+        <h2>全部评分标准</h2>
+        <span class="muted">按分组列出每一条的小图（同样从高到低）　·　点小图 = 切换上方主图</span>
+      </div>
+      <div id="scoreGridWrap"></div>
+    </section>
+
+    <p class="sc-footnote">
+      <b>口径</b>：主图与小图都是「同一条评分标准下、各模型分值从高到低」的横向柱状图，柱端数字是分值。
+      百分比类标准横轴固定 <b>0~100%</b>；数值类标准横轴按<b>本条最大值</b>定标，所以只有同一条标准内的柱长可以直接比。
+      没填分值的模型不进图（小图脚注会写「几个模型有分」），图旁会提示未评分模型数量。
+    </p>
+  </section>
+</div>
+
+<!-- ============ 模型评分 · 评分标准子窗口 ============ -->
+<div class="modal-mask" id="scoreCriteriaModal" hidden>
+  <div class="modal" role="dialog" aria-label="评分标准">
+    <div class="modal-head">
+      <h2>评分标准</h2>
+      <span class="muted">一条标准 = 名称 + 分组 + 单位（百分比 / 数值）+ 说明</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="sc-side" id="scoreCriteriaList"></div>
+      <div class="map-editor" id="scoreCriteriaEditor"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 模型评分 · 模型信息子窗口 ============ -->
+<div class="modal-mask" id="scoreModelsModal" hidden>
+  <div class="modal" role="dialog" aria-label="模型信息">
+    <div class="modal-head">
+      <h2>模型信息</h2>
+      <span class="muted">一个模型 = 名称 + 分组 + 若干「评分维度」（选标准 → 填分值）</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="sc-side" id="scoreModelList"></div>
+      <div class="map-editor" id="scoreModelEditor"></div>
+    </div>
+  </div>
 </div>
 
 <!-- 设置入口弹窗（统一设置入口，后续扩展更多设置项） -->
@@ -1017,5 +1291,8 @@
 <!-- 套餐额度估算引擎（纯函数、无 DOM）：必须在 app.js 之前加载 -->
 <script src="./quota-eval.js"></script>
 <script src="./app.js"></script>
+<!-- 模型评分页（v15）：自己拉 /api/score、渲染主图与小图、两个子窗口；复用 app.js 暴露的 window.showToast -->
+<script src="./score-filter.js"></script>
+<script src="./score.js"></script>
 </body>
 </html>

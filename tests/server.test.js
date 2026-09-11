@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, rmSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { openDb } from '../src/store.js';
+import { SCORE_SEED } from '../src/score-seed.js';
 import { createApp } from '../src/server.js';
 import { todayKey, localDateAddDays } from '../src/aggregate.js';
 import { saveMapping } from '../src/mapping.js';
@@ -24,6 +25,14 @@ function makeApp() {
   const { handle } = createApp({ db, maintenance, modelPriceDir: join(root, 'model-price') });
   return { root, db, handle, maintenance };
 }
+
+/** 内置数据的期望规模（由 SCORE_SEED 推导，避免每改一次内置数据就回来改断言） */
+const SEED_SHAPE = {
+  criteria: SCORE_SEED.criteria.length,
+  models: SCORE_SEED.models.length,
+  criterionGroups: SCORE_SEED.criterionGroups.length,
+  filled: Object.values(SCORE_SEED.scores).reduce((n, r) => n + Object.keys(r).length, 0),
+};
 
 async function call(handle, url) {
   const res = {
@@ -1636,4 +1645,126 @@ test('启动自动加载：目录缺失零摘要不抛；合法文件加载即�
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/* ================= v15 模型评分 API（model-scorecard） ================= */
+
+test('模型评分 API：GET /api/score 返回整包，规模为内置数据', async () => {
+  const { root, handle } = makeApp();
+  try {
+    const { status, body } = await call(handle, '/api/score');
+    assert.equal(status, 200);
+    assert.deepEqual(Object.keys(body).sort(), ['criteria', 'criterionGroups', 'modelGroups', 'models', 'scores']);
+    assert.equal(body.criteria.length, SEED_SHAPE.criteria);
+    assert.equal(body.models.length, SEED_SHAPE.models);
+    assert.equal(body.criterionGroups.length, SEED_SHAPE.criterionGroups);
+    assert.equal(Object.values(body.scores).reduce((n, r) => n + Object.keys(r).length, 0), SEED_SHAPE.filled);
+    assert.equal(body.scores['m-k3']['c-gpqa'], 93.5);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('模型评分 API：标准与分组的建改 / 删除 / 重排，以及 400 与 404 分支', async () => {
+  const { root, handle } = makeApp();
+  try {
+    // 新建分组 + 新建标准
+    assert.equal((await callBody(handle, 'POST', '/api/score/criterion-groups', { name: 'API 分组' })).status, 200);
+    const cg = (await call(handle, '/api/score')).body.criterionGroups.find((g) => g.name === 'API 分组');
+    assert.ok(cg);
+    const created = await callBody(handle, 'POST', '/api/score/criteria', {
+      groupId: cg.id, name: 'API 标准', unit: 'pct', description: '来自路由测试',
+    });
+    assert.equal(created.status, 200);
+    let board = (await call(handle, '/api/score')).body;
+    const crit = board.criteria.find((c) => c.name === 'API 标准');
+    assert.ok(crit && crit.desc === '来自路由测试');
+
+    // 400：单位非法 / 重名 / 非空分组删除
+    assert.equal((await callBody(handle, 'POST', '/api/score/criteria', { groupId: cg.id, name: 'X', unit: 'ratio' })).status, 400);
+    assert.equal((await callBody(handle, 'POST', '/api/score/criteria', { groupId: cg.id, name: 'API 标准', unit: 'pct' })).status, 400);
+    assert.equal((await callBody(handle, 'DELETE', `/api/score/criterion-groups/${cg.id}`)).status, 400);
+
+    // 重排标准分组（全量顺序）
+    const ids = board.criterionGroups.map((g) => g.id);
+    const rotated = [ids[ids.length - 1], ...ids.slice(0, -1)];
+    assert.equal((await callBody(handle, 'PUT', '/api/score/criterion-groups/order', { ids: rotated })).status, 200);
+    board = (await call(handle, '/api/score')).body;
+    assert.deepEqual(board.criterionGroups.map((g) => g.id), rotated);
+
+    // 删除标准 → 连带清分值
+    assert.equal((await callBody(handle, 'DELETE', `/api/score/criteria/${crit.id}`)).status, 200);
+    assert.equal((await call(handle, '/api/score')).body.criteria.some((c) => c.id === crit.id), false);
+
+    // 404：未知资源 / 未知方法组合
+    assert.equal((await call(handle, '/api/score/nope')).status, 404);
+    assert.equal((await callBody(handle, 'PUT', '/api/score/criteria/whatever', {})).status, 404);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('模型评分 API：模型建改（含越界 400）/ 重排 / 删除 / POST /api/score/reset', async () => {
+  const { root, handle } = makeApp();
+  try {
+    const board0 = (await call(handle, '/api/score')).body;
+    const mg = board0.modelGroups[0];
+
+    // 新建模型 + 两个维度
+    const saved = await callBody(handle, 'POST', '/api/score/models', {
+      groupId: mg.id, name: 'API 模型',
+      entries: [{ criterionId: 'c-gpqa', value: 77.7 }, { criterionId: 'c-codeforces', value: 3000 }],
+    });
+    assert.equal(saved.status, 200);
+    assert.ok(saved.body.id);
+    let board = (await call(handle, '/api/score')).body;
+    assert.equal(board.scores[saved.body.id]['c-gpqa'], 77.7);
+    assert.equal(board.scores[saved.body.id]['c-codeforces'], 3000);
+
+    // 400：百分比越界 / 同模型重复标准 / 名称重复
+    assert.equal((await callBody(handle, 'POST', '/api/score/models', {
+      groupId: mg.id, name: 'API 模型2', entries: [{ criterionId: 'c-gpqa', value: 200 }],
+    })).status, 400);
+    assert.equal((await callBody(handle, 'POST', '/api/score/models', {
+      groupId: mg.id, name: 'API 模型2', entries: [{ criterionId: 'c-gpqa', value: 1 }, { criterionId: 'c-gpqa', value: 2 }],
+    })).status, 400);
+    assert.equal((await callBody(handle, 'POST', '/api/score/models', {
+      groupId: mg.id, name: 'Kimi K3', entries: [],
+    })).status, 400);
+
+    // 组内重排（含该组原有模型）
+    const groupIds = board.models.filter((m) => m.groupId === mg.id).map((m) => m.id);
+    const reversed = [...groupIds].reverse();
+    assert.equal((await callBody(handle, 'PUT', '/api/score/models/order', { groupId: mg.id, ids: reversed })).status, 200);
+    board = (await call(handle, '/api/score')).body;
+    assert.deepEqual(board.models.filter((m) => m.groupId === mg.id).map((m) => m.id), reversed);
+
+    // 删除模型 → 连带清分值
+    const del = await callBody(handle, 'DELETE', `/api/score/models/${saved.body.id}`);
+    assert.equal(del.status, 200);
+    assert.equal(del.body.affected, 2);
+    board = (await call(handle, '/api/score')).body;
+    assert.equal(board.models.some((m) => m.id === saved.body.id), false);
+    assert.equal(board.scores[saved.body.id], undefined);
+
+    // 恢复内置数据
+    const reset = await callBody(handle, 'POST', '/api/score/reset');
+    assert.equal(reset.status, 200);
+    assert.deepEqual(reset.body, { ok: true, criteria: SEED_SHAPE.criteria, models: SEED_SHAPE.models, filled: SEED_SHAPE.filled, possible: SEED_SHAPE.criteria * SEED_SHAPE.models });
+    assert.equal((await call(handle, '/api/score')).body.criteria.length, SEED_SHAPE.criteria);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test('静态资源：/score.js 在白名单内可取，未登记路径 404', async () => {
+  const { root, handle } = makeApp();
+  try {
+    const res = {
+      status: null, body: null,
+      writeHead(status) { this.status = status; },
+      end(body) { this.body = body; }
+    };
+    await handle({ method: 'GET', url: '/score.js' }, res);
+    assert.equal(res.status, 200);
+    assert.ok(String(res.body).includes('模型评分'), 'score.js 应可被面板取到');
+
+    const miss = { status: null, body: null, writeHead(s) { this.status = s; }, end(b) { this.body = b; } };
+    await handle({ method: 'GET', url: '/not-registered.js' }, miss);
+    assert.equal(miss.status, 404);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -45,6 +45,12 @@ import {
   startQuotaPreset, stopQuotaPreset, invalidatePresetsFor, invalidatePresetsForPlans,
   abandonQuotaPreset, migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots
 } from './quota.js';
+import {
+  loadScoreboard, saveCriterionGroup, deleteCriterionGroup, reorderCriterionGroups,
+  saveCriterion, deleteCriterion, reorderCriteria,
+  saveModelGroup, deleteModelGroup, reorderModelGroups,
+  saveModel, deleteModel, reorderModels, resetScore
+} from './score.js';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -1188,11 +1194,68 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         });
       }
 
+      // ---- v15 模型评分（model-scorecard）----
+      // 评分标准 / 模型 / 分值是本域自有的独立配置：只读写 score_* 五张表，与 usage_* / cost_* /
+      // quota_* / plan_* / map_* 无关。写操作返回 {ok:true,...}，面板收到后重新 GET /api/score
+      // 拉整包重渲染；校验失败一律 400 + {error} 文案（前端直接提示）。
+      if (req.method === 'GET' && path === '/api/score') {
+        return sendJson(res, 200, loadScoreboard(db));
+      }
+
+      if (req.method === 'POST' && path === '/api/score/reset') {
+        try {
+          return sendJson(res, 200, resetScore(db));
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
+      // 四类资源统一形态：建改 = POST 集合路径；删除 = DELETE /:id；重排 = PUT /order（body {ids[, groupId]}）
+      const SCORE_RESOURCES = {
+        'criterion-groups': {
+          save: saveCriterionGroup, del: deleteCriterionGroup,
+          reorder: (body) => reorderCriterionGroups(db, body?.ids),
+        },
+        'criteria': {
+          save: saveCriterion, del: deleteCriterion,
+          reorder: (body) => reorderCriteria(db, body?.groupId, body?.ids),
+        },
+        'model-groups': {
+          save: saveModelGroup, del: deleteModelGroup,
+          reorder: (body) => reorderModelGroups(db, body?.ids),
+        },
+        'models': {
+          save: saveModel, del: deleteModel,
+          reorder: (body) => reorderModels(db, body?.groupId, body?.ids),
+        },
+      };
+
+      if (path.startsWith('/api/score/')) {
+        const seg = path.slice('/api/score/'.length).split('/');
+        const resource = SCORE_RESOURCES[seg[0]];
+        if (!resource) return sendJson(res, 404, { error: `未知路径：${path}` });
+        try {
+          if (req.method === 'POST' && seg.length === 1) {
+            return sendJson(res, 200, resource.save(db, await readBody(req)));
+          }
+          if (req.method === 'DELETE' && seg.length === 2) {
+            return sendJson(res, 200, resource.del(db, decodeURIComponent(seg[1])));
+          }
+          if (req.method === 'PUT' && seg.length === 2 && seg[1] === 'order') {
+            return sendJson(res, 200, resource.reorder(await readBody(req)));
+          }
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        return sendJson(res, 404, { error: `未知路径：${path}` });
+      }
+
       // 静态文件（白名单内，防目录穿越）：quota-eval.js 为套餐额度估算引擎（纯函数，app.js 依赖它）
       if (req.method === 'GET') {
         const allow = {
           '/': 'index.html', '/index.html': 'index.html',
-          '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js'
+          '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js',
+          '/score.js': 'score.js', '/score-filter.js': 'score-filter.js'
         };
         const file = allow[path];
         if (file) {

@@ -44,14 +44,19 @@
  * 列级 UNIQUE(map_name) 无法摘除约束，升级为表级 UNIQUE(map_name, plan_name) 组合唯一；
  * 存量行回填所在提供商条目的当前套餐（条目不存在或无当前套餐回填 '' = 绑定悬空态），
  * 旧数据一提供商至多一条预设，组合键必不撞唯一约束；usage_* / cost_* / quota_snapshots 零改动。
+ * schema v15（model-scorecard）：新增模型评分五张纯配置表（score_criterion_groups / score_criteria /
+ * score_model_groups / score_models / score_values），并在首次建表后写入内置评分数据
+ * （4 个标准分组 / 59 条标准 / 7 个模型分组 / 16 个模型 / 378 个分值，来自用户提供的来源材料）；
+ * 纯新增：usage_* / cost_* / quota_* / plan_* / map_* 表零改动，不参与防重复统计与增量统计。
  */
 
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync, copyFileSync, readdirSync, unlinkSync, existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { SCORE_SEED } from './score-seed.js';
 
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /** 运行数据根目录（测试可通过 envOverride 注入临时 HOME） */
 export function dataDir(envOverride = process.env) {
@@ -587,6 +592,81 @@ CREATE TABLE IF NOT EXISTS plan_quota_coef_tiers (
 `;
 
 /**
+ * schema v15（model-scorecard）：模型评分的五张纯配置表。
+ * 全部是本域自有的独立数据，不与 usage_* / cost_* / quota_* / plan_* / map_* 发生任何外键或读写关系；
+ * 主键用 TEXT 业务 id（内置数据带 id 落库 → 重跑种子幂等、前端可直接用 id 保持选中态）；
+ * sort_order 是「组内」序号，跨组顺序由分组的 sort_order 决定；
+ * score_values 缺行 = 该模型在该评分标准上未评分（不存 NULL、不存 0）。
+ * 一次性建表（幂等），存量库由 v14→v15 递进路径补建。
+ */
+const SCORE_SQL = `
+CREATE TABLE IF NOT EXISTS score_criterion_groups (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS score_criteria (
+  id          TEXT PRIMARY KEY,
+  group_id    TEXT NOT NULL REFERENCES score_criterion_groups(id) ON UPDATE CASCADE ON DELETE RESTRICT,
+  name        TEXT NOT NULL UNIQUE,
+  unit        TEXT NOT NULL CHECK (unit IN ('pct', 'num')),
+  description TEXT NOT NULL DEFAULT '',
+  sort_order  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS score_model_groups (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS score_models (
+  id         TEXT PRIMARY KEY,
+  group_id   TEXT NOT NULL REFERENCES score_model_groups(id) ON UPDATE CASCADE ON DELETE RESTRICT,
+  name       TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS score_values (
+  model_id     TEXT NOT NULL REFERENCES score_models(id) ON DELETE CASCADE,
+  criterion_id TEXT NOT NULL REFERENCES score_criteria(id) ON DELETE CASCADE,
+  value        REAL NOT NULL,
+  PRIMARY KEY (model_id, criterion_id)
+);
+`;
+
+/**
+ * 写入模型评分的内置数据（model-scorecard）：仅当 score_criteria 为空时执行，整批在一个事务内完成。
+ * 内置数据来自用户提供的 4 份来源（官方评测表 + 三张对比图），由 dev-file/scripts/build-score-seed.mjs
+ * 生成 src/score-seed.js；主键固定，因此即使逻辑被重入也不会产生重复条目。
+ * 首次建库（openDb → migrate）与「恢复内置数据」都走这里，seed.js 之外的写入口只有 scoreValues 的 CRUD。
+ * @returns {boolean} 是否写入（false = 已有数据，跳过）
+ */
+export function seedScoreTables(db) {
+  const existing = db.prepare('SELECT COUNT(*) AS n FROM score_criteria').get().n;
+  if (existing > 0) return false;
+  runInTransaction(db, () => {
+    const gIns = db.prepare('INSERT INTO score_criterion_groups (id, name, sort_order) VALUES (?, ?, ?)');
+    SCORE_SEED.criterionGroups.forEach((g) => gIns.run(g.id, g.name, g.order));
+    const cIns = db.prepare(
+      'INSERT INTO score_criteria (id, group_id, name, unit, description, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+    SCORE_SEED.criteria.forEach((c) => cIns.run(c.id, c.groupId, c.name, c.unit, c.desc ?? '', c.order));
+    const mgIns = db.prepare('INSERT INTO score_model_groups (id, name, sort_order) VALUES (?, ?, ?)');
+    SCORE_SEED.modelGroups.forEach((g) => mgIns.run(g.id, g.name, g.order));
+    const mIns = db.prepare('INSERT INTO score_models (id, group_id, name, sort_order) VALUES (?, ?, ?, ?)');
+    SCORE_SEED.models.forEach((m) => mIns.run(m.id, m.groupId, m.name, m.order));
+    const vIns = db.prepare('INSERT INTO score_values (model_id, criterion_id, value) VALUES (?, ?, ?)');
+    Object.keys(SCORE_SEED.scores).forEach((modelId) => {
+      const row = SCORE_SEED.scores[modelId] || {};
+      Object.keys(row).forEach((criterionId) => vIns.run(modelId, criterionId, row[criterionId]));
+    });
+  });
+  return true;
+}
+
+/**
  * v6 列迁移：plan_model_prices 无 tiered 列则补（v4/v5 存量库），幂等。
  * 全新库与 v3→v4 递进路径的 PLAN_SQL 已含该列，此处为空操作。
  */
@@ -727,7 +807,8 @@ export function migrate(db) {
   if (current < 1) {
     // 全新库：v2 业务表 + v3 映射配置表 + v4 套餐配置表 + v5 待决清单表 + v6 分段/费用/额度表
     // + v8 费用模板表 + v9 套餐额度分段计价表一次建齐（套餐价格表的 v8 列、
-    // quota_presets 的 v10/v14 列与组合唯一约束、条目排序与模板分组的 v12 列已含在 CREATE 定义中）
+    // quota_presets 的 v10/v14 列与组合唯一约束、条目排序与模板分组的 v12 列已含在 CREATE 定义中），
+    // 最后建 v15 模型评分表并写入内置评分数据
     db.exec(SCHEMA_SQL);
     db.exec(MAPPING_SQL);
     db.exec(PLAN_SQL);
@@ -735,6 +816,8 @@ export function migrate(db) {
     db.exec(TIERED_COST_QUOTA_SQL);
     db.exec(TEMPLATE_SQL);
     db.exec(QUOTA_COEF_SQL);
+    db.exec(SCORE_SQL);
+    seedScoreTables(db);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }
@@ -750,6 +833,7 @@ export function migrate(db) {
   // v12→v13 quota_snapshots 补 eval_json 列（幂等纯加列，不改既有行数据）；
   // v13→v14 重建 quota_presets（quota-preset-plan-binding）——补 plan_name 组合绑定列、
   // 列级 UNIQUE(map_name) 升级表级 UNIQUE(map_name, plan_name)，存量行回填当前套餐
+  // v14→v15 纯新增模型评分配置表 + 首次写入内置评分数据（model-scorecard，幂等）
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     runInTransaction(db, () => {
@@ -772,6 +856,11 @@ export function migrate(db) {
       if (current < 12) ensureV12Columns(db);
       if (current < 13) ensureEvalJsonColumn(db);
       if (current < 14) rebuildQuotaPresetsForPlanName(db);
+      if (current < 15) {
+        // 纯新增五张模型评分配置表 + 首次写入内置评分数据（表非空则跳过，幂等）
+        db.exec(SCORE_SQL);
+        seedScoreTables(db);
+      }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });
   } finally {
