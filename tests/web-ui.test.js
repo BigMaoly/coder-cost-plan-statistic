@@ -204,3 +204,111 @@ test('快照详情单位金额 token 比值气泡（tokPerMoney 纯前端计算�
     '缺估算总额度或包月金额 ≤ 0 应返回 null（不渲染比值）');
 });
 
+
+/* ===== 任务基准（quota-snapshot-benchmark）前端契约 ===== */
+
+const bmkJs = readFileSync(join(webRoot, 'quota-benchmark.js'), 'utf8');
+
+test('任务基准：设置入口第 4 条、配置页骨架、脚本引入顺序与 [hidden] 兜底', () => {
+  // 设置弹窗第 4 条「统计基准」入口（meta 概览 + 点击进配置页）
+  assert.match(indexHtml, /id="settingsItemBmk"/, '设置弹窗应有第 4 条「统计基准」入口');
+  assert.match(indexHtml, /id="settingsBmkMeta"/, '入口应带概览计数节点');
+  assert.match(bmkJs, /settingsItemBmk/, 'quota-benchmark.js 应绑定设置入口');
+  // 配置页骨架：左 .bmk-side 分组盒侧栏 + 右 .map-editor 编辑器
+  assert.match(indexHtml, /id="bmkModal"/, '应有基准配置页弹窗 #bmkModal');
+  assert.ok(/id="bmkModal"/.test(indexHtml) && /id="bmkList"/.test(indexHtml) && /id="bmkEditor"/.test(indexHtml),
+    '配置页应含 #bmkList 侧栏与 #bmkEditor 编辑器');
+  assert.match(bmkJs, /window\.QuotaBenchmark = \{/, '模块应挂 window.QuotaBenchmark 装配入口');
+  // 脚本顺序：quota-benchmark.js 在 app.js 之后（读取其暴露的 QuotaBenchmarkBridge）
+  const iApp = indexHtml.indexOf('<script src="./app.js">');
+  const iBmk = indexHtml.indexOf('<script src="./quota-benchmark.js">');
+  assert.ok(iApp > 0 && iBmk > iApp, 'quota-benchmark.js 应在 app.js 之后引入');
+  // [hidden] 兜底：display:flex 容器显式写规则（score-combobox 同源踩坑）
+  assert.match(indexHtml, /\.bmk-side\[hidden\], \.bmk-items\[hidden\], \.bmk-picker\[hidden\] \{ display: none; \}/,
+    'flex 容器应有 [hidden] 兜底规则');
+});
+
+test('任务基准：记录窗口标记按钮 / 基准筛选 / 条目标签与悬浮气泡入口', () => {
+  // 工具栏「◈ 标记为基准」（未勾选禁用）与「基准」筛选下拉（候选含「未设基准（N）」）
+  assert.match(appJs, /id="bmkMarkBtn"/, '工具栏应有「标记为基准」按钮');
+  assert.match(appJs, /\(recs\.selected\.size \? '' : ' disabled'\)[^>]*>◈ 标记为基准/,
+    '未勾选任何条目时标记按钮应禁用');
+  assert.match(appJs, /id="recsBmkSel"/, '工具栏应有「基准」筛选下拉');
+  assert.ok(appJs.includes("__none__") && appJs.includes('未设基准（'), '筛选应含「未设基准（N）」取值 __none__');
+  assert.match(appJs, /if \(recs\.benchmark\) q\.set\('benchmark', recs\.benchmark\);/, 'loadRecs 应携带 benchmark 参数');
+  // 条目基准标签：形态恒定「◈ <名字>」，复用 tip-info/tip-pop 悬浮气泡机制
+  assert.match(appJs, /class="ri-bmk tip-info"/, '条目应渲染 .ri-bmk 标签并挂 tip-info 气泡入口');
+  assert.ok(appJs.includes('该基准未填写说明信息'), '描述为空时气泡应显示占位文案');
+  assert.ok(appJs.includes('标记时的快照：基准配置此后改名、改说明或删除，都不会改变这条记录'),
+    '气泡应写明「完全独立」口径');
+  // 标签点击为独立分支：打开基准比较窗口（quota-benchmark-compare），不触发行详情
+  assert.match(appJs, /const bmkTag = t\.closest\('\.ri-bmk'\);/, '标签点击应有独立分支（不触发行详情）');
+  assert.match(appJs, /window\.QuotaBenchmarkCompare\?\.open\(bmkTag\.dataset\.bmk, bmkTag\)/,
+    '标签点击应可选调用基准比较模块');
+  // ⚙ 菜单：标记 / 清除两条路径
+  assert.ok(appJs.includes("label: '◈ 标记为基准…'"), '条目菜单应有「标记为基准…」');
+  assert.ok(appJs.includes("label: '清除该条基准'"), '条目菜单应有「清除该条基准」');
+  // 装配桥：依赖注入（下拉模块不触碰 app.js 内部状态）
+  assert.match(appJs, /window\.QuotaBenchmarkBridge = \{/, 'app.js 应暴露 QuotaBenchmarkBridge 装配桥');
+  assert.match(bmkJs, /window\.QuotaBenchmarkBridge \|\| null/, '下拉应经桥依赖注入装配');
+});
+
+
+/* ===== 基准比较（quota-benchmark-compare）前端契约 ===== */
+
+const bmkCmpJs = readFileSync(join(webRoot, 'quota-benchmark-compare.js'), 'utf8');
+
+test('基准比较：标签 data-bmk 与点击分支、弹窗骨架、样式段与脚本顺序', () => {
+  // 标签：data-bmk 携带记录固化名字；aria/title 表述「悬浮查看说明，点击查看基准比较」
+  assert.ok(appJs.includes(`data-bmk="' + esc(b.name)`), '基准标签应带 data-bmk 属性（事件委托取名字的来源）');
+  assert.ok(appJs.includes('悬浮查看说明，点击查看基准比较'), '标签 aria/title 应说明悬浮与点击两种行为');
+  // 模块：暴露 open/close、调 compare 接口、汇率输入框禁用 number 型（"7." 中间态丢小数点）
+  assert.match(bmkCmpJs, /window\.QuotaBenchmarkCompare = \{ open, close \}/, '模块应暴露 window.QuotaBenchmarkCompare');
+  assert.ok(bmkCmpJs.includes("'/api/quota/benchmarks/compare?name='"), '模块应调用 compare 只读接口');
+  assert.match(bmkCmpJs, /inputmode="decimal"/, '汇率输入框应为 text + inputmode=decimal');
+  // 弹窗骨架与样式段
+  assert.match(indexHtml, /id="bmkCmpModal"/, '应有 #bmkCmpModal 弹窗骨架');
+  assert.match(indexHtml, /id="bmkCmpBody"/, '窗口应有动态渲染容器 #bmkCmpBody');
+  assert.match(indexHtml, /id="bmkCmpCloseBtn"/, '窗口应有关闭按钮');
+  assert.match(indexHtml, /\.bmk-cmp-summary \{/, '应有 .bmk-cmp- 样式段（摘要条）');
+  assert.match(indexHtml, /\.modal-mask\.bmk-cmp-mask \{ z-index: 93; \}/, '比较窗口应盖过记录窗口（recs-mask 92）');
+  // [hidden] 兜底 + 窄屏横向滚动（9 列表最小宽度，不裁列）
+  assert.match(indexHtml, /\.bmk-cmp-summary\[hidden\], \.bmk-cmp-fx-row\[hidden\]/, 'flex 容器应有 [hidden] 兜底规则');
+  assert.match(indexHtml, /min-width: 1030px/, '9 列比较表应有最小可用宽度（末三列按区间文本校准；窄屏整表横向滚动，不裁列）');
+  // 区间值（a ~ b）布局适配：区间字号两分支都生效、U 列区间也挂 rng、末三列加宽轨道
+  assert.match(indexHtml, /\.bmk-cmp-cell\.rng \{ font-size: 10\.5px; \}/, '区间单元字号应小于单值（主分支 10.5px）');
+  assert.match(indexHtml, /\.bmk-cmp-row \.bmk-cmp-cell\.rng \{ font-size: 10px; \}/, '窄屏分支应显式保留区间字号规则（不被通用字号覆盖）');
+  assert.ok(bmkCmpJs.includes(`class="bmk-cmp-cell num u' + (isRange(g.display) ? ' rng' : '') + '"`),
+    'U 列值形态为区间时也应挂 rng class');
+  // 脚本顺序：app.js → quota-benchmark.js → quota-benchmark-compare.js（紧随其后）
+  const iApp = indexHtml.indexOf('<script src="./app.js">');
+  const iBmk = indexHtml.indexOf('<script src="./quota-benchmark.js">');
+  const iCmp = indexHtml.indexOf('<script src="./quota-benchmark-compare.js">');
+  assert.ok(iApp > 0 && iBmk > iApp && iCmp > iBmk, 'quota-benchmark-compare.js 应紧随 quota-benchmark.js（app.js 之后）引入');
+});
+
+test('快照备注：详情行内输入框、maxlength/placeholder、样式段与 keydown/focusout 委托', () => {
+  // 详情渲染：备注行插在「折算等价金额」之后、评估区块之前（quota-snapshot-note）
+  const equivIdx = appJs.indexOf("row('折算等价金额'");
+  const noteIdx = appJs.indexOf("row('备注', '<input type=\"text\" class=\"rd-note\"");
+  const evalIdx = appJs.indexOf('(s.eval ? evalSectionHtml(s)');
+  assert.ok(equivIdx > -1 && noteIdx > -1 && evalIdx > -1, '详情渲染应含折算等价金额 / 备注行 / 评估区块');
+  assert.ok(noteIdx > equivIdx && noteIdx < evalIdx, '备注行应位于折算等价金额之后、评估区块之前');
+  assert.match(appJs, /class="rd-note" maxlength="200" placeholder="添加备注…"/, '备注输入框应限 200 字并带占位提示');
+  assert.match(appJs, /value="' \+ esc\(s\.note \|\| ''\) \+ '"/, '备注输入框预填值应经 esc 转义');
+
+  // 事件委托：Enter/Escape 分支 + focusout 保存路径 + 保存函数无变更 no-op
+  assert.match(appJs, /if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;/, '备注事件应以 class 委托过滤');
+  assert.match(appJs, /if \(e\.key === 'Enter'\) \{\s*e\.preventDefault\(\);\s*e\.target\.blur\(\);/, 'Enter 应阻止默认并走失焦保存');
+  assert.match(appJs, /else if \(e\.key === 'Escape'\) \{[\s\S]*?e\.target\.value = s\.note \|\| '';/s, 'Escape 应还原为已存值');
+  assert.match(appJs, /addEventListener\('focusout', \(e\) => \{\s*if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;/s, '失焦保存应委托在 recsModal 上');
+  assert.match(appJs, /async function saveSnapshotNote\(id, value\)/, '应存在 saveSnapshotNote 保存函数');
+  assert.match(appJs, /if \(\(value \?\? ''\) === \(s\.note \?\? ''\)\) return;/, '无变更应不发请求');
+  assert.ok(appJs.includes("quotaApi('PUT', '/api/quota/snapshots/note'"), '保存应调用备注端点');
+  assert.match(appJs, /showToast\('备注已保存'\)/, '保存成功应有 toast 反馈');
+
+  // 样式段：输入框视觉契约（右对齐 + 暗色变量 + 聚焦描边）
+  assert.match(indexHtml, /\.rd-note \{[\s\S]*?text-align: right;/s, '.rd-note 应右对齐');
+  assert.match(indexHtml, /\.rd-note \{[\s\S]*?background: var\(--panel-2\);[\s\S]*?border: 1px solid var\(--border\);/s, '.rd-note 应使用暗色主题变量');
+  assert.match(indexHtml, /\.rd-note:focus \{ border-color: var\(--teal\);/, '.rd-note 聚焦应有 teal 描边');
+});

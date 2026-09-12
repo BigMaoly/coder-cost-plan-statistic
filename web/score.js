@@ -37,6 +37,14 @@
   const criterionGroups = () => (state.board?.criterionGroups || []).slice().sort(byOrder);
   const modelGroups = () => (state.board?.modelGroups || []).slice().sort(byOrder);
   const criteria = () => (state.board?.criteria || []).slice().sort(byOrder);
+  /**
+   * 「模型信息」子窗口的候选列表专用顺序：名称字母升序 A→Z（变更 score-picker-and-backup）。
+   * 大小写不敏感、名称内数字按数值比（K2.6 在 K10 前）、中文括号条目排在 ASCII 之后。
+   * 与 criteria() 的「分组序 → 组内序」并存互不影响：分组树与主图「评分标准」下拉仍用 criteria()，
+   * 数据层的 sort_order 语义不变（见 design.md 决策 1）。
+   */
+  const byName = (a, b) => String(a.name).localeCompare(String(b.name), 'en', { numeric: true, sensitivity: 'base' });
+  const criteriaByName = () => (state.board?.criteria || []).slice().sort(byName);
   const models = () => (state.board?.models || []).slice().sort(byOrder);
   const criteriaOf = (groupId) => criteria().filter((c) => c.groupId === groupId);
   const modelsOf = (groupId) => models().filter((m) => m.groupId === groupId);
@@ -718,6 +726,7 @@
   let modelSel = null;      // 当前选中的模型 id；'' = 正在新建
   let draftRows = [];       // 编辑中的评分维度行 [{ key, criterionId, value }]
   let rowSeq = 0;
+  let rowPickers = [];      // 本行渲染出来的可搜索下拉实例（重画前必须逐个 destroy，摘掉 document 监听）
 
   function openModelsModal() {
     loadModelDraft(state.board && models()[0] ? models()[0].id : '');
@@ -866,25 +875,26 @@
       '</div>';
 
     const rowsHost = host.querySelector('#scRows');
-    const allCriteria = criteria();
+    const allCriteria = criteriaByName();           // 候选按名称字母升序（变更 score-picker-and-backup）
+    const groupNameOf = new Map(criterionGroups().map((g) => [g.id, g.name]));
 
     const paintRows = () => {
+      rowPickers.forEach((p) => p.destroy());       // 先摘掉上一轮的实例（含 document 上的外部点击监听）
+      rowPickers = [];
       rowsHost.innerHTML = '';
+      const usedIds = new Set(draftRows.map((r) => r.criterionId));
       draftRows.forEach((row) => {
         const c = criterionById(row.criterionId);
         const el = document.createElement('div');
         el.className = 'sc-row';
-        el.innerHTML = '<select class="sc-input">' + allCriteria.map((x) =>
-            '<option value="' + attr(x.id) + '"' + (x.id === row.criterionId ? ' selected' : '') + '>' +
-            esc(x.name) + '（' + (x.unit === 'pct' ? '％' : '#') + '）</option>').join('') +
-          '</select>' +
+        el.innerHTML = '<div class="sc-pick"></div>' +
           '<input type="number" class="sc-input" step="any" min="0" value="' + attr(row.value) + '"' +
             ' placeholder="' + (c && c.unit === 'pct' ? '0~100' : '任意数值') + '">' +
           '<span class="sc-row-state"></span>' +
           '<button type="button" class="sc-ord-btn sc-del" data-act="del" title="删掉这一行">✕</button>';
 
-        const selEl = el.querySelector('select');
-        const numEl = el.querySelector('input');
+        const pickHost = el.querySelector('.sc-pick');
+        const numEl = el.querySelector('input[type="number"]');
         const stateEl = el.querySelector('.sc-row-state');
         const paintState = () => {
           const cc = criterionById(row.criterionId);
@@ -903,7 +913,33 @@
           stateEl.textContent = '= ' + fmtValue(n, cc.unit) + '　该条排名第 ' + better + '/' + (rank.length + 1);
           stateEl.className = 'sc-row-state ok';
         };
-        selEl.onchange = () => { row.criterionId = selEl.value; paintState(); };
+        if (typeof window.createScoreCombobox === 'function') {
+          rowPickers.push(window.createScoreCombobox({
+            host: pickHost,
+            options: allCriteria.map((x) => ({
+              id: x.id, name: x.name, unit: x.unit,
+              groupName: groupNameOf.get(x.groupId) || '',
+              // 本模型别的维度已经选过的标准：灰显 + 「已添加」标，点了只提示不改选中。
+              // 注意这只是提前提示，权威校验仍在后端 saveModel（重复选择会被拒绝）。
+              disabled: usedIds.has(x.id) && x.id !== row.criterionId,
+              tag: '已添加',
+              disabledReason: '「' + x.name + '」已经在本模型的另一个维度里了',
+            })),
+            value: row.criterionId,
+            placeholder: '搜索评分标准，如 gpqa / swe / 代码…',
+            onChange: (id) => { row.criterionId = id; paintRows(); },   // 整行重画：别行的「已添加」标记要跟着变
+            onBlocked: (o) => toast('「' + o.name + '」已经在本模型的另一个维度里了'),
+          }));
+        } else {
+          // 降级：score-combobox.js 未加载时回退原生下拉（保留旧行为，页面不坏）
+          const selEl = document.createElement('select');
+          selEl.className = 'sc-input';
+          selEl.innerHTML = allCriteria.map((x) =>
+            '<option value="' + attr(x.id) + '"' + (x.id === row.criterionId ? ' selected' : '') + '>' +
+            esc(x.name) + '（' + (x.unit === 'pct' ? '％' : '#') + '）</option>').join('');
+          selEl.onchange = () => { row.criterionId = selEl.value; paintState(); };
+          pickHost.appendChild(selEl);
+        }
         numEl.oninput = () => { row.value = numEl.value; paintState(); };
         el.querySelector('[data-act="del"]').onclick = () => {
           draftRows = draftRows.filter((r) => r !== row);
@@ -921,8 +957,15 @@
       if (!next) { toast('所有评分标准都已经在这张表里了'); return; }
       draftRows.push({ key: 'r' + (++rowSeq), criterionId: next.id, value: '' });
       paintRows();
-      const inputs = rowsHost.querySelectorAll('input[type="number"]');
-      if (inputs.length) inputs[inputs.length - 1].focus();
+      const lastCb = rowPickers[rowPickers.length - 1];
+      if (lastCb) {
+        // 新增行直接把搜索框打开并聚焦：省掉「先点开、再输入」，open() 内部会聚焦搜索框
+        lastCb.el.scrollIntoView({ block: 'nearest' });
+        lastCb.open();
+      } else {
+        const inputs = rowsHost.querySelectorAll('input[type="number"]');
+        if (inputs.length) inputs[inputs.length - 1].focus();
+      }
     };
 
     host.querySelector('#scModelSave').onclick = async () => {
@@ -987,6 +1030,126 @@
       if (resource === 'criteria') renderCriteriaModal(); else renderModelsModal();
     } catch (error) { toast(error.message); }
   }
+
+  /* ================= 备份：导出 / 导入恢复（变更 score-picker-and-backup） ================= */
+
+  let backupFiles = [];    // 列表接口最近一次返回的全部条目（含不可用项）
+  let backupPick = '';     // 当前选中的备份文件名（'' = 未选）
+
+  /** 本地时间 YYYY-MM-DD HH:mm:ss（备份时间来自内容里的 exportedAtMs） */
+  function fmtBackupTime(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return '时间未知';
+    const d = new Date(ms);
+    const p = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+      ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
+  /** 规模摘要：模型 · 评分标准 · 分值 */
+  const fmtCounts = (c) => c
+    ? (c.models + ' 个模型 · ' + c.criteria + ' 条标准 · ' + c.values + ' 项分值')
+    : '规模未知';
+
+  /** 当前库内规模（确认框里与备份规模对照用） */
+  function currentShape() {
+    const ms = models().length;
+    const cs = criteria().length;
+    const filled = Object.keys(state.board?.scores || {})
+      .reduce((n, mid) => n + Object.keys(state.board.scores[mid]).length, 0);
+    return ms + ' 个模型 · ' + cs + ' 条标准 · ' + filled + ' 项分值';
+  }
+
+  /** 拉列表并渲染（打开小窗与点「刷新列表」都走这里） */
+  async function renderBackupModal() {
+    const host = $('scoreBackupList');
+    host.innerHTML = '<div class="sc-backup-empty">正在读取备份目录…</div>';
+    let data;
+    try {
+      data = await api('/api/score/backup/list');
+    } catch (error) {
+      host.innerHTML = '<div class="sc-backup-empty">读取备份目录失败：' + esc(error.message) + '</div>';
+      $('scoreBackupDir').textContent = '';
+      return;
+    }
+    backupFiles = data.files || [];
+    if (!backupFiles.some((f) => f.file === backupPick && f.valid)) backupPick = '';
+    $('scoreBackupDir').textContent = data.dir || '';
+
+    if (!backupFiles.length) {
+      host.innerHTML = '<div class="sc-backup-empty">这个目录里还没有任何备份。' +
+        '先在页面顶栏点「⇩ 导出备份」生成第一份。</div>';
+    } else {
+      host.innerHTML = backupFiles.map((f) => {
+        const sel = f.valid && f.file === backupPick;
+        const cls = 'sc-bk-item' + (sel ? ' sel' : '') + (f.valid ? '' : ' bad');
+        const head = f.valid
+          ? '<div class="sc-bk-time">' + esc(fmtBackupTime(f.exportedAtMs)) + '</div>' +
+            '<div class="sc-bk-meta">' + esc(fmtCounts(f.counts)) + '</div>'
+          : '<div class="sc-bk-time">不可用</div><div class="sc-bk-meta">' + esc(f.reason || '无法识别') + '</div>';
+        return '<label class="' + cls + '" data-file="' + attr(f.file) + '">' +
+            '<input type="radio" name="scBkPick" value="' + attr(f.file) + '"' +
+              (f.valid ? '' : ' disabled') + (sel ? ' checked' : '') + '>' +
+            '<span class="sc-bk-main">' + head +
+              '<div class="sc-bk-name">' + esc(f.file) + '</div></span>' +
+          '</label>';
+      }).join('');
+    }
+    paintRestoreBtn();
+  }
+
+  function paintRestoreBtn() {
+    const btn = $('scoreRestoreBtn');
+    btn.disabled = !backupPick;
+    const pick = backupFiles.find((f) => f.file === backupPick && f.valid);
+    $('scoreBackupHint').textContent = pick
+      ? '将用 ' + fmtBackupTime(pick.exportedAtMs) + ' 的备份（' + fmtCounts(pick.counts) + '）替换当前数据'
+      : '先选中一份备份再恢复';
+  }
+
+  async function openBackupModal() {
+    backupPick = '';
+    $('scoreBackupModal').hidden = false;
+    await renderBackupModal();
+  }
+
+  async function exportBackup() {
+    const btn = $('scoreExportBtn');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/score/backup/export', { method: 'POST' });
+      toast('已导出到 ' + r.dir + '/' + r.file + '（目录内滚动保留最近 5 份）');
+    } catch (error) {
+      toast('导出失败：' + error.message);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function restoreBackup() {
+    const pick = backupFiles.find((f) => f.file === backupPick && f.valid);
+    if (!pick) { toast('先选中一份备份'); return; }
+    const msg = '恢复备份 ' + pick.file + '（' + fmtBackupTime(pick.exportedAtMs) + '）？\n\n' +
+      '当前的 ' + currentShape() + ' 会被清空，并整体替换为备份中的 ' + fmtCounts(pick.counts) + '。\n' +
+      '此操作不可撤销。';
+    if (!confirm(msg)) return;
+    const btn = $('scoreRestoreBtn');
+    btn.disabled = true;
+    try {
+      const r = await api('/api/score/backup/restore', { method: 'POST', body: { file: pick.file } });
+      state.criterionId = null;                 // 主图选中项可能指向已消失的标准，交给 loadBoard 重挑
+      await loadBoard();
+      renderAll();                              // 内部会先 filter.prune()，清掉指向已消失模型的勾选
+      if (!$('scoreCriteriaModal').hidden) renderCriteriaModal();
+      if (!$('scoreModelsModal').hidden) renderModelsModal();
+      closeBackupModal();
+      toast('已恢复到 ' + fmtBackupTime(r.exportedAtMs) + ' 的备份（' + r.stats.models + ' 个模型 / ' + r.stats.criteria + ' 条标准）');
+    } catch (error) {
+      toast('恢复失败：' + error.message);
+      paintRestoreBtn();
+    }
+  }
+
+  function closeBackupModal() { $('scoreBackupModal').hidden = true; }
 
   /* ================= 按模型筛选条（UI 装配） ================= */
 
@@ -1063,6 +1226,19 @@
     $('scoreCritSel').addEventListener('change', (e) => selectCriterion(e.target.value));
     $('scoreCriteriaBtn').addEventListener('click', openCriteriaModal);
     $('scoreModelsBtn').addEventListener('click', openModelsModal);
+
+    // ---- 备份：导出 / 导入恢复 ----
+    $('scoreExportBtn').addEventListener('click', exportBackup);
+    $('scoreImportBtn').addEventListener('click', openBackupModal);
+    $('scoreBackupRefresh').addEventListener('click', renderBackupModal);
+    $('scoreRestoreBtn').addEventListener('click', restoreBackup);
+    $('scoreBackupList').addEventListener('click', (e) => {
+      const item = e.target.closest('.sc-bk-item');
+      if (!item || item.classList.contains('bad')) return;   // 不可用项不可选中
+      backupPick = item.dataset.file;
+      $('scoreBackupList').querySelectorAll('.sc-bk-item').forEach((el) => el.classList.toggle('sel', el === item));
+      paintRestoreBtn();
+    });
 
     // ---- 按模型筛选条 ----
     if (!filter) {

@@ -9,6 +9,9 @@
  *    reasoningTokens 为信息性字段（dsh 四桶互斥总和不含），不另计
  *  - 降级声明：标题生成等不产生 assistant/message 的辅助 LLM 调用不计数，相对账单轻微低估；
  *    缓存写入统计恒 0 为数据源缺失，非程序缺陷
+ *  - 会话目录枚举：判据为「目录内存在 session.jsonl / session.jsonl.zstd」，不看目录名
+ *    （顶层会话目录 `session-<id>`、子代理会话目录为裸 `<id>`）；子代理会话用量同等收录，
+ *    与顶层会话明细并行累积（变更 fix-dsh-subagent-scan-gap）
  *  - 模型/提供商行序归因：取事件之前最近一次 request/header 的 config.provider / config.model
  *    原值（dsh 官方 UI findLast 折叠同语义；header 仅首录+配置变化补录，每会话 1–4 条）；
  *    header 前事件记 'unknown' 哨兵（明细两列 NOT NULL，不得写 SQL NULL；对齐 zcode/ccsclaude
@@ -142,15 +145,20 @@ function readdirSafe(dir) {
   }
 }
 
-/** 遍历会话根目录（固定三层：项目桶 / session-* 目录 / session.jsonl[.zstd]）。
- *  同一部署单一物理编码（dsh logSuffix 配置二选一）；万一并存取 .zstd 终态，防双算。 */
+/**
+ * 遍历会话根目录（固定三层：项目桶 / 会话目录 / session.jsonl[.zstd]）。
+ * 会话目录的认定判据 = **该目录内存在会话日志文件**，SHALL NOT 依赖目录名：DSH 的目录名
+ * 即会话 id，顶层会话为 `session-<uuid>`，而委派出的子代理会话为**裸 uuid**（会话头带
+ * `origin:"subagent"` / `parentSession` / `delegationDepth:1`）——按名前缀筛选会整份漏扫
+ * 子代理会话（变更 fix-dsh-subagent-scan-gap；实测损失见
+ * docs/reports/2026-09-12-deepseek-snapshot-reconciliation.md）。
+ * 同一部署单一物理编码（dsh logSuffix 配置二选一）；万一并存取 .zstd 终态，防双算。 */
 export function listSessionFiles(sessionsRoot) {
   const files = [];
   if (!existsSync(sessionsRoot)) return files;
   for (const project of readdirSafe(sessionsRoot)) {
     const projectDir = join(sessionsRoot, project);
     for (const session of readdirSafe(projectDir)) {
-      if (!session.startsWith('session-')) continue;
       const dir = join(projectDir, session);
       const zstdPath = join(dir, 'session.jsonl.zstd');
       const plainPath = join(dir, 'session.jsonl');
@@ -332,7 +340,13 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         if (entry.absPath.endsWith('.zstd')) {
           ({ text, completeEnd } = decodeZstdContainer(readFileSync(entry.absPath)));
         } else {
-          ({ text, completeEnd } = readCompleteLines(entry.absPath, 0, stat.size));
+          // 明文：水位 = 截至最后一个完整行的字节数。readCompleteLines 返回 { text, consumed }
+          // （kimi/codex 同款语义）；曾误按 zstd 分支的字段名解构 completeEnd → 恒 undefined →
+          // 索引写入抛「cannot be bound to SQLite parameter 6」被下方 catch 吞掉 → 该文件永不入
+          // 索引、每轮整份重扫重插、已固化日被反复累加（防重复统计铁律）。
+          let consumed = 0;
+          ({ text, consumed } = readCompleteLines(entry.absPath, 0, stat.size));
+          completeEnd = consumed;
         }
         const { delegationDepth, records, lineCount } = parseSessionText(text);
         const keepFrom = isAppend ? Number(prev.scanned_lines) : 0;

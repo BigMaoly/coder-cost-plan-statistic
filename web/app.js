@@ -3288,12 +3288,14 @@
   /* ----- 记录大窗口（快照记录） ----- */
 
   // pageSize 不持久化：关闭窗口即复位（spec: 每页数量的修改在窗口关闭后不保留）
-  const recs = { plan: '', provider: '', page: 1, pageSize: 10, selected: new Set(), detailId: null, data: null };
+  // benchmark 筛选：'' 全部 / '__none__' 未设基准 / 其它值 = 基准名（quota-snapshot-benchmark）
+  const recs = { plan: '', provider: '', benchmark: '', page: 1, pageSize: 10, selected: new Set(), detailId: null, data: null };
 
   async function loadRecs() {
     const q = new URLSearchParams();
     if (recs.plan) q.set('plan', recs.plan);
     if (recs.provider) q.set('provider', recs.provider);
+    if (recs.benchmark) q.set('benchmark', recs.benchmark);
     q.set('page', String(recs.page));
     q.set('pageSize', String(recs.pageSize));
     recs.data = await getJson('/api/quota/snapshots?' + q);
@@ -3323,27 +3325,47 @@
     const data = recs.data;
     const opt = (cur, all, vals) => '<option value="">' + all + '</option>' +
       vals.map((v) => '<option value="' + esc(v) + '"' + (v === cur ? ' selected' : '') + '>' + esc(v) + '</option>').join('');
+    // 基准筛选候选 = 记录全表去重（响应 benchmarks）+「未设基准（N）」，N 服务端算好（unbound）
+    const bmkOpts = '<option value="">全部基准</option>' +
+      '<option value="__none__"' + (recs.benchmark === '__none__' ? ' selected' : '') + '>未设基准（' + (data.unbound ?? 0) + '）</option>' +
+      (data.benchmarks || []).map((v) => '<option value="' + esc(v) + '"' + (v === recs.benchmark ? ' selected' : '') + '>' + esc(v) + '</option>').join('');
     $('recsToolbar').innerHTML =
       '<label class="recs-checkall"><input type="checkbox" id="recsCheckAll"' +
         (data.items.length && data.items.every((s) => recs.selected.has(s.id)) ? ' checked' : '') + '> 全选本页</label>' +
       '<span class="muted">已选 ' + recs.selected.size + ' 条</span>' +
+      '<button type="button" class="btn primary bmk-mark" id="bmkMarkBtn"' + (recs.selected.size ? '' : ' disabled') +
+        ' title="把选中的记录标记为同一个任务基准">◈ 标记为基准 <span class="caret">▾</span></button>' +
       '<button type="button" class="btn danger" id="recsBatchDel"' + (recs.selected.size ? '' : ' disabled') + '>批量删除</button>' +
       '<span class="spacer"></span>' +
+      '<label class="field"><span>基准</span><select id="recsBmkSel">' + bmkOpts + '</select></label>' +
       '<label class="field"><span>套餐</span><select id="recsPlanSel">' + opt(recs.plan, '全部套餐', data.plans) + '</select></label>' +
       '<label class="field"><span>提供商</span><select id="recsProviderSel">' + opt(recs.provider, '全部提供商', data.providers) + '</select></label>';
   }
 
   function renderRecsList() {
+    hideTipPop(true); // 列表重渲染前强制收起浮层气泡（含基准标签气泡），防止节点搬移与重建竞争
     const items = recs.data.items;
     $('recsList').innerHTML = items.length ? items.map((s) => {
       // 右侧三列（recs-item-value-display）：每 1 单位套餐货币每月 token 数（口径同详情
       // 页 estRatioOf）→ 包月费用（数值快照固化、币符随全局计费币种）→ 估计每月总 token
       // （不带 ≈ / tokens 字样）。无比值（缺估算总额度 / 包月金额 ≤ 0）时第一列留空占位。
       const r = estRatioOf(s);
+      // 任务基准标签（quota-snapshot-benchmark）：形态恒为「◈ <名字>」——标记即固化，
+      // 不区分配置里现在是否还存在该基准（无任何「失效」表达）；悬浮气泡展示标记时
+      // 固化的名字与说明（复用 tip-float-layer 机制的 .tip-info/.tip-pop 结构）；
+      // 点击 = 打开该基准的比较窗口（quota-benchmark-compare，data-bmk 供事件委托取名字）
+      const b = s.benchmark;
       return '<div class="recs-item' + (recs.detailId === s.id ? ' active' : '') + '" data-id="' + s.id + '">' +
         '<input type="checkbox" class="recs-check" data-check="' + s.id + '"' + (recs.selected.has(s.id) ? ' checked' : '') + '>' +
         '<span class="ri-plan">' + esc(s.planName) + '</span>' +
         '<span class="ri-mode">' + (s.mode === 'model' ? esc(s.model) : '总量') + '</span>' +
+        (b ? '<span class="ri-bmk tip-info" tabindex="0" role="button" data-bmk="' + esc(b.name) + '" aria-label="基准：' + esc(b.name) + '，悬浮查看说明，点击查看基准比较" title="悬浮查看说明，点击查看基准比较">◈ <span class="ri-bmk-name">' + esc(b.name) + '</span>' +
+          '<span class="tip-pop">' +
+            '<span class="tip-t">任务基准 · ' + esc(b.name) + '</span>' +
+            '<span class="tip-p">' + esc(b.desc || '该基准未填写说明信息') + '</span>' +
+            '<span class="tip-p">标记时的快照：基准配置此后改名、改说明或删除，都不会改变这条记录——要换基准，在记录页重新标记即可。</span>' +
+            '<span class="tip-f">记录 #' + s.id + ' · ' + esc(s.planName) + '</span>' +
+          '</span></span>' : '') +
         '<span class="ri-cells">' +
           (r ? '<span class="ri-cell ri-cell-ratio">' + r.ratioText + '/' + r.icon + '</span>'
              : '<span class="ri-cell ri-cell-ratio"></span>') +
@@ -3875,6 +3897,9 @@
       (s.equivMoney != null
         ? row('折算等价金额', '<b>' + fmtMaybeRange(s.equivMoney, quotaMoney) + '</b>' + equivMoneyTipHtml())
         : '') +
+      // 备注行（quota-snapshot-note）：快照唯一可后补的元数据（与基准标记同族），
+      // 统计数值字段仍写入时固化不可变；失焦 / 回车自动保存见 bindRecsEvents 委托
+      row('备注', '<input type="text" class="rd-note" maxlength="200" placeholder="添加备注…" value="' + esc(s.note || '') + '">') +
       (s.eval ? evalSectionHtml(s) : '') +
       '<div class="ed-hint" style="margin-top:10px">快照式记录：写入时固化以上全部字段，后续修改套餐 / 价格 / 映射配置均不影响本条。</div>';
   }
@@ -3914,6 +3939,26 @@
     }
   }
 
+  /** 快照备注保存（quota-snapshot-note）：无变更不发请求（含 Escape 还原后的 no-op）；
+   *  成功只按引用更新本地缓存条目、不重渲染详情（innerHTML 重建会抢走输入焦点）；
+   *  失败 toast 错误文案并把输入框还原为已存值。 */
+  async function saveSnapshotNote(id, value) {
+    const s = recs.data?.items.find((x) => x.id === id);
+    if (!s) return;
+    if ((value ?? '') === (s.note ?? '')) return;
+    try {
+      const res = await quotaApi('PUT', '/api/quota/snapshots/note', { id, note: value });
+      s.note = res.note ?? '';
+      showToast('备注已保存');
+    } catch (error) {
+      showToast(error.message);
+      if (recs.detailId === id) {
+        const input = $('recsDetail').querySelector('.rd-note');
+        if (input) input.value = s.note || '';
+      }
+    }
+  }
+
   function bindRecsEvents() {
     $('recsCloseBtn').addEventListener('click', closeRecsModal);
     $('recsModal').addEventListener('click', (e) => { if (e.target === $('recsModal')) closeRecsModal(); });
@@ -3932,13 +3977,34 @@
       if (gear) {
         e.stopPropagation();
         const id = Number(gear.dataset.rgear);
-        openQuotaMenu(gear, [
+        // 基准菜单项（quota-snapshot-benchmark）：标记 = 把勾选集合收缩为该条后开下拉；
+        // 清除仅对已标记条目出现（清除 = 字段回 NULL = 未设基准）
+        const items = [
           { label: '查看详细', onClick: () => { recs.detailId = id; renderRecs(); } },
-          { label: '删除', danger: true, onClick: () => deleteSnapshots([id], () => '已删除该快照记录') },
-        ]);
+          { label: '◈ 标记为基准…', onClick: () => {
+              recs.selected.clear();
+              recs.selected.add(id);
+              renderRecs();
+              window.QuotaBenchmark?.openPicker?.();
+            } },
+        ];
+        if (recs.data?.items.find((x) => x.id === id)?.benchmark) {
+          items.push({ label: '清除该条基准', onClick: () => { QuotaBenchmarkBridge.applyBenchmark([id], ''); } });
+        }
+        items.push({ label: '删除', danger: true, onClick: () => deleteSnapshots([id], () => '已删除该快照记录') });
+        openQuotaMenu(gear, items);
         return;
       }
       if (t.classList.contains('recs-check')) return; // 复选框走 change
+      // 基准标签：悬浮 = 说明气泡（既有 tip-info 机制）；点击 = 基准比较小窗口（quota-benchmark-compare）。
+      // 不触发行选中 / 详情看板；可选调用（?.）保证比较模块缺失时点击不报错、不阻塞记录窗口
+      const bmkTag = t.closest('.ri-bmk');
+      if (bmkTag) {
+        hideTipPop(true);
+        e.stopPropagation();
+        window.QuotaBenchmarkCompare?.open(bmkTag.dataset.bmk, bmkTag);
+        return;
+      }
 
       // 点条目本体 → 查看详细（看板打开时可连续切换）
       const item = t.closest('.recs-item');
@@ -3947,6 +4013,7 @@
 
     $('recsModal').addEventListener('change', async (e) => {
       const t = e.target;
+      if (t.id === 'recsBmkSel') { recs.benchmark = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsPlanSel') { recs.plan = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsProviderSel') { recs.provider = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsPageSize') { recs.pageSize = Number(t.value); recs.page = 1; await loadRecs(); renderRecs(); return; }
@@ -3969,7 +4036,53 @@
       const v = parseInt(e.target.value, 10) || 1;
       if (v !== recs.page) { recs.page = v; await loadRecs(); renderRecs(); }
     });
+
+    // 快照备注（quota-snapshot-note）：keydown 与 focusout 都委托在常驻 recsModal 上
+    // （详情内容随渲染 innerHTML 重建，直接绑定会随节点丢失）；Enter 走失焦同一路径保存，
+    // Escape 还原为已存值（还原后与已存一致，保存函数 no-op 不发请求）。
+    // focusout 在切换详情条目时也会触发：此处捕获当时的 detailId，保存按该 id 落条目，
+    // 异步返回不触碰已切换后的新条目 DOM
+    $('recsModal').addEventListener('keydown', (e) => {
+      if (!e.target.classList?.contains('rd-note')) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        e.target.blur();
+      } else if (e.key === 'Escape') {
+        const s = recs.data?.items.find((x) => x.id === recs.detailId);
+        if (s) e.target.value = s.note || '';
+        e.target.blur();
+      }
+    });
+    $('recsModal').addEventListener('focusout', (e) => {
+      if (!e.target.classList?.contains('rd-note')) return;
+      if (recs.detailId !== null) saveSnapshotNote(recs.detailId, e.target.value);
+    });
   }
+
+  /* ===== 任务基准装配点（quota-snapshot-benchmark，设计 D6） =====
+   * quota-benchmark.js 在本文件之后加载：读取本桥装配「◈ 标记为基准」下拉
+   * （依赖注入，不直接触碰 app.js 内部状态）；本侧只保留 apply 接缝——
+   * 调批量标记端点后重拉列表渲染。标记下拉本体与配置页都在该模块内。 */
+  window.QuotaBenchmarkBridge = {
+    getSelected: () => [...recs.selected],
+    getItems: () => (recs.data ? recs.data.items : []),
+    markBtn: () => $('bmkMarkBtn'),
+    async applyBenchmark(ids, name) {
+      if (!Array.isArray(ids) || !ids.length) return null;
+      try {
+        const res = await quotaApi('POST', '/api/quota/snapshots/benchmark', { ids, name });
+        await loadRecs();
+        renderRecs();
+        showToast(name
+          ? '已把 ' + res.updated + ' 条记录标记为基准「' + name + '」：名字与说明已快照写入记录，任务提示词不写入'
+          : '已清除 ' + res.updated + ' 条记录的基准绑定（字段回「未设基准」）');
+        return res;
+      } catch (error) {
+        showToast(error.message);
+        return null;
+      }
+    }
+  };
 
   async function refreshAll() {
     await loadFilterOptions().catch((e) => console.error(e));

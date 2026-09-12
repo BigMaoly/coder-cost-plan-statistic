@@ -48,6 +48,15 @@
  * score_model_groups / score_models / score_values），并在首次建表后写入内置评分数据
  * （4 个标准分组 / 59 条标准 / 7 个模型分组 / 16 个模型 / 378 个分值，来自用户提供的来源材料）；
  * 纯新增：usage_* / cost_* / quota_* / plan_* / map_* 表零改动，不参与防重复统计与增量统计。
+ * schema v16（quota-snapshot-benchmark）：新增任务基准两张纯配置表（quota_benchmark_groups /
+ * quota_benchmarks，形态对齐 score_* 分组/条目），quota_snapshots 幂等加列 benchmark_json
+ * （JSON 字符串：标记时固化的基准名与描述 {"name","desc"}，旧行 NULL = 未设基准，无回填）；
+ * 纯新增：usage_* / cost_* / 汇总层与完成标记 / plan_* / map_* 表零改动，
+ * 基准读写收口 src/quota.js（额度家族表铁律），不参与防重复统计与增量统计。
+ * schema v17（quota-snapshot-note）：quota_snapshots 幂等加列 note TEXT（快照详情人工备注，
+ * 单行 ≤200 字，纯空白 = 清除落 NULL；旧行 NULL = 无备注，无回填）；
+ * 纯加列：usage_* / cost_* / 汇总层与完成标记 / plan_* / map_* 表零改动，
+ * note 写入收口 src/quota.js（额度家族表铁律），不参与防重复统计与增量统计。
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -56,7 +65,7 @@ import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { SCORE_SEED } from './score-seed.js';
 
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 17;
 
 /** 运行数据根目录（测试可通过 envOverride 注入临时 HOME） */
 export function dataDir(envOverride = process.env) {
@@ -326,7 +335,9 @@ CREATE TABLE IF NOT EXISTS quota_snapshots (
   equiv_cost_lo  REAL,
   equiv_cost_hi  REAL,
   token_costs_json TEXT,
-  eval_json TEXT
+  eval_json TEXT,
+  benchmark_json TEXT,
+  note TEXT
 );
 `;
 
@@ -488,6 +499,30 @@ function ensureEvalJsonColumn(db) {
   }
 }
 
+/**
+ * v16 列迁移（quota-snapshot-benchmark）：quota_snapshots 无 benchmark_json 列则补
+ * （v15 及更早存量库），幂等。全新库的 TIERED_COST_QUOTA_SQL 已含该列，此处为空操作。
+ * 旧行保持 NULL = 未设基准（历史记录本就没有基准，迁移不做任何回填）。
+ */
+function ensureBenchmarkJsonColumn(db) {
+  const cols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+  if (!cols.includes('benchmark_json')) {
+    db.exec('ALTER TABLE quota_snapshots ADD COLUMN benchmark_json TEXT');
+  }
+}
+
+/**
+ * v17 列迁移（quota-snapshot-note）：quota_snapshots 无 note 列则补
+ * （v16 及更早存量库），幂等。全新库的 SCHEMA_SQL 已含该列，此处为空操作。
+ * 旧行保持 NULL = 无备注（备注是功能上线后才可能存在的用户后补元数据，迁移不做任何回填）。
+ */
+function ensureSnapshotNoteColumn(db) {
+  const cols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+  if (!cols.includes('note')) {
+    db.exec('ALTER TABLE quota_snapshots ADD COLUMN note TEXT');
+  }
+}
+
 /** v13→v14 重建 SQL（见 rebuildQuotaPresetsForPlanName）：建 new → 回填 → DROP → RENAME */
 const V13_TO_V14_SQL = `
 CREATE TABLE quota_presets_new (
@@ -588,6 +623,34 @@ CREATE TABLE IF NOT EXISTS plan_quota_coef_tiers (
   weekdays   INTEGER,
   multiplier REAL NOT NULL,
   PRIMARY KEY (coef_id, sort)
+);
+`;
+
+/**
+ * schema v16 新增（quota-snapshot-benchmark）：任务基准两张纯配置表（额度家族区块）。
+ * - quota_benchmark_groups：基准分组（独立实体，形态对齐 score_* 分组表——分组自身有序，
+ *   支持整组排序与组头改名；基准行靠 group_id 外键归属，改名只动分组自身）。
+ * - quota_benchmarks：基准 = 基准名（全局唯一：名字是记录侧唯一识别键，重名会导致按名筛选串台）
+ *   + 描述信息 + 任务提示词（一整段自由文本）三业务字段，加归属与组内序。
+ * 两张表是纯独立配置、与统计链路零耦合：不设指向映射 / 套餐 / 明细 / 汇总表的任何外键
+ * （唯一外键指向自家分组表），无任何统计路径读写；读写恒收口 src/quota.js（额度家族铁律）。
+ * 记录侧不引用这两张表：标记时把「名字 + 描述」固化为快照自身的 benchmark_json 字符串，
+ * 与配置完全独立（无失效态、无回写）。
+ */
+const BENCHMARK_SQL = `
+CREATE TABLE IF NOT EXISTS quota_benchmark_groups (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL UNIQUE,
+  sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS quota_benchmarks (
+  id          TEXT PRIMARY KEY,
+  group_id    TEXT NOT NULL REFERENCES quota_benchmark_groups(id) ON UPDATE CASCADE ON DELETE RESTRICT,
+  name        TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  prompt      TEXT NOT NULL DEFAULT '',
+  sort_order  INTEGER NOT NULL
 );
 `;
 
@@ -807,8 +870,9 @@ export function migrate(db) {
   if (current < 1) {
     // 全新库：v2 业务表 + v3 映射配置表 + v4 套餐配置表 + v5 待决清单表 + v6 分段/费用/额度表
     // + v8 费用模板表 + v9 套餐额度分段计价表一次建齐（套餐价格表的 v8 列、
-    // quota_presets 的 v10/v14 列与组合唯一约束、条目排序与模板分组的 v12 列已含在 CREATE 定义中），
-    // 最后建 v15 模型评分表并写入内置评分数据
+    // quota_presets 的 v10/v14 列与组合唯一约束、条目排序与模板分组的 v12 列、
+    // 快照的 v11/v13/v16 JSON 列已含在 CREATE 定义中），
+    // 最后建 v15 模型评分表并写入内置评分数据、建 v16 任务基准两张配置表
     db.exec(SCHEMA_SQL);
     db.exec(MAPPING_SQL);
     db.exec(PLAN_SQL);
@@ -818,6 +882,7 @@ export function migrate(db) {
     db.exec(QUOTA_COEF_SQL);
     db.exec(SCORE_SQL);
     seedScoreTables(db);
+    db.exec(BENCHMARK_SQL);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }
@@ -834,6 +899,10 @@ export function migrate(db) {
   // v13→v14 重建 quota_presets（quota-preset-plan-binding）——补 plan_name 组合绑定列、
   // 列级 UNIQUE(map_name) 升级表级 UNIQUE(map_name, plan_name)，存量行回填当前套餐
   // v14→v15 纯新增模型评分配置表 + 首次写入内置评分数据（model-scorecard，幂等）
+  // v15→v16 纯新增任务基准两张配置表 + quota_snapshots 补 benchmark_json 列
+  //（quota-snapshot-benchmark，均幂等，不改既有行数据；旧行 NULL = 未设基准）
+  // v16→v17 quota_snapshots 补 note 列（quota-snapshot-note，幂等纯加列，不改既有行数据；
+  // 旧行 NULL = 无备注）
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     runInTransaction(db, () => {
@@ -860,6 +929,15 @@ export function migrate(db) {
         // 纯新增五张模型评分配置表 + 首次写入内置评分数据（表非空则跳过，幂等）
         db.exec(SCORE_SQL);
         seedScoreTables(db);
+      }
+      if (current < 16) {
+        // 纯新增任务基准两张配置表 + 快照补 benchmark_json 列（quota-snapshot-benchmark，幂等）
+        db.exec(BENCHMARK_SQL);
+        ensureBenchmarkJsonColumn(db);
+      }
+      if (current < 17) {
+        // 快照补 note 列（quota-snapshot-note，幂等纯加列，不改既有行数据）
+        ensureSnapshotNoteColumn(db);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });

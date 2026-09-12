@@ -43,7 +43,10 @@ import { loadPricingContext, calcCost, totalCost, listCostDaily, listCostMonthly
 import {
   listQuotaPresets, saveQuotaPreset, deleteQuotaPreset,
   startQuotaPreset, stopQuotaPreset, invalidatePresetsFor, invalidatePresetsForPlans,
-  abandonQuotaPreset, migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots
+  abandonQuotaPreset, migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots,
+  listBenchmarks, saveBenchmark, deleteBenchmark, reorderBenchmarks,
+  saveBenchmarkGroup, deleteBenchmarkGroup, reorderBenchmarkGroups,
+  bindSnapshotsBenchmark, compareBenchmark, updateSnapshotNote
 } from './quota.js';
 import {
   loadScoreboard, saveCriterionGroup, deleteCriterionGroup, reorderCriterionGroups,
@@ -51,6 +54,7 @@ import {
   saveModelGroup, deleteModelGroup, reorderModelGroups,
   saveModel, deleteModel, reorderModels, resetScore
 } from './score.js';
+import { scoreBackupDir, exportScoreBackup, listScoreBackups, restoreScoreBackup } from './score-backup.js';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -696,10 +700,12 @@ function queryFilterOptions(db, range, year, tool, maps, mappingOn) {
  * @param {import('node:sqlite').DatabaseSync} deps.db
  * @param {{sessionsRoot?: string, configTomlPath?: string, codexSessionsRoot?: string, zcodeDbPath?: string, ccsclaudeDbPath?: string, dshSessionsRoot?: string}} deps.maintenance 运维参数
  */
-export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
+export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBackupDir: scoreBackupDirOverride }) {
   const staticRoot = webDir();
   // 模板备份目录（entry-sort-and-template-backup）：默认 <数据根目录>/model-price，测试可注入临时目录
   const templatesBackupDir = backupDir || join(dataDir(), 'model-price');
+  // 评分数据备份目录（score-picker-and-backup）：默认 <数据根目录>/model-rate-score，测试可注入临时目录
+  const scoreBackupsDir = scoreBackupDirOverride || scoreBackupDir();
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost');
@@ -1103,11 +1109,73 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         return sendJson(res, 404, { error: `未知路径：${path}` });
       }
 
-      // 快照记录：筛选（plan/provider）+ 分页（page/pageSize）；批量删除 body {ids}
+      // ---- 任务基准配置 API（quota-snapshot-benchmark）----
+      // 基准分组 / 基准是纯独立配置：读写收口 src/quota.js（额度家族铁律），路由只做透传；
+      // 错误透传 quota.js 的 err.status（400/404）与 err.code。/order 置于按 id 定位的
+      // 通用 PUT 之前，避免「order」被当作条目 id（对齐 mappings / plans 块的既有顺序）。
+      if (path.startsWith('/api/quota/benchmarks') || path.startsWith('/api/quota/benchmark-groups')) {
+        const isGroup = path.startsWith('/api/quota/benchmark-groups');
+        const prefix = isGroup ? '/api/quota/benchmark-groups/' : '/api/quota/benchmarks/';
+        const rest = path.startsWith(prefix) ? decodeURIComponent(path.slice(prefix.length)) : '';
+
+        if (req.method === 'GET' && !rest && !isGroup) {
+          return sendJson(res, 200, listBenchmarks(db)); // 分组树一次拉全（配置页左栏数据源）
+        }
+        if (req.method === 'PUT' && (rest === 'order' || !rest)) {
+          let body;
+          try {
+            body = await readBody(req);
+          } catch (error) {
+            return sendJson(res, 400, { error: error.message });
+          }
+          try {
+            // 裸路径 = 新建；/order = 全量置换排序（分组 {ids}，组内 {groupId, ids}）
+            const result = rest === 'order'
+              ? (isGroup ? reorderBenchmarkGroups(db, body?.ids) : reorderBenchmarks(db, body?.groupId, body?.ids))
+              : (isGroup ? saveBenchmarkGroup(db, body) : saveBenchmark(db, body));
+            return sendJson(res, 200, { ok: true, ...result });
+          } catch (error) {
+            return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+          }
+        }
+        if (req.method === 'PUT' && rest) {
+          let body;
+          try {
+            body = await readBody(req);
+          } catch (error) {
+            return sendJson(res, 400, { error: error.message });
+          }
+          try {
+            const result = isGroup ? saveBenchmarkGroup(db, { ...body, id: rest }) : saveBenchmark(db, { ...body, id: rest });
+            return sendJson(res, 200, { ok: true, ...result });
+          } catch (error) {
+            return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+          }
+        }
+        if (req.method === 'DELETE' && rest) {
+          try {
+            isGroup ? deleteBenchmarkGroup(db, rest) : deleteBenchmark(db, rest);
+            return sendJson(res, 200, { ok: true });
+          } catch (error) {
+            return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+          }
+        }
+        // 基准比较（quota-benchmark-compare，只读）：名字走 query——基准名可含空格 / 中文等，
+        // 路径段不可靠；未知名字返回 200 空结果（查询语义，不是资源查找）；只读不写任何表
+        if (req.method === 'GET' && !isGroup && rest === 'compare') {
+          const name = url.searchParams.get('name');
+          if (!name) return sendJson(res, 400, { error: '请提供基准名 name' });
+          return sendJson(res, 200, compareBenchmark(db, name));
+        }
+        return sendJson(res, 404, { error: `未知路径：${path}` });
+      }
+
+      // 快照记录：筛选（plan/provider/benchmark）+ 分页（page/pageSize）；批量删除 body {ids}
       if (req.method === 'GET' && path === '/api/quota/snapshots') {
         return sendJson(res, 200, listQuotaSnapshots(db, {
           plan: url.searchParams.get('plan') || undefined,
           provider: url.searchParams.get('provider') || undefined,
+          benchmark: url.searchParams.get('benchmark') || undefined,
           page: url.searchParams.get('page') || undefined,
           pageSize: url.searchParams.get('pageSize') || undefined
         }));
@@ -1121,6 +1189,40 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         }
         try {
           const result = deleteQuotaSnapshots(db, body?.ids);
+          return sendJson(res, 200, { ok: true, ...result });
+        } catch (error) {
+          return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+        }
+      }
+
+      // 批量标记 / 清除基准（quota-snapshot-benchmark）：body {ids, name}，name 空 = 清除；
+      // 与 DELETE /api/quota/snapshots（body {ids}）同族，单事务整批成功或整批回滚
+      if (req.method === 'POST' && path === '/api/quota/snapshots/benchmark') {
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          const result = bindSnapshotsBenchmark(db, body?.ids, body?.name);
+          return sendJson(res, 200, { ok: true, ...result });
+        } catch (error) {
+          return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+        }
+      }
+
+      // 快照备注单条更新（quota-snapshot-note）：body {id, note}，note 空串 / 纯空白 = 清除；
+      // 备注是单条目操作，与基准的批量 {ids} 路由分列；校验与落库收口 updateSnapshotNote
+      if (req.method === 'PUT' && path === '/api/quota/snapshots/note') {
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          const result = updateSnapshotNote(db, body?.id, body?.note);
           return sendJson(res, 200, { ok: true, ...result });
         } catch (error) {
           return sendJson(res, error.status || 400, { error: error.message, code: error.code });
@@ -1210,6 +1312,31 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         }
       }
 
+      // ---- 评分数据备份（score-picker-and-backup）----
+      // 单文件全量导出到 <数据根目录>/model-rate-score（滚动保留 5 份）、列出该目录的备份、
+      // 选定一份整体替换恢复（单事务）。只读写 score_* 五张表，与 usage_* / cost_* / quota_* / plan_* / map_* 零关系。
+      // 注意：这三条必须排在下面 /api/score/ 前缀分发**之前**，否则会被当成未知资源返回 404。
+      if (req.method === 'GET' && path === '/api/score/backup/list') {
+        return sendJson(res, 200, listScoreBackups(scoreBackupsDir));
+      }
+
+      if (req.method === 'POST' && path === '/api/score/backup/export') {
+        try {
+          return sendJson(res, 200, exportScoreBackup(db, scoreBackupsDir));
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
+      if (req.method === 'POST' && path === '/api/score/backup/restore') {
+        try {
+          const body = await readBody(req);
+          return sendJson(res, 200, restoreScoreBackup(db, body?.file, scoreBackupsDir));
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
       // 四类资源统一形态：建改 = POST 集合路径；删除 = DELETE /:id；重排 = PUT /order（body {ids[, groupId]}）
       const SCORE_RESOURCES = {
         'criterion-groups': {
@@ -1255,7 +1382,9 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir }) {
         const allow = {
           '/': 'index.html', '/index.html': 'index.html',
           '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js',
-          '/score.js': 'score.js', '/score-filter.js': 'score-filter.js'
+          '/score.js': 'score.js', '/score-filter.js': 'score-filter.js',
+          '/score-combobox.js': 'score-combobox.js', '/quota-benchmark.js': 'quota-benchmark.js',
+          '/quota-benchmark-compare.js': 'quota-benchmark-compare.js'
         };
         const file = allow[path];
         if (file) {

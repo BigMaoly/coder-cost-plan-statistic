@@ -1,6 +1,6 @@
 {
   "name": "@dev-tools/my-kimicode-statistic",
-  "version": "0.23.0",
+  "version": "0.27.0",
   "description": "CLI 本地会话用量统计（多平台）：扫描 kimi/zcode 等本机用量写入 SQLite，本地 Web 面板按 统计工具/提供商/模型/日期 多维度查看，支持增量扫描与滚动固化归档",
   "type": "module",
   "files": [

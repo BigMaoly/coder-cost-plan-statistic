@@ -1247,3 +1247,232 @@ test('schema v14：v13 存量库打开自动重建 quota_presets——plan_name 
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ===== schema v16（quota-snapshot-benchmark）：任务基准两张配置表 + 快照 benchmark_json 列 ===== */
+
+test('schema v16：全新库两张基准表齐备 + 快照表带 benchmark_json 列', () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, 'statistic.db'));
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+
+    // 两张纯配置表建成，列形态与 score_* 分组/条目同构（TEXT 业务 id + UNIQUE 名 + sort_order）
+    const gCols = db.prepare('PRAGMA table_info(quota_benchmark_groups)').all().map((c) => c.name);
+    assert.deepEqual(gCols, ['id', 'name', 'sort_order']);
+    const bCols = db.prepare('PRAGMA table_info(quota_benchmarks)').all().map((c) => c.name);
+    assert.deepEqual(bCols, ['id', 'group_id', 'name', 'description', 'prompt', 'sort_order']);
+
+    // 分组名 / 基准名全局唯一
+    db.prepare('INSERT INTO quota_benchmark_groups (id, name, sort_order) VALUES (?, ?, ?)').run('g1', '分组一', 1);
+    assert.throws(() => db.prepare('INSERT INTO quota_benchmark_groups (id, name, sort_order) VALUES (?, ?, ?)').run('g2', '分组一', 2), /UNIQUE/);
+    db.prepare(
+      "INSERT INTO quota_benchmarks (id, group_id, name, description, prompt, sort_order) VALUES (?, ?, ?, '', '', ?)"
+    ).run('b1', 'g1', '基准一', 1);
+    assert.throws(() => db.prepare('INSERT INTO quota_benchmarks (id, group_id, name, sort_order) VALUES (?, ?, ?, ?)').run('b2', 'g1', '基准一', 2), /UNIQUE/);
+    // 外键：ON UPDATE CASCADE（组 id 跟走）+ ON DELETE RESTRICT（非空组拒删）
+    db.exec('PRAGMA foreign_keys = ON');
+    db.prepare("UPDATE quota_benchmark_groups SET id = 'g1x' WHERE id = 'g1'").run();
+    assert.equal(db.prepare('SELECT group_id FROM quota_benchmarks WHERE id = ?').get('b1').group_id, 'g1x');
+    assert.throws(() => db.prepare('DELETE FROM quota_benchmark_groups WHERE id = ?').run('g1x'), /FOREIGN/);
+
+    // 快照表带新列；描述 / 提示词默认空串
+    const snapCols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.ok(snapCols.includes('benchmark_json'), 'quota_snapshots 应含 benchmark_json 列');
+    const b = db.prepare('SELECT description, prompt FROM quota_benchmarks WHERE id = ?').get('b1');
+    assert.equal(b.description, '');
+    assert.equal(b.prompt, '');
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schema v16：v15 存量库递进到 v16——历史快照 benchmark_json 为 NULL、既有字段逐行不变、幂等', () => {
+  const root = makeRoot();
+  try {
+    const dbPath = join(root, 'statistic.db');
+    // 先用当前代码建库并写入快照样本，再降级为 v15 形态（无 benchmark_json 列、无基准两张表）
+    const db = openDb(dbPath);
+    db.prepare(
+      `INSERT INTO quota_snapshots (preset_id, created_ms, start_ms, mode, model, tokens_json,
+         plan_name, provider, price, limit_period, quota_text,
+         consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+         token_costs_json, eval_json)
+       VALUES (1, 1000, 500, 'total', NULL, '{"inputHit":10,"inputMiss":20,"output":5}',
+         '套餐A', '火山引擎', 200, 'month', '100%/月', 0.1, 0.1, 1000, 1000, NULL, NULL,
+         '{"currency":"CNY"}', '{"v":2}')`
+    ).run();
+    db.close();
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      CREATE TABLE quota_snapshots_v15 (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        preset_id      INTEGER,
+        created_ms     INTEGER NOT NULL,
+        start_ms       INTEGER NOT NULL,
+        mode           TEXT NOT NULL,
+        model          TEXT,
+        tokens_json    TEXT NOT NULL,
+        plan_name      TEXT NOT NULL,
+        provider       TEXT NOT NULL,
+        price          REAL NOT NULL,
+        limit_period   TEXT,
+        quota_text     TEXT NOT NULL,
+        consume_pct_lo REAL NOT NULL,
+        consume_pct_hi REAL NOT NULL,
+        est_total_lo   REAL NOT NULL,
+        est_total_hi   REAL NOT NULL,
+        equiv_cost_lo  REAL,
+        equiv_cost_hi  REAL,
+        token_costs_json TEXT,
+        eval_json TEXT
+      );
+      INSERT INTO quota_snapshots_v15 (preset_id, created_ms, start_ms, mode, model, tokens_json,
+        plan_name, provider, price, limit_period, quota_text,
+        consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+        token_costs_json, eval_json)
+        SELECT preset_id, created_ms, start_ms, mode, model, tokens_json,
+          plan_name, provider, price, limit_period, quota_text,
+          consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+          token_costs_json, eval_json
+        FROM quota_snapshots;
+      DROP TABLE quota_snapshots;
+      ALTER TABLE quota_snapshots_v15 RENAME TO quota_snapshots;
+      DROP TABLE quota_benchmarks;
+      DROP TABLE quota_benchmark_groups;
+      PRAGMA user_version = 15;
+    `);
+    raw.close();
+
+    const migrated = openDb(dbPath);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    // 基准两张表补建、快照补列且历史行为 NULL = 未设基准
+    const cols = migrated.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.ok(cols.includes('benchmark_json'));
+    assert.equal(migrated.prepare('SELECT COUNT(*) c FROM quota_benchmark_groups').get().c, 0);
+    const row = migrated.prepare('SELECT id, plan_name, tokens_json, token_costs_json, eval_json, benchmark_json FROM quota_snapshots').get();
+    assert.equal(row.benchmark_json, null);
+    // 既有字段逐行不变
+    assert.equal(row.plan_name, '套餐A');
+    assert.equal(row.tokens_json, '{"inputHit":10,"inputMiss":20,"output":5}');
+    assert.equal(row.token_costs_json, '{"currency":"CNY"}');
+    assert.equal(row.eval_json, '{"v":2}');
+    migrated.close();
+
+    // 幂等：再开不再变化（不重复建表 / 不重复加列）
+    const again = openDb(dbPath);
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols2 = again.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.equal(cols2.filter((c) => c === 'benchmark_json').length, 1);
+    again.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== schema v17（quota-snapshot-note）：快照 note 列 ===== */
+
+test('schema v17：全新库快照表带 note 列', () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, 'statistic.db'));
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const snapCols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.ok(snapCols.includes('note'), 'quota_snapshots 应含 note 列');
+    // 新建快照不写 note：NULL = 无备注
+    db.prepare(
+      `INSERT INTO quota_snapshots (created_ms, start_ms, mode, tokens_json,
+         plan_name, provider, price, quota_text, consume_pct_lo, consume_pct_hi,
+         est_total_lo, est_total_hi)
+       VALUES (1000, 500, 'total', '{}', '套餐A', '火山引擎', 200, '100%/月', 0, 0, 0, 0)`
+    ).run();
+    assert.equal(db.prepare('SELECT note FROM quota_snapshots').get().note, null);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schema v17：v16 存量库递进到 v17——历史快照 note 为 NULL、既有字段逐行不变、幂等', () => {
+  const root = makeRoot();
+  try {
+    const dbPath = join(root, 'statistic.db');
+    // 先用当前代码建库并写入带 benchmark_json 的快照样本，再降级为 v16 形态（无 note 列）
+    const db = openDb(dbPath);
+    db.prepare(
+      `INSERT INTO quota_snapshots (created_ms, start_ms, mode, model, tokens_json,
+         plan_name, provider, price, limit_period, quota_text,
+         consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+         token_costs_json, eval_json, benchmark_json)
+       VALUES (1000, 500, 'total', NULL, '{"inputHit":10,"inputMiss":20,"output":5}',
+         '套餐A', '火山引擎', 200, 'month', '100%/月', 0.1, 0.1, 1000, 1000, NULL, NULL,
+         '{"currency":"CNY"}', '{"v":2}', '{"name":"基准一","desc":"说明"}')`
+    ).run();
+    db.close();
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      CREATE TABLE quota_snapshots_v16 (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        preset_id      INTEGER,
+        created_ms     INTEGER NOT NULL,
+        start_ms       INTEGER NOT NULL,
+        mode           TEXT NOT NULL,
+        model          TEXT,
+        tokens_json    TEXT NOT NULL,
+        plan_name      TEXT NOT NULL,
+        provider       TEXT NOT NULL,
+        price          REAL NOT NULL,
+        limit_period   TEXT,
+        quota_text     TEXT NOT NULL,
+        consume_pct_lo REAL NOT NULL,
+        consume_pct_hi REAL NOT NULL,
+        est_total_lo   REAL NOT NULL,
+        est_total_hi   REAL NOT NULL,
+        equiv_cost_lo  REAL,
+        equiv_cost_hi  REAL,
+        token_costs_json TEXT,
+        eval_json TEXT,
+        benchmark_json TEXT
+      );
+      INSERT INTO quota_snapshots_v16 (preset_id, created_ms, start_ms, mode, model, tokens_json,
+        plan_name, provider, price, limit_period, quota_text,
+        consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+        token_costs_json, eval_json, benchmark_json)
+        SELECT preset_id, created_ms, start_ms, mode, model, tokens_json,
+          plan_name, provider, price, limit_period, quota_text,
+          consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+          token_costs_json, eval_json, benchmark_json
+        FROM quota_snapshots;
+      DROP TABLE quota_snapshots;
+      ALTER TABLE quota_snapshots_v16 RENAME TO quota_snapshots;
+      PRAGMA user_version = 16;
+    `);
+    raw.close();
+
+    const migrated = openDb(dbPath);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    // 快照补 note 列且历史行为 NULL = 无备注
+    const cols = migrated.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.ok(cols.includes('note'));
+    const row = migrated.prepare('SELECT id, plan_name, tokens_json, token_costs_json, eval_json, benchmark_json, note FROM quota_snapshots').get();
+    assert.equal(row.note, null);
+    // 既有字段逐行不变（含 v16 引入的 benchmark_json）
+    assert.equal(row.plan_name, '套餐A');
+    assert.equal(row.tokens_json, '{"inputHit":10,"inputMiss":20,"output":5}');
+    assert.equal(row.token_costs_json, '{"currency":"CNY"}');
+    assert.equal(row.eval_json, '{"v":2}');
+    assert.equal(row.benchmark_json, '{"name":"基准一","desc":"说明"}');
+    migrated.close();
+
+    // 幂等：再开不再变化（不重复加列）
+    const again = openDb(dbPath);
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols2 = again.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.equal(cols2.filter((c) => c === 'note').length, 1);
+    again.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

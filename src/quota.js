@@ -24,7 +24,13 @@
  *   保存事务的外层事务内调用——quota 表写入恒收口在本模块，避免核心模块循环依赖。
  * - 停止时的「先扫描后计算」由调用方注入 refresh 回调（路由层注入 runMaintenance），
  *   本模块不感知扫描参数，也不 import aggregate.js（防循环依赖）。
- * 只写 quota_* 两表：不触碰 usage_* 明细 / 汇总层与完成标记（沉淀保护铁律）。
+ * - 任务基准（quota-snapshot-benchmark）：基准分组 / 基准两张纯配置表的 CRUD 与排序
+ *   （形态对齐 score_*），快照标记 bindSnapshotsBenchmark 把「名字 + 描述」单向固化为
+ *   快照自身 benchmark_json（与配置完全独立、无失效态）；本域全部读写收口在本模块。
+ * - 快照备注（quota-snapshot-note）：updateSnapshotNote 单条更新快照 note（trim 后 ≤200 字，
+ *   空 = 清除落 NULL），对外 publicSnapshot 统一空串口径；备注与统计数值无关、不参与任何口径。
+ * 只写 quota_* 家族表（quota_presets / quota_snapshots / quota_benchmark_groups /
+ * quota_benchmarks）：不触碰 usage_* 明细 / 汇总层与完成标记（沉淀保护铁律）。
  */
 
 import { localDateKey } from './parser.js';
@@ -200,6 +206,14 @@ const parseJsonColumn = (raw) => {
 
 /** token_costs_json → tokenCosts 对象 */
 const parseTokenCosts = parseJsonColumn;
+
+/** benchmark_json → { name, desc } | null（NULL / 解析失败 / 缺名字一律按未设基准展示，不抛错） */
+const parseBenchmarkJson = (raw) => {
+  const v = parseJsonColumn(raw);
+  return v && typeof v === 'object' && !Array.isArray(v) && v.name
+    ? { name: String(v.name), desc: typeof v.desc === 'string' ? v.desc : '' }
+    : null;
+};
 
 /* ================= 套餐额度评估写入侧（quota-coef-evaluation） ================= */
 
@@ -771,6 +785,8 @@ function publicSnapshot(row) {
     },
     tokenCosts: parseTokenCosts(row.token_costs_json),
     eval: parseJsonColumn(row.eval_json),
+    benchmark: parseBenchmarkJson(row.benchmark_json),
+    note: row.note ?? '',
     planName: row.plan_name,
     provider: row.provider,
     price: row.price,
@@ -782,18 +798,32 @@ function publicSnapshot(row) {
   };
 }
 
+/* 基准名匹配谓词（quota-snapshot-benchmark 确立的 json_valid 守卫口径，筛选与比较共用一处）：
+   损坏的 benchmark_json（非合法 JSON）会让 json_extract 直接抛 malformed JSON——先过滤再取值
+   （SQLite AND 短路），损坏行不匹配任何名字、也不让任何查询抛错 */
+const BENCH_NAME_PRESENT = "json_valid(benchmark_json) AND json_extract(benchmark_json, '$.name') IS NOT NULL";
+const BENCH_NAME_MATCH = "json_valid(benchmark_json) AND json_extract(benchmark_json, '$.name') = ?";
+const BENCH_NAME_ABSENT = "benchmark_json IS NULL OR NOT json_valid(benchmark_json) OR json_extract(benchmark_json, '$.name') IS NULL";
+
 /**
  * 快照分页查询（默认最近在前：启动时间倒序）。
- * @param {{plan?: string, provider?: string, page?: number, pageSize?: number}} [opts]
- *   page/pageSize 任意正整数（页码超界钳到末页）；plans/providers 为全表去重值（供筛选下拉，
- *   不受当前筛选条件影响）。
+ * @param {{plan?: string, provider?: string, benchmark?: string, page?: number, pageSize?: number}} [opts]
+ *   page/pageSize 任意正整数（页码超界钳到末页）；plans/providers/benchmarks 为全表去重值
+ *   （供筛选下拉，不受当前筛选条件影响；基准候选因此含「配置已删除但记录仍留着」的旧名字）；
+ *   benchmark 传 '__none__' 筛未设基准，其它值按 benchmark_json 里的名字等值匹配；
+ *   unbound 为未设基准条数（前端「未设基准（N）」计数来源）。
  */
-export function listQuotaSnapshots(db, { plan, provider, page = 1, pageSize = 10 } = {}) {
+export function listQuotaSnapshots(db, { plan, provider, benchmark, page = 1, pageSize = 10 } = {}) {
   const size = Math.min(200, Math.max(1, Math.floor(Number(pageSize)) || 10));
   const where = [];
   const args = [];
   if (plan) { where.push('plan_name = ?'); args.push(plan); }
   if (provider) { where.push('provider = ?'); args.push(provider); }
+  // 「未设基准」= 无有效基准名（NULL / 非 JSON / 缺 name 键三种情形都与展示侧 parseBenchmarkJson
+  // 的 null 口径一致），三值逻辑下须显式覆盖 NULL 行
+  if (benchmark === '__none__') {
+    where.push(`(${BENCH_NAME_ABSENT})`);
+  } else if (benchmark) { where.push(BENCH_NAME_MATCH); args.push(benchmark); }
   const cond = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM quota_snapshots ${cond}`).get(...args).c;
   const pages = Math.max(1, Math.ceil(total / size));
@@ -804,7 +834,13 @@ export function listQuotaSnapshots(db, { plan, provider, page = 1, pageSize = 10
   return {
     items, total, page: cur, pageSize: size, pages,
     plans: db.prepare('SELECT DISTINCT plan_name AS v FROM quota_snapshots ORDER BY v').all().map((r) => r.v),
-    providers: db.prepare('SELECT DISTINCT provider AS v FROM quota_snapshots ORDER BY v').all().map((r) => r.v)
+    providers: db.prepare('SELECT DISTINCT provider AS v FROM quota_snapshots ORDER BY v').all().map((r) => r.v),
+    benchmarks: db.prepare(
+      `SELECT DISTINCT json_extract(benchmark_json, '$.name') AS v FROM quota_snapshots WHERE ${BENCH_NAME_PRESENT} ORDER BY v`
+    ).all().map((r) => r.v),
+    unbound: db.prepare(
+      `SELECT COUNT(*) AS c FROM quota_snapshots WHERE ${BENCH_NAME_ABSENT}`
+    ).get().c
   };
 }
 
@@ -819,4 +855,333 @@ export function deleteQuotaSnapshots(db, ids) {
     for (const n of nums) deleted += Number(stmt.run(n).changes);
     return { deleted };
   });
+}
+
+/* ================= 快照备注（quota-snapshot-note） =================
+ * 备注是继 benchmark_json 之后第二个允许写入后变更的快照元数据字段：
+ * 用户后补、与统计数值无关、不参与任何口径；写入恒收口本模块（额度家族表铁律）。
+ * 空串 / 纯空白 = 清除（落 NULL，与「清除基准」同语义）；对外（publicSnapshot）统一空串口径。
+ */
+
+/**
+ * 更新单条快照备注（快照详情行内编辑唯一写入口）。
+ * @param {number} id 快照 id（正整数）
+ * @param {unknown} note 任意输入，规整为 trim 后字符串；空 = 清除（落 NULL）
+ * @returns {{ id: number, note: string|null }} note 为落库后的有效值
+ */
+export function updateSnapshotNote(db, id, note) {
+  if (!Number.isInteger(id) || id <= 0) throw quotaError(400, '快照 id 应为正整数');
+  const text = String(note ?? '').trim();
+  if (text.length > 200) throw quotaError(400, '备注最长 200 字');
+  return runInTransaction(db, () => {
+    const info = db.prepare('UPDATE quota_snapshots SET note = ? WHERE id = ?')
+      .run(text === '' ? null : text, id);
+    if (Number(info.changes) === 0) throw quotaError(404, '快照记录不存在');
+    return { id, note: text === '' ? null : text };
+  });
+}
+
+/* ================= 任务基准（quota-snapshot-benchmark） =================
+ * 基准分组 / 基准的纯配置 CRUD（形态对齐模型评分域 src/score.js：TEXT 业务 id、
+ * 全量置换排序、组内 sort_order 密集化），加快照标记的唯一切入点 bindSnapshotsBenchmark。
+ * 「完全独立」契约：标记把「基准名 + 描述」固化为快照自身的 benchmark_json 字符串
+ * （不含任务提示词、不存基准 id、无外键），此后配置改名 / 改说明 / 删除与记录互不影响，
+ * 系统不引入任何「失效」状态；反向改绑 / 清除也不回写配置。
+ * 本节只读写 quota_benchmark_groups / quota_benchmarks 两表与 quota_snapshots.benchmark_json
+ * 一列（额度家族表铁律：收口本模块）；校验失败一律 quotaError(中文文案)，路由层透传 status。
+ */
+
+const bmText = (v) => String(v ?? '').trim();
+const bmUid = (prefix) => prefix + '-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+const nextBenchmarkGroupSort = (db) =>
+  db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS n FROM quota_benchmark_groups').get().n + 1;
+const nextBenchmarkSort = (db, groupId) =>
+  db.prepare('SELECT COALESCE(MAX(sort_order), 0) AS n FROM quota_benchmarks WHERE group_id = ?').get(groupId).n + 1;
+
+/** 组内 / 全局 sort_order 按现序密集化为 1..n（保证 ↑↓ 与首末禁用判定稳定，score.js reindex 同构） */
+function reindexBenchmarkGroups(db) {
+  const st = db.prepare('UPDATE quota_benchmark_groups SET sort_order = ? WHERE id = ?');
+  db.prepare('SELECT id FROM quota_benchmark_groups ORDER BY sort_order, name').all()
+    .forEach((row, i) => st.run(i + 1, row.id));
+}
+
+function reindexBenchmarks(db, groupId) {
+  const st = db.prepare('UPDATE quota_benchmarks SET sort_order = ? WHERE id = ?');
+  db.prepare('SELECT id FROM quota_benchmarks WHERE group_id = ? ORDER BY sort_order, name').all(groupId)
+    .forEach((row, i) => st.run(i + 1, row.id));
+}
+
+/** 重排入参校验：必须正好是该范围内的全员集合（score.js assertFullPermutation 同构） */
+function assertBenchmarkPermutation(actualIds, ids, what) {
+  if (!Array.isArray(ids) || ids.length !== actualIds.length || new Set(ids).size !== ids.length) {
+    throw quotaError(400, `${what}排序参数必须包含全部成员且不重复`);
+  }
+  const set = new Set(actualIds);
+  if (!ids.every((id) => set.has(id))) throw quotaError(400, `${what}排序参数里有不属于该范围的条目`);
+}
+
+/** 分组列表（按 sort_order，附组内条数；供 listBenchmarks 组树与概览计数复用） */
+export function listBenchmarkGroups(db) {
+  return db.prepare(
+    `SELECT g.id, g.name, g.sort_order AS sortOrder,
+            (SELECT COUNT(*) FROM quota_benchmarks b WHERE b.group_id = g.id) AS count
+       FROM quota_benchmark_groups g ORDER BY g.sort_order, g.name`
+  ).all();
+}
+
+/**
+ * 新建 / 更新分组：无 id 新建（追加末尾），有 id 仅改名（只动分组自身，组内基准的
+ * 归属与内容不变——条目靠 group_id 归属，与按组名字符串存储的形态本质不同）。
+ */
+export function saveBenchmarkGroup(db, { id, name } = {}) {
+  const nm = bmText(name);
+  if (!nm) throw quotaError(400, '分组名不能为空');
+  const dup = db.prepare('SELECT id FROM quota_benchmark_groups WHERE name = ? AND id <> ?').get(nm, id || '');
+  if (dup) throw quotaError(400, `已存在同名分组「${nm}」`);
+  if (id) {
+    const r = db.prepare('UPDATE quota_benchmark_groups SET name = ? WHERE id = ?').run(nm, id);
+    if (!r.changes) throw quotaError(404, '找不到该分组');
+  } else {
+    db.prepare('INSERT INTO quota_benchmark_groups (id, name, sort_order) VALUES (?, ?, ?)')
+      .run(bmUid('bmg'), nm, nextBenchmarkGroupSort(db));
+  }
+  return { ok: true };
+}
+
+/** 删除分组：组内非空拒绝（提示先移走或删除），空组删除后其余分组顺序紧凑稳定 */
+export function deleteBenchmarkGroup(db, id) {
+  const used = db.prepare('SELECT COUNT(*) AS n FROM quota_benchmarks WHERE group_id = ?').get(id).n;
+  if (used > 0) throw quotaError(400, `该分组下还有 ${used} 个基准，请先移走或删除`);
+  const r = db.prepare('DELETE FROM quota_benchmark_groups WHERE id = ?').run(id);
+  if (!r.changes) throw quotaError(404, '找不到该分组');
+  reindexBenchmarkGroups(db);
+  return { ok: true };
+}
+
+/** 分组整组排序：全量置换校验（缺失 / 重复 / 外来 id 一律 400）后落 sort_order = 序号 + 1 */
+export function reorderBenchmarkGroups(db, ids) {
+  const all = db.prepare('SELECT id FROM quota_benchmark_groups').all().map((r) => r.id);
+  assertBenchmarkPermutation(all, ids, '基准分组');
+  runInTransaction(db, () => {
+    const st = db.prepare('UPDATE quota_benchmark_groups SET sort_order = ? WHERE id = ?');
+    ids.forEach((id, i) => st.run(i + 1, id));
+  });
+  return { ok: true };
+}
+
+/**
+ * 基准配置分组树（配置页左栏一次拉全）：组按分组序、组内按组内序；每个基准附
+ * usedCount = 按名字统计的快照条数。这是**参考计数**而非关联：改名后它会跟着名字
+ * 归零（记录在标记时已固化旧名字），UI 文案已写明。
+ */
+export function listBenchmarks(db) {
+  const used = new Map(
+    db.prepare(
+      "SELECT json_extract(benchmark_json, '$.name') AS name, COUNT(*) AS c FROM quota_snapshots WHERE json_valid(benchmark_json) AND json_extract(benchmark_json, '$.name') IS NOT NULL GROUP BY name"
+    ).all().map((r) => [r.name, r.c])
+  );
+  const groups = listBenchmarkGroups(db).map((g) => ({
+    ...g,
+    list: db.prepare(
+      `SELECT id, group_id AS groupId, name, description, prompt, sort_order AS sortOrder
+         FROM quota_benchmarks WHERE group_id = ? ORDER BY sort_order, name`
+    ).all(g.id).map((b) => ({ ...b, usedCount: used.get(b.name) ?? 0 }))
+  }));
+  return { groups };
+}
+
+/**
+ * 新建 / 更新基准：空名 / 重名（全局唯一，名字是记录侧唯一识别键）400；分组不存在 400；
+ * 新建落组尾；换组（编辑器「所属分组」）落目标组尾并把源组 sort_order 紧凑化。
+ * 描述与提示词按原样保存（提示词是一整段自由文本，不 trim、不拆分）。
+ */
+export function saveBenchmark(db, { id, groupId, name, description, prompt } = {}) {
+  const nm = bmText(name);
+  if (!nm) throw quotaError(400, '基准名不能为空');
+  if (!db.prepare('SELECT 1 FROM quota_benchmark_groups WHERE id = ?').get(groupId)) {
+    throw quotaError(400, '请选择所属分组');
+  }
+  const dup = db.prepare('SELECT id FROM quota_benchmarks WHERE name = ? AND id <> ?').get(nm, id || '');
+  if (dup) throw quotaError(400, `已存在同名基准「${nm}」`);
+  const desc = String(description ?? '');
+  const promptText = String(prompt ?? '');
+  if (id) {
+    const cur = db.prepare('SELECT group_id AS groupId, sort_order AS sortOrder FROM quota_benchmarks WHERE id = ?').get(id);
+    if (!cur) throw quotaError(404, '找不到该基准');
+    const moved = cur.groupId !== groupId;
+    runInTransaction(db, () => {
+      db.prepare(
+        'UPDATE quota_benchmarks SET name = ?, group_id = ?, description = ?, prompt = ?, sort_order = ? WHERE id = ?'
+      ).run(nm, groupId, desc, promptText, moved ? nextBenchmarkSort(db, groupId) : cur.sortOrder, id);
+      if (moved) reindexBenchmarks(db, cur.groupId); // 源组紧凑化（无空洞）
+    });
+  } else {
+    db.prepare(
+      'INSERT INTO quota_benchmarks (id, group_id, name, description, prompt, sort_order) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(bmUid('bm'), groupId, nm, desc, promptText, nextBenchmarkSort(db, groupId));
+  }
+  return { ok: true };
+}
+
+/** 删除基准：历史快照不受影响（记录持有的是标记时固化的 JSON 字符串，非外键） */
+export function deleteBenchmark(db, id) {
+  const cur = db.prepare('SELECT group_id AS groupId FROM quota_benchmarks WHERE id = ?').get(id);
+  if (!cur) throw quotaError(404, '找不到该基准');
+  runInTransaction(db, () => {
+    db.prepare('DELETE FROM quota_benchmarks WHERE id = ?').run(id);
+    reindexBenchmarks(db, cur.groupId);
+  });
+  return { ok: true };
+}
+
+/** 基准组内排序：全量置换校验后落组内 sort_order = 序号 + 1 */
+export function reorderBenchmarks(db, groupId, ids) {
+  if (!db.prepare('SELECT 1 FROM quota_benchmark_groups WHERE id = ?').get(groupId)) {
+    throw quotaError(400, '找不到该分组');
+  }
+  const actual = db.prepare('SELECT id FROM quota_benchmarks WHERE group_id = ?').all(groupId).map((r) => r.id);
+  assertBenchmarkPermutation(actual, ids, '基准');
+  runInTransaction(db, () => {
+    const st = db.prepare('UPDATE quota_benchmarks SET sort_order = ? WHERE id = ?');
+    ids.forEach((id, i) => st.run(i + 1, id));
+  });
+  return { ok: true };
+}
+
+/**
+ * 快照标记 / 清除基准（记录侧唯一写入路径，单事务整批成功或整批回滚）。
+ * name 为空 → 逐条写 NULL（清除 = 回未设基准）；否则查配置取「名字 + 描述」序列化为
+ * {"name","desc"} 逐条 UPDATE（**不含 prompt 键**、不存基准 id）。快照行已被删除的条目
+ * changes=0 自然跳过；配置不存在时 400 整批不动。
+ */
+export function bindSnapshotsBenchmark(db, ids, name) {
+  if (!Array.isArray(ids) || !ids.length) throw quotaError(400, '请求体应为 { ids: [快照 id 列表], name }');
+  const nums = ids.map(Number);
+  if (nums.some((n) => !Number.isInteger(n) || n <= 0)) throw quotaError(400, '快照 id 应为正整数');
+  return runInTransaction(db, () => {
+    const stmt = db.prepare('UPDATE quota_snapshots SET benchmark_json = ? WHERE id = ?');
+    let n = 0;
+    if (!bmText(name)) {
+      for (const id of nums) n += Number(stmt.run(null, id).changes);
+      return { updated: n, cleared: true };
+    }
+    const nm = bmText(name);
+    const b = db.prepare('SELECT name, description FROM quota_benchmarks WHERE name = ?').get(nm);
+    if (!b) throw quotaError(400, `找不到基准「${nm}」，请先在「设置 → 统计基准」里创建`);
+    const json = JSON.stringify({ name: b.name, desc: b.description }); // 名字 + 描述固化；任务提示词不写入
+    for (const id of nums) n += Number(stmt.run(json, id).changes);
+    return { updated: n, cleared: false };
+  });
+}
+
+/* ================= 基准比较（quota-benchmark-compare，只读聚合） =================
+ * 按记录内固化的基准名扫描**全库**同名快照（不受记录窗口筛选 / 分页影响、与基准配置是否
+ * 仍存在无关），按「套餐 + 模型」统计对象分组求均值并算派生指标（公式：基准比较设计 §6.7）：
+ *   ① 样本级 T = inputHit + inputMiss + output、o = output ÷ T（输出占比只展示）、
+ *      D = { est_total_lo, est_total_hi }（两列 NOT NULL，月限额两端相等 = 单值）；
+ *   ② 分组 g = (plan_name, mode === 'model' ? model : '总量')——同一套餐的不同模型配置
+ *      分开当作多种套餐；排除 T ≤ 0（零消耗）与 tokens_json 解析失败行并计数；
+ *   ③ 组内均值 B = 平均(T)、b = 平均(o)、d = { lo: 平均(est_total_lo), hi: 平均(est_total_hi) }
+ *      ——**区间两端各自求均值，不取中值**；
+ *   ④ r = B ÷ B_min（自动取平均消耗最少者为参照，不支持手动指定）；
+ *   ⑤⑥⑦ n = d ÷ B、D′ = d ÷ r = n × B_min、U = D′ ÷ price——区间**两端各算一次**；
+ *      零额度（d.lo = d.hi = 0）总量类指标不可算；price ≤ 0（免费套餐）U 不可算；
+ *      两者均不影响该对象的 B / b / r。
+ * 纯只读：不写任何表；无匹配记录返回 recordCount = 0 的空结果（查询语义，不抛错）；
+ * 不排序返回（前端按三种排序本地切换，避免重复请求）。 */
+
+/** 数值防御性收敛：非有限值按 0 计（tokens_json 各字段语义上恒为数值，写坏也不抛错） */
+const benchNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+
+export function compareBenchmark(db, name) {
+  const globalCurrency = getBillingCurrency(db);
+  // 全量扫描（**不分页**——listQuotaSnapshots 有 200 条/页上限，均值必须覆盖全部记录）；
+  // 行序即 start_ms DESC, id DESC，组内明细 push 后天然时间倒序
+  const rows = db.prepare(
+    `SELECT id, start_ms, mode, model, plan_name, tokens_json, price, token_costs_json, est_total_lo, est_total_hi
+       FROM quota_snapshots WHERE ${BENCH_NAME_MATCH} ORDER BY start_ms DESC, id DESC`
+  ).all(name);
+
+  // 说明变体（同名记录各条固化的 desc 可能不同——配置改过说明；与展示侧 parseBenchmarkJson
+  // 同口径：缺失 / 非字符串一律按空串）：按出现次数降序，desc 取最常见一条
+  const descVariants = [...new Set(db.prepare(
+    `SELECT json_extract(benchmark_json, '$.desc') AS v, COUNT(*) AS c
+       FROM quota_snapshots WHERE ${BENCH_NAME_MATCH} GROUP BY v ORDER BY c DESC, v`
+  ).all(name).map((r) => (typeof r.v === 'string' ? r.v : '')))];
+
+  const excluded = { zeroTokens: 0, invalidTokens: 0 };
+  const buckets = new Map();
+  for (const row of rows) {
+    let tokens;
+    try {
+      tokens = JSON.parse(row.tokens_json);
+    } catch {
+      excluded.invalidTokens += 1; // 解析失败整行跳过（与 json_valid 守卫同一防御哲学），不影响其它行
+      continue;
+    }
+    const T = benchNum(tokens?.inputHit) + benchNum(tokens?.inputMiss) + benchNum(tokens?.output);
+    if (!(T > 0)) { excluded.zeroTokens += 1; continue; } // 零消耗：不参与任何均值
+    const model = row.mode === 'model' ? (row.model || '(未知模型)') : '总量'; // 总量模式按「总量」这个模型看待
+    const gkey = row.plan_name + '||' + model;
+    if (!buckets.has(gkey)) buckets.set(gkey, { planName: row.plan_name, model, samples: [] });
+    buckets.get(gkey).samples.push({
+      id: row.id,
+      startTime: row.start_ms,
+      T,
+      ratio: benchNum(tokens?.output) / T, // 本次输出占比（只展示，不参与计算）
+      estLo: row.est_total_lo,
+      estHi: row.est_total_hi,
+      price: row.price,
+      // 币种 = 快照写入时刻固化的计费币种（price 当时所属币种的唯一记录）；旧记录缺失回退全局币种
+      currency: parseTokenCosts(row.token_costs_json)?.currency || globalCurrency
+    });
+  }
+
+  const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const groups = [...buckets.values()].map((g) => {
+    const ss = g.samples;
+    return {
+      key: g.planName + '||' + g.model,
+      planName: g.planName,
+      model: g.model,
+      sampleCount: ss.length,
+      B: mean(ss.map((s) => s.T)),                    // 平均单次消耗
+      b: mean(ss.map((s) => s.ratio)),                // 平均输出占比（只展示）
+      d: { lo: mean(ss.map((s) => s.estLo)), hi: mean(ss.map((s) => s.estHi)) }, // 区间端点各自求均值
+      price: ss[0].price,                             // 组价格 / 币种取最近一条快照固化值
+      currency: ss[0].currency,
+      samples: ss
+    };
+  });
+
+  const minB = groups.length ? Math.min(...groups.map((g) => g.B)) : null;
+  for (const g of groups) {
+    const zeroQuota = g.d.lo === 0 && g.d.hi === 0;   // est 两列 NOT NULL 但值可为 0（零额度套餐）
+    g.ratio = minB == null ? null : g.B / minB;
+    g.isBaseline = minB != null && g.B === minB;
+    // 区间第 ⑤⑥⑦ 步两端各算一次；零额度 → 三个总量类指标不可算（前端显示「—」）
+    g.times = zeroQuota ? null : { lo: g.d.lo / g.B, hi: g.d.hi / g.B };
+    // D′ = d ÷ r = n × B_min（恒等式逐端点成立，「基准等价总量」与「可完成次数」永远同序）
+    g.equivTokens = zeroQuota ? null : { lo: g.d.lo / g.ratio, hi: g.d.hi / g.ratio };
+    g.perMoney = !zeroQuota && g.price > 0
+      ? { lo: g.equivTokens.lo / g.price, hi: g.equivTokens.hi / g.price }
+      : null;                                         // U = D′ ÷ price；免费套餐不可算
+  }
+
+  const currencies = [...new Set(groups.map((g) => g.currency))];
+  const baseline = groups.find((g) => g.isBaseline) || null;
+  return {
+    name,
+    desc: descVariants[0] || '',
+    descVariants,
+    recordCount: rows.length,
+    excluded,
+    groups,
+    minB,
+    currencies,
+    baseCurrency: baseline?.currency || currencies[0] || globalCurrency, // 参照组合的币种
+    hasRange: groups.some((g) => g.d.lo !== g.d.hi),
+    priceZero: groups.some((g) => !(g.price > 0))
+  };
 }

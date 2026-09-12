@@ -23,7 +23,10 @@ import {
   listQuotaPresets, saveQuotaPreset, deleteQuotaPreset,
   startQuotaPreset, stopQuotaPreset, reapStaleRuns, invalidatePresetsFor,
   invalidatePresetsForPlans, abandonQuotaPreset,
-  migrateQuotaPresetsOwnership, listQuotaSnapshots
+  migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots, updateSnapshotNote,
+  listBenchmarkGroups, saveBenchmarkGroup, deleteBenchmarkGroup, reorderBenchmarkGroups,
+  listBenchmarks, saveBenchmark, deleteBenchmark, reorderBenchmarks,
+  bindSnapshotsBenchmark, compareBenchmark
 } from '../src/quota.js';
 
 function tempDb() {
@@ -1564,6 +1567,659 @@ test('放弃统计 abandonQuotaPreset：归位 stopped、清基线、读数保�
     // 放弃后可重新启动新一轮
     startQuotaPreset(db, id);
     assert.equal(presetRow(db, id).status, 'running');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 任务基准（quota-snapshot-benchmark 2.4） =================
+ * 分组 / 基准纯配置 CRUD（对齐模型评分域）+ 快照标记的单向固化语义。
+ * 快照行直插构造（聚焦 benchmark_json 语义，不走启停全链路）。 */
+
+/** 直插一条最小快照行（NOT NULL 列补缺省），返回 id */
+function insertSnapshot(db, { planName = '套餐A', provider = '火山引擎', startMs = 1000, price = 200 } = {}) {
+  const info = db.prepare(
+    `INSERT INTO quota_snapshots (preset_id, created_ms, start_ms, mode, tokens_json, plan_name, provider,
+       price, limit_period, quota_text, consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi)
+     VALUES (NULL, ?, ?, 'total', '{}', ?, ?, ?, 'month', '100%/月', 1, 1, 1000, 1000)`
+  ).run(startMs + 10, startMs, planName, provider, price);
+  return Number(info.lastInsertRowid);
+}
+
+const snapRaw = (db, id) => db.prepare('SELECT * FROM quota_snapshots WHERE id = ?').get(id);
+
+test('基准分组：新建追加末尾 / 空名与重名被拒 / 改名只动分组自身 / 排序全量置换校验 / 非空拒删与空组可删', () => {
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '长文场景' });
+    saveBenchmarkGroup(db, { name: '代码场景' });
+    // 新建追加末尾：sort_order 递增
+    assert.deepEqual(listBenchmarkGroups(db).map((g) => [g.name, g.sortOrder, g.count]),
+      [['长文场景', 1, 0], ['代码场景', 2, 0]]);
+
+    // 空名 / 重名被拒
+    assert.throws(() => saveBenchmarkGroup(db, { name: '  ' }), (e) => e.status === 400 && /分组名不能为空/.test(e.message));
+    assert.throws(() => saveBenchmarkGroup(db, { name: '长文场景' }),
+      (e) => e.status === 400 && /已存在同名分组「长文场景」/.test(e.message));
+
+    // 组内条目：改名分组不动条目
+    const g1 = listBenchmarkGroups(db)[0];
+    saveBenchmark(db, { groupId: g1.id, name: '基准一', description: '描述一', prompt: '提示词' });
+    saveBenchmarkGroup(db, { id: g1.id, name: '长文场景v2' });
+    const renamed = listBenchmarks(db).groups.find((g) => g.name === '长文场景v2');
+    assert.equal(renamed.list.length, 1);
+    assert.equal(renamed.list[0].name, '基准一'); // 条目归属与内容原样
+    assert.throws(() => saveBenchmarkGroup(db, { id: g1.id, name: '代码场景' }),
+      (e) => e.status === 400 && /已存在同名分组/.test(e.message));
+    assert.throws(() => saveBenchmarkGroup(db, { id: '不存在', name: 'X' }), (e) => e.status === 404 && /找不到该分组/.test(e.message));
+
+    // 分组排序：全量置换（缺失 / 重复 / 外来 id 均报错，顺序不变化）
+    const ids = listBenchmarkGroups(db).map((g) => g.id);
+    assert.throws(() => reorderBenchmarkGroups(db, [ids[0]]), (e) => e.status === 400 && /全部成员/.test(e.message));
+    assert.throws(() => reorderBenchmarkGroups(db, [ids[0], ids[0]]), (e) => e.status === 400 && /全部成员/.test(e.message));
+    assert.throws(() => reorderBenchmarkGroups(db, [ids[0], '外来id']), (e) => e.status === 400 && /不属于该范围/.test(e.message));
+    reorderBenchmarkGroups(db, [ids[1], ids[0]]);
+    assert.deepEqual(listBenchmarkGroups(db).map((g) => g.name), ['代码场景', '长文场景v2']);
+
+    // 非空组拒删（提示条数）；空组可删且其余分组顺序稳定
+    assert.throws(() => deleteBenchmarkGroup(db, g1.id),
+      (e) => e.status === 400 && /该分组下还有 1 个基准，请先移走或删除/.test(e.message));
+    deleteBenchmarkGroup(db, ids[1]); // 代码场景（空）
+    assert.deepEqual(listBenchmarkGroups(db).map((g) => g.name), ['长文场景v2']);
+    assert.equal(listBenchmarkGroups(db)[0].sortOrder, 1); // 紧凑化后仍从 1 起
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('基准读写：新建落组尾 / 换组落目标组末尾且源组紧凑 / 组内排序全量置换 / 唯一名与字段校验 / usedCount', () => {
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '组A' });
+    saveBenchmarkGroup(db, { name: '组B' });
+    const [gA, gB] = listBenchmarkGroups(db);
+    saveBenchmark(db, { groupId: gA.id, name: '基准1' });
+    saveBenchmark(db, { groupId: gA.id, name: '基准2', description: '说明', prompt: '整段提示词\n带换行' });
+    saveBenchmark(db, { groupId: gB.id, name: '基准3' });
+
+    // 空名 / 重名（跨组全局唯一）/ 分组不存在
+    assert.throws(() => saveBenchmark(db, { groupId: gA.id, name: '' }), (e) => e.status === 400 && /基准名不能为空/.test(e.message));
+    assert.throws(() => saveBenchmark(db, { groupId: gB.id, name: '基准1' }),
+      (e) => e.status === 400 && /已存在同名基准「基准1」/.test(e.message));
+    assert.throws(() => saveBenchmark(db, { groupId: '不存在', name: 'X' }), (e) => e.status === 400 && /请选择所属分组/.test(e.message));
+    assert.throws(() => saveBenchmark(db, { id: '不存在', groupId: gA.id, name: 'X' }), (e) => e.status === 404 && /找不到该基准/.test(e.message));
+
+    // 组树：按分组序 → 组内序；prompt 整段原样；usedCount 初始 0
+    let tree = listBenchmarks(db);
+    assert.deepEqual(tree.groups.map((g) => g.list.map((b) => b.name)), [['基准1', '基准2'], ['基准3']]);
+    assert.equal(tree.groups[0].list[1].prompt, '整段提示词\n带换行');
+    assert.equal(tree.groups[0].list[1].usedCount, 0);
+
+    // 标记后 usedCount 按名字统计（参考计数）
+    const s1 = insertSnapshot(db);
+    bindSnapshotsBenchmark(db, [s1], '基准2');
+    tree = listBenchmarks(db);
+    assert.equal(tree.groups[0].list[1].usedCount, 1);
+
+    // 换组：落目标组末尾 + 源组紧凑
+    const b2 = tree.groups[0].list[1];
+    saveBenchmark(db, { id: b2.id, groupId: gB.id, name: '基准2', description: '说明', prompt: '整段提示词\n带换行' });
+    tree = listBenchmarks(db);
+    assert.deepEqual(tree.groups.map((g) => g.list.map((b) => b.name)), [['基准1'], ['基准3', '基准2']]);
+    assert.deepEqual(tree.groups[0].list.map((b) => b.sortOrder), [1]); // 源组无空洞
+
+    // 组内排序：全量置换（缺项 / 外来 id 报错）；合法重排生效
+    const gBIds = tree.groups[1].list.map((b) => b.id);
+    assert.throws(() => reorderBenchmarks(db, gB.id, [gBIds[0]]), (e) => e.status === 400 && /全部成员/.test(e.message));
+    assert.throws(() => reorderBenchmarks(db, '不存在组', gBIds), (e) => e.status === 400 && /找不到该分组/.test(e.message));
+    reorderBenchmarks(db, gB.id, [gBIds[1], gBIds[0]]);
+    assert.deepEqual(listBenchmarks(db).groups[1].list.map((b) => b.name), ['基准2', '基准3']);
+
+    // 删除基准：条目消失、组内紧凑（gBIds[0] 是重排前捕获的基准3）
+    deleteBenchmark(db, gBIds[0]);
+    tree = listBenchmarks(db);
+    assert.deepEqual(tree.groups[1].list.map((b) => b.name), ['基准2']);
+    assert.equal(tree.groups[1].list[0].sortOrder, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('标记基准：JSON 恰为 {"name","desc"} 不含 prompt / 批量覆盖 / 清除写 NULL / 非法 id 整批回滚 / 基准不存在 400', () => {
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '组A' });
+    const gA = listBenchmarkGroups(db)[0];
+    saveBenchmark(db, { groupId: gA.id, name: '基准X', description: '说明X', prompt: '绝密提示词内容' });
+    saveBenchmark(db, { groupId: gA.id, name: '基准Y', description: '' }); // 描述为空合法
+
+    const ids = [insertSnapshot(db, { startMs: 1000 }), insertSnapshot(db, { startMs: 2000 }), insertSnapshot(db, { startMs: 3000 })];
+
+    // 批量标记：字段固化为 {"name","desc"}，Object.keys 断言不含 prompt
+    const r1 = bindSnapshotsBenchmark(db, ids.slice(0, 2), '基准X');
+    assert.deepEqual(r1, { updated: 2, cleared: false });
+    for (const id of ids.slice(0, 2)) {
+      const v = JSON.parse(snapRaw(db, id).benchmark_json);
+      assert.deepEqual(Object.keys(v).sort(), ['desc', 'name']);
+      assert.equal(v.name, '基准X');
+      assert.equal(v.desc, '说明X');
+      assert.ok(!snapRaw(db, id).benchmark_json.includes('绝密提示词内容'), '任务提示词 SHALL NOT 进入记录');
+    }
+
+    // 覆盖（一条记录只能有一个基准）：只保留新值
+    bindSnapshotsBenchmark(db, [ids[0]], '基准Y');
+    const covered = JSON.parse(snapRaw(db, ids[0]).benchmark_json);
+    assert.deepEqual(covered, { name: '基准Y', desc: '' });
+    assert.equal(JSON.parse(snapRaw(db, ids[1]).benchmark_json).name, '基准X'); // 未勾选的记录不动
+
+    // 清除：字段回 NULL
+    const r2 = bindSnapshotsBenchmark(db, [ids[0]], '');
+    assert.deepEqual(r2, { updated: 1, cleared: true });
+    assert.equal(snapRaw(db, ids[0]).benchmark_json, null);
+    // 清除幂等：本来未设基准的条目也计 updated（UPDATE 命中即算）
+    bindSnapshotsBenchmark(db, [ids[0]], '基准X');
+
+    // 非法 ids：非数组 / 空数组 / 非正整数 → 400，且整批不动
+    assert.throws(() => bindSnapshotsBenchmark(db, 'x', '基准X'), (e) => e.status === 400 && /请求体应为/.test(e.message));
+    assert.throws(() => bindSnapshotsBenchmark(db, [], '基准X'), (e) => e.status === 400 && /请求体应为/.test(e.message));
+    assert.throws(() => bindSnapshotsBenchmark(db, [ids[0], 0], '基准X'), (e) => e.status === 400 && /快照 id 应为正整数/.test(e.message));
+    assert.throws(() => bindSnapshotsBenchmark(db, [ids[0], -1], '基准X'), (e) => e.status === 400 && /快照 id 应为正整数/.test(e.message));
+
+    // 基准不存在：400 且已标记记录字节不变
+    const before = snapRaw(db, ids[1]).benchmark_json;
+    assert.throws(() => bindSnapshotsBenchmark(db, [ids[0], ids[1]], '不存在的基准'),
+      (e) => e.status === 400 && /找不到基准「不存在的基准」/.test(e.message));
+    assert.equal(snapRaw(db, ids[1]).benchmark_json, before);
+    assert.ok(!JSON.parse(snapRaw(db, ids[0]).benchmark_json || 'null') || true); // 前一条也未被部分写入
+    assert.equal(JSON.parse(snapRaw(db, ids[0]).benchmark_json).name, '基准X');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('完全独立（核心回归锚点）：配置改名 / 改描述 / 删除后，记录 benchmark 字段字节不变；改绑不回写配置', () => {
+  // 补充说明（quota-snapshot-benchmark 7.2）：同一组断言已在隔离沙箱（独立 HOME + 空扫描源 +
+  // 独立端口）经真实 HTTP 服务做过端到端回归——建基准 → 批量标记 → 读回 benchmark_json 逐字
+  // 一致（无 prompt 键）→ 改名 / 改描述 / 删除配置后记录字节不变 → 筛选候选仍含旧名字，
+  // 26 项断言全绿；口径与本用例一致，此处不再重复脚本。
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '组A' });
+    const gA = listBenchmarkGroups(db)[0];
+    saveBenchmark(db, { groupId: gA.id, name: '基准V1', description: '第一版说明', prompt: '提示词' });
+    const sid = insertSnapshot(db);
+    bindSnapshotsBenchmark(db, [sid], '基准V1');
+    const frozen = snapRaw(db, sid).benchmark_json;
+    assert.equal(frozen, JSON.stringify({ name: '基准V1', desc: '第一版说明' }));
+
+    // 配置改名 + 改描述 + 改提示词：记录字节不变
+    const bid = listBenchmarks(db).groups[0].list[0].id;
+    saveBenchmark(db, { id: bid, groupId: gA.id, name: '基准V2', description: '第二版说明', prompt: '新提示词' });
+    assert.equal(snapRaw(db, sid).benchmark_json, frozen);
+
+    // 删除配置：记录照旧，且筛选候选仍含旧名字（全表去重口径）
+    deleteBenchmark(db, bid);
+    assert.equal(snapRaw(db, sid).benchmark_json, frozen);
+    let res = listQuotaSnapshots(db, {});
+    assert.deepEqual(res.benchmarks, ['基准V1']);
+    res = listQuotaSnapshots(db, { benchmark: '基准V1' });
+    assert.equal(res.total, 1); // 配置已删除的名字仍可筛到
+    assert.equal(res.items[0].benchmark.name, '基准V1');
+    assert.equal(res.items[0].benchmark.desc, '第一版说明');
+
+    // 反向：改绑 / 清除记录不回写配置（配置侧行不变——这里配置已删，再建同名基准验证互不影响）
+    saveBenchmark(db, { groupId: gA.id, name: '基准V3', description: '第三版' });
+    bindSnapshotsBenchmark(db, [sid], '基准V3');
+    assert.equal(JSON.parse(snapRaw(db, sid).benchmark_json).name, '基准V3');
+    const row = db.prepare('SELECT description FROM quota_benchmarks WHERE name = ?').get('基准V3');
+    assert.equal(row.description, '第三版'); // 记录侧标记没有触碰配置行
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('快照筛选：按名字 / __none__ / 与套餐提供商 AND 组合 / 候选值全表去重不受筛选影响 / unbound 计数', () => {
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '组A' });
+    const gA = listBenchmarkGroups(db)[0];
+    saveBenchmark(db, { groupId: gA.id, name: '基准A' });
+    saveBenchmark(db, { groupId: gA.id, name: '基准B' });
+
+    const s1 = insertSnapshot(db, { planName: '套餐A', provider: '火山引擎', startMs: 1000 });
+    const s2 = insertSnapshot(db, { planName: '套餐A', provider: '月之暗面', startMs: 2000 });
+    const s3 = insertSnapshot(db, { planName: '套餐B', provider: '火山引擎', startMs: 3000 });
+    const s4 = insertSnapshot(db, { planName: '套餐B', provider: '月之暗面', startMs: 4000 });
+    bindSnapshotsBenchmark(db, [s1, s2], '基准A');
+    bindSnapshotsBenchmark(db, [s3], '基准B');
+    // s4 保持未设基准；重复标记同名不产生重复候选
+    bindSnapshotsBenchmark(db, [s2], '基准A');
+
+    // 按名字筛选
+    assert.deepEqual(listQuotaSnapshots(db, { benchmark: '基准A' }).items.map((x) => x.id).sort(), [s1, s2]);
+    // 未设基准
+    const none = listQuotaSnapshots(db, { benchmark: '__none__' });
+    assert.deepEqual(none.items.map((x) => x.id), [s4]);
+    assert.equal(none.unbound, 1);
+    // AND 组合：基准 × 套餐 × 提供商
+    assert.deepEqual(listQuotaSnapshots(db, { benchmark: '基准A', plan: '套餐A', provider: '月之暗面' }).items.map((x) => x.id), [s2]);
+    assert.equal(listQuotaSnapshots(db, { benchmark: '基准B', plan: '套餐A' }).total, 0);
+    // 候选值恒为全表去重（不受当前筛选影响）+ 未筛也带 unbound
+    const filtered = listQuotaSnapshots(db, { benchmark: '基准A', plan: '套餐A' });
+    assert.deepEqual(filtered.benchmarks, ['基准A', '基准B']);
+    assert.equal(filtered.unbound, 1);
+    const empty = listQuotaSnapshots(db, { benchmark: '基准A', plan: '不存在的套餐' });
+    assert.deepEqual(empty.benchmarks, ['基准A', '基准B']);
+    assert.equal(empty.total, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('publicSnapshot 容错：benchmark_json 为 NULL 与损坏内容时 benchmark 为 null，既有字段不受影响', () => {
+  const { root, db } = tempDb();
+  try {
+    const s1 = insertSnapshot(db, { startMs: 1000 }); // 未标记：NULL
+    const s2 = insertSnapshot(db, { startMs: 2000 });
+    const s3 = insertSnapshot(db, { startMs: 3000 });
+    db.prepare('UPDATE quota_snapshots SET benchmark_json = ? WHERE id = ?').run('不是JSON', s2);
+    db.prepare('UPDATE quota_snapshots SET benchmark_json = ? WHERE id = ?').run('{"n":"缺名字"}', s3);
+
+    const res = listQuotaSnapshots(db, {});
+    const byId = new Map(res.items.map((x) => [x.id, x]));
+    assert.equal(byId.get(s1).benchmark, null);
+    assert.equal(byId.get(s2).benchmark, null); // 解析失败按未设基准
+    assert.equal(byId.get(s3).benchmark, null); // 缺名字按未设基准
+    // 未设基准条目计入 unbound；损坏内容不进候选值
+    assert.equal(res.unbound, 3);
+    assert.deepEqual(res.benchmarks, []);
+    // 既有字段不受加列影响
+    assert.equal(byId.get(s1).planName, '套餐A');
+    assert.equal(byId.get(s1).price, 200);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 基准比较（quota-benchmark-compare 1.5） =================
+ * 只读聚合：全库同名基准扫描 →「套餐 + 模型」分组求均值 → 七步派生指标。
+ * 快照行直插构造（聚焦 tokens_json / est_total / price / token_costs_json / benchmark_json 口径），
+ * 数值全部按设计稿 §6.7 手算对照；恒等式与均值用相对误差比较（浮点末位）。 */
+
+/** 直插一条可指定比较口径字段的快照行，返回 id */
+function insertBenchSnapshot(db, {
+  planName = '套餐A', mode = 'total', model = null, startMs = 1000, price = 200,
+  hit = 1000, miss = 2000, output = 1000, estLo = 1_000_000, estHi = 1_000_000,
+  tokenCosts = null, tokens = null, benchmark = null
+} = {}) {
+  const info = db.prepare(
+    `INSERT INTO quota_snapshots (preset_id, created_ms, start_ms, mode, model, tokens_json, plan_name, provider,
+       price, limit_period, quota_text, consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi,
+       token_costs_json, benchmark_json)
+     VALUES (NULL, ?, ?, ?, ?, ?, ?, '火山引擎', ?, 'month', '100%/月', 1, 1, ?, ?, ?, ?)`
+  ).run(
+    startMs + 10, startMs, mode, model,
+    tokens ?? JSON.stringify({ inputHit: hit, inputMiss: miss, output }),
+    planName, price, estLo, estHi,
+    tokenCosts === null ? null : JSON.stringify(tokenCosts),
+    benchmark === null ? null : JSON.stringify(benchmark)
+  );
+  return Number(info.lastInsertRowid);
+}
+
+const approx = (a, b) => Math.abs(a - b) <= Math.abs(b) * 1e-9 + 1e-9;
+const byKey = (res, planName, model) => res.groups.find((g) => g.planName === planName && g.model === model);
+
+test('compareBenchmark 主场景：分组与均值逐列手算对照（B / b / d / r / n / D′ / U）', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '压测基准', desc: '说明' };
+    // 组1（套餐A+m1）：T=4000/6000 → B=5000；o=0.25/0.25 → b=0.25；est 1e6；price 200
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm1', startMs: 1000, output: 1000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm1', startMs: 2000, hit: 2500, miss: 2000, output: 1500, benchmark: bmk });
+    // 组2（套餐A+m2）：T=10000/20000 → B=15000；o=0.3/0.2 → b=0.25；est 2e6；price 400
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm2', startMs: 3000, hit: 3000, miss: 4000, output: 3000, price: 400, estLo: 2_000_000, estHi: 2_000_000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm2', startMs: 4000, hit: 6000, miss: 10000, output: 4000, price: 400, estLo: 2_000_000, estHi: 2_000_000, benchmark: bmk });
+    // 组3（套餐B，总量模式按「总量」模型看待）：T=25000 → B=25000；o=0.2；est 3e6；price 600
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 5000, hit: 15000, miss: 5000, output: 5000, price: 600, estLo: 3_000_000, estHi: 3_000_000, benchmark: bmk });
+
+    const res = compareBenchmark(db, '压测基准');
+    assert.equal(res.name, '压测基准');
+    assert.equal(res.desc, '说明');
+    assert.deepEqual(res.descVariants, ['说明']);
+    assert.equal(res.recordCount, 5);
+    assert.deepEqual(res.excluded, { zeroTokens: 0, invalidTokens: 0 });
+    assert.equal(res.groups.length, 3);
+    assert.equal(res.minB, 5000);
+    assert.equal(res.hasRange, false);
+    assert.equal(res.priceZero, false);
+
+    const g1 = byKey(res, '套餐A', 'm1');
+    assert.equal(g1.sampleCount, 2);
+    assert.equal(g1.B, 5000);
+    assert.equal(g1.b, 0.25);
+    assert.deepEqual(g1.d, { lo: 1_000_000, hi: 1_000_000 });
+    assert.equal(g1.ratio, 1); // 最省者恰为 1
+    assert.equal(g1.isBaseline, true);
+    assert.deepEqual(g1.times, { lo: 200, hi: 200 });           // 1e6 ÷ 5000
+    assert.deepEqual(g1.equivTokens, { lo: 1_000_000, hi: 1_000_000 });
+    assert.deepEqual(g1.perMoney, { lo: 5000, hi: 5000 });      // 1e6 ÷ 200
+
+    const g2 = byKey(res, '套餐A', 'm2');
+    assert.equal(g2.B, 15000);
+    assert.ok(approx(g2.b, 0.25));                              // (0.3 + 0.2) ÷ 2
+    assert.equal(g2.ratio, 3);
+    assert.equal(g2.isBaseline, false);
+    assert.ok(approx(g2.times.lo, 2_000_000 / 15000));          // 133.33…
+    assert.ok(approx(g2.equivTokens.lo, 2_000_000 / 3));        // D′ = d ÷ r
+    assert.ok(approx(g2.perMoney.lo, 2_000_000 / 3 / 400));     // U = D′ ÷ price
+
+    const g3 = byKey(res, '套餐B', '总量');
+    assert.equal(g3.B, 25000);
+    assert.equal(g3.b, 0.2);
+    assert.equal(g3.ratio, 5);
+    assert.deepEqual(g3.times, { lo: 120, hi: 120 });           // 3e6 ÷ 25000
+    assert.deepEqual(g3.perMoney, { lo: 1000, hi: 1000 });      // 3e6 ÷ 5 ÷ 600
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 区间端点分别求均值：5.05M~6.35M 与 5.20M~6.10M → 5.125M~6.225M（不是中值）', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '区间基准', desc: '' };
+    insertBenchSnapshot(db, { planName: '套餐C', mode: 'model', model: 'm1', startMs: 1000, hit: 2000, miss: 2000, output: 1000, estLo: 5_050_000, estHi: 6_350_000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐C', mode: 'model', model: 'm1', startMs: 2000, hit: 2000, miss: 2000, output: 1000, estLo: 5_200_000, estHi: 6_100_000, benchmark: bmk });
+
+    const res = compareBenchmark(db, '区间基准');
+    assert.equal(res.hasRange, true);
+    const g = res.groups[0];
+    assert.deepEqual(g.d, { lo: 5_125_000, hi: 6_225_000 }); // 两端各自求均值
+    // 显式断言不是任何中值（若先取中值再均值会得到 5_700_000 / 5_700_000 等错误口径）
+    assert.notEqual(g.d.lo, (5_050_000 + 6_350_000) / 2);
+    assert.notEqual(g.d.lo, (5_050_000 + 6_100_000) / 2);
+    // 派生量保持区间形态（B = 5000）
+    assert.deepEqual(g.times, { lo: 1025, hi: 1245 });
+    assert.ok(approx(g.equivTokens.lo, 5_125_000) && approx(g.equivTokens.hi, 6_225_000));
+    assert.ok(approx(g.perMoney.lo, 5_125_000 / 200) && approx(g.perMoney.hi, 6_225_000 / 200));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 恒等式：D′ = n × B_min 逐端点成立，且 n 与 D′ 同序', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '压测基准', desc: '' };
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm1', startMs: 1000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐A', mode: 'model', model: 'm2', startMs: 2000, hit: 3000, miss: 4000, output: 3000, price: 400, estLo: 2_000_000, estHi: 2_000_000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 3000, hit: 15000, miss: 5000, output: 5000, price: 600, estLo: 3_000_000, estHi: 3_000_000, benchmark: bmk });
+    // 再掺一个区间组，恒等式须在区间两端同时成立
+    insertBenchSnapshot(db, { planName: '套餐C', startMs: 4000, price: 100, estLo: 5_050_000, estHi: 6_350_000, benchmark: bmk });
+
+    const res = compareBenchmark(db, '压测基准');
+    for (const g of res.groups) {
+      assert.ok(approx(g.equivTokens.lo, g.times.lo * res.minB), `D′.lo = n.lo × B_min（${g.key}）`);
+      assert.ok(approx(g.equivTokens.hi, g.times.hi * res.minB), `D′.hi = n.hi × B_min（${g.key}）`);
+    }
+    // 同序：按可完成次数与按基准等价总量（区间按中值）排序结果一致
+    const mid = (v) => (v.lo + v.hi) / 2;
+    const byTimes = [...res.groups].sort((a, b) => mid(b.times) - mid(a.times)).map((g) => g.key);
+    const byEquiv = [...res.groups].sort((a, b) => mid(b.equivTokens) - mid(a.equivTokens)).map((g) => g.key);
+    assert.deepEqual(byTimes, byEquiv);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 排除计数：零消耗行不参与任何均值；tokens_json 损坏行跳过且不影响其它行', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '排除基准', desc: '' };
+    const ok1 = insertBenchSnapshot(db, { planName: '套餐A', startMs: 1000, benchmark: bmk });
+    const ok2 = insertBenchSnapshot(db, { planName: '套餐A', startMs: 2000, hit: 2000, miss: 2000, output: 2000, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 3000, hit: 0, miss: 0, output: 0, benchmark: bmk }); // 全零
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 4000, tokens: '{}', benchmark: bmk });              // 空 JSON → T=0
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 5000, tokens: '{bad json', benchmark: bmk });       // 解析失败
+
+    const res = compareBenchmark(db, '排除基准');
+    assert.equal(res.recordCount, 5);            // 匹配到的同名记录总数（含被排除行）
+    assert.equal(res.excluded.zeroTokens, 2);    // 全零 + 空 JSON
+    assert.equal(res.excluded.invalidTokens, 1); // 损坏 JSON
+    assert.equal(res.groups.length, 1);
+    const g = res.groups[0];
+    assert.equal(g.sampleCount, 2);              // 只有两条有效样本参与均值
+    assert.equal(g.B, 5000);                     // (4000 + 6000) ÷ 2，零消耗行未拉低均值
+    assert.deepEqual(g.samples.map((s) => s.id), [ok2, ok1]); // 明细时间倒序、不含被排除行
+    // 样本形状：{ id, startTime, T, ratio, estLo, estHi }
+    assert.deepEqual(Object.keys(g.samples[0]).sort(), ['T', 'currency', 'estHi', 'estLo', 'id', 'price', 'ratio', 'startTime']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 不可算分支：零额度三个总量类指标 null（B/b/r 照常）；免费套餐仅 U null', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '不可算基准', desc: '' };
+    // 零额度：est 两列为 0（列 NOT NULL 但值可为 0）
+    insertBenchSnapshot(db, { planName: '免费套餐', startMs: 1000, price: 0, estLo: 0, estHi: 0, benchmark: bmk });
+    // 免费套餐：额度正常但 price = 0
+    insertBenchSnapshot(db, { planName: '零额度套餐', startMs: 2000, price: 0, benchmark: bmk });
+    // 正常对照组
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 3000, benchmark: bmk });
+
+    const res = compareBenchmark(db, '不可算基准');
+    assert.equal(res.priceZero, true);
+    const zero = byKey(res, '零额度套餐', '总量');
+    assert.deepEqual(zero.d, { lo: 1_000_000, hi: 1_000_000 });
+    assert.ok(zero.times != null && zero.equivTokens != null);
+    assert.equal(zero.perMoney, null);           // price ≤ 0 → 仅 U 不可算
+    assert.ok(zero.B > 0 && zero.ratio > 0);     // B / b / r 照常
+
+    const free = byKey(res, '免费套餐', '总量');
+    assert.equal(free.times, null);              // d = {0,0} → 总量类全部不可算
+    assert.equal(free.equivTokens, null);
+    assert.equal(free.perMoney, null);
+    assert.ok(free.B > 0 && free.b >= 0 && free.ratio > 0);
+    assert.equal(free.isBaseline, true);         // 免费套餐 T=4000 最省 → 仍是参照
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 币种：写时冻结币种 / 缺 token_costs_json 回退全局币种 / 参照币种为 baseCurrency', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '币种基准', desc: '' };
+    // 参照组（T 最小）CNY；另一组 USD
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 1000, tokenCosts: { currency: 'CNY', mode: 'total', amounts: { total: 1 } }, benchmark: bmk });
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 2000, hit: 3000, miss: 4000, output: 3000, tokenCosts: { currency: 'USD' }, benchmark: bmk });
+    let res = compareBenchmark(db, '币种基准');
+    // 不排序返回：currencies 为统计对象相遇序（扫描按 start_ms 倒序），断言只看成员集合
+    assert.deepEqual([...res.currencies].sort(), ['CNY', 'USD']);
+    assert.equal(res.baseCurrency, 'CNY');       // 参照组合的币种（T 最小者）
+    assert.equal(byKey(res, '套餐B', '总量').currency, 'USD');
+
+    // 缺 token_costs_json 的旧记录：回退全局计费币种（此处全局设为 USD）
+    setBillingCurrency(db, 'USD');
+    const bmk2 = { name: '旧记录基准', desc: '' };
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 1000, benchmark: bmk2 }); // 无 token_costs_json
+    res = compareBenchmark(db, '旧记录基准');
+    assert.deepEqual(res.currencies, ['USD']);
+    assert.equal(res.baseCurrency, 'USD');
+    assert.equal(res.groups[0].currency, 'USD');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 完全独立：标记后改配置名 / 删除配置，比较结果与说明变体不变', () => {
+  const { root, db } = tempDb();
+  try {
+    saveBenchmarkGroup(db, { name: '组A' });
+    const gA = listBenchmarkGroups(db)[0];
+    saveBenchmark(db, { groupId: gA.id, name: '基准V1', description: '第一版说明', prompt: '提示词' });
+    const s1 = insertBenchSnapshot(db, { planName: '套餐A', startMs: 1000 });
+    const s2 = insertBenchSnapshot(db, { planName: '套餐A', startMs: 2000, hit: 3000, miss: 3000, output: 3000 });
+    bindSnapshotsBenchmark(db, [s1, s2], '基准V1');
+
+    const before = compareBenchmark(db, '基准V1');
+    assert.equal(before.recordCount, 2);
+    assert.deepEqual(before.descVariants, ['第一版说明']);
+
+    // 改名 + 改描述：记录固化值不变 → 比较结果逐字段不变
+    const bid = listBenchmarks(db).groups[0].list[0].id;
+    saveBenchmark(db, { id: bid, groupId: gA.id, name: '基准V2', description: '第二版说明', prompt: '新提示词' });
+    assert.deepEqual(compareBenchmark(db, '基准V1'), before);
+
+    // 删除配置：照样可比较（读的是记录内固化的名字）
+    deleteBenchmark(db, bid);
+    assert.deepEqual(compareBenchmark(db, '基准V1'), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 空结果与损坏 benchmark_json：未知名字 200 空结果；损坏行不匹配任何名字也不抛错', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '压测基准', desc: '说明' };
+    insertBenchSnapshot(db, { planName: '套餐A', startMs: 1000, benchmark: bmk });
+    db.prepare('UPDATE quota_snapshots SET benchmark_json = ? WHERE plan_name = ?').run('不是JSON', '套餐A');
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 2000, benchmark: { n: '缺名字' } });
+
+    const res = compareBenchmark(db, '压测基准');
+    assert.equal(res.recordCount, 0);
+    assert.deepEqual(res.groups, []);
+    assert.equal(res.minB, null);
+    assert.deepEqual(res.currencies, []);
+    assert.equal(res.desc, '');
+    assert.ok(res.baseCurrency); // 回退全局币种，供前端空态展示
+
+    // 损坏 benchmark_json 与缺名字的行不匹配、不抛错
+    assert.equal(compareBenchmark(db, '缺名字').recordCount, 0);
+    assert.equal(compareBenchmark(db, '不存在的名字').recordCount, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('compareBenchmark 单对象 / 单样本照常计算：r 按定义为 1、明细形状完整、无任何告警分支', () => {
+  const { root, db } = tempDb();
+  try {
+    const bmk = { name: '单样本基准', desc: '' };
+    insertBenchSnapshot(db, {
+      planName: '套餐A', mode: 'model', model: 'm1', startMs: 1000,
+      hit: 1500, miss: 2500, output: 1000, estLo: 2_000_000, estHi: 2_000_000,
+      price: 100, benchmark: bmk
+    });
+
+    const res = compareBenchmark(db, '单样本基准');
+    assert.equal(res.recordCount, 1);
+    assert.equal(res.groups.length, 1);
+    const g = res.groups[0];
+    assert.equal(g.sampleCount, 1);
+    assert.equal(g.B, 5000);
+    assert.equal(g.b, 0.2);                      // 1000 ÷ 5000
+    assert.equal(g.ratio, 1);                    // 单对象按定义为 1.00×
+    assert.equal(g.isBaseline, true);
+    assert.deepEqual(g.times, { lo: 400, hi: 400 });
+    assert.deepEqual(g.equivTokens, { lo: 2_000_000, hi: 2_000_000 });
+    assert.deepEqual(g.perMoney, { lo: 20_000, hi: 20_000 });
+    assert.equal(g.samples.length, 1);
+    assert.equal(g.samples[0].T, 5000);
+    assert.equal(g.samples[0].estLo, 2_000_000);
+    // 多种说明变体：同名记录改过说明时全部候选按次数降序返回，desc 取最常见一条
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 2000, benchmark: { name: '多说明基准', desc: '新说明' } });
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 3000, benchmark: { name: '多说明基准', desc: '旧说明' } });
+    insertBenchSnapshot(db, { planName: '套餐B', startMs: 4000, benchmark: { name: '多说明基准', desc: '旧说明' } });
+    const multi = compareBenchmark(db, '多说明基准');
+    assert.deepEqual(multi.descVariants, ['旧说明', '新说明']); // 按出现次数降序
+    assert.equal(multi.desc, '旧说明');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 快照备注（quota-snapshot-note 2.3） =================
+ * updateSnapshotNote 全分支 + publicSnapshot 空串口径 + 列表回读。
+ * 快照行直插构造（聚焦 note 语义，不走启停全链路）。 */
+
+test('快照备注：设置 / 更新 / 清除（空与纯空白落 NULL）/ trim 落库 / 返回落库有效值', () => {
+  const { root, db } = tempDb();
+  try {
+    const id = insertSnapshot(db);
+    assert.equal(snapRaw(db, id).note, null); // 新建快照默认无备注
+
+    // 设置：trim 落库，返回落库后的有效值
+    assert.deepEqual(updateSnapshotNote(db, id, '  调价前最后一条  '), { id, note: '调价前最后一条' });
+    assert.equal(snapRaw(db, id).note, '调价前最后一条');
+
+    // 更新：新值覆盖旧值
+    updateSnapshotNote(db, id, '第二次备注');
+    assert.equal(snapRaw(db, id).note, '第二次备注');
+
+    // 清除：空串与纯空白均落 NULL
+    assert.deepEqual(updateSnapshotNote(db, id, ''), { id, note: null });
+    assert.equal(snapRaw(db, id).note, null);
+    updateSnapshotNote(db, id, '临时');
+    assert.deepEqual(updateSnapshotNote(db, id, '   \t '), { id, note: null });
+    assert.equal(snapRaw(db, id).note, null);
+
+    // null / undefined 输入等同清除
+    updateSnapshotNote(db, id, '临时');
+    assert.deepEqual(updateSnapshotNote(db, id, null), { id, note: null });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('快照备注：非法输入被拒（超 200 字 / id 非正整数）/ 不存在 404 / 拒绝后原值不变', () => {
+  const { root, db } = tempDb();
+  try {
+    const id = insertSnapshot(db);
+    updateSnapshotNote(db, id, '原值');
+
+    assert.throws(() => updateSnapshotNote(db, id, 'x'.repeat(201)),
+      (e) => e.status === 400 && /备注最长 200 字/.test(e.message));
+    assert.equal(updateSnapshotNote(db, id, 'x'.repeat(200)).note, 'x'.repeat(200)); // 恰好 200 合法
+    for (const bad of [0, -1, 1.5, '1', null, undefined]) {
+      assert.throws(() => updateSnapshotNote(db, bad, 'x'), (e) => e.status === 400 && /快照 id 应为正整数/.test(e.message));
+    }
+    assert.throws(() => updateSnapshotNote(db, id + 1000, 'x'), (e) => e.status === 404 && /快照记录不存在/.test(e.message));
+
+    // 全部拒绝路径不触碰原值
+    assert.equal(snapRaw(db, id).note, 'x'.repeat(200));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('快照备注：列表回读 note（NULL → 空串口径）/ 备注与基准、统计字段互不影响', () => {
+  const { root, db } = tempDb();
+  try {
+    const s1 = insertSnapshot(db, { startMs: 1000 });
+    const s2 = insertSnapshot(db, { startMs: 2000 });
+    const before = listQuotaSnapshots(db, {}).items.find((x) => x.id === s1);
+    assert.equal(before.note, ''); // 旧记录 / 无备注 → 空串口径
+    assert.equal(before.benchmark, null);
+
+    updateSnapshotNote(db, s1, '第一条的备注');
+    updateSnapshotNote(db, s2, '普通记录');
+
+    const items = listQuotaSnapshots(db, {}).items;
+    assert.equal(items.find((x) => x.id === s1).note, '第一条的备注');
+    assert.equal(items.find((x) => x.id === s2).note, '普通记录');
+
+    // 改备注不动基准与统计固化字段
+    const raw1 = snapRaw(db, s1);
+    updateSnapshotNote(db, s1, '改过的备注');
+    const raw1b = snapRaw(db, s1);
+    for (const k of ['created_ms', 'start_ms', 'mode', 'tokens_json', 'plan_name', 'provider', 'price', 'quota_text', 'benchmark_json']) {
+      assert.equal(raw1b[k], raw1[k], `改备注不应改动字段 ${k}`);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

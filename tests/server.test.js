@@ -1160,6 +1160,44 @@ test('额度估计 API：快照筛选 / 分页 / 批量删除（形状贴近 dem
   }
 });
 
+test('额度估计 API：快照备注单条更新（200 保存回读 / 400 非法输入 / 404 不存在）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    insertSnapshot(db, { planName: 'P1', provider: '火山引擎', startMs: 100000 });
+    const id = (await call(handle, '/api/quota/snapshots')).body.items[0].id;
+
+    // 200：保存成功并回读（首尾空白去除）
+    let res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { id, note: '  调价前最后一条 ' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { ok: true, id, note: '调价前最后一条' });
+    res = await call(handle, '/api/quota/snapshots');
+    assert.equal(res.body.items.find((s) => s.id === id).note, '调价前最后一条');
+
+    // 200：清除（纯空白 → 落 NULL，列表回读为空串口径）
+    res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { id, note: '   ' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.note, null);
+    assert.equal((await call(handle, '/api/quota/snapshots')).body.items.find((s) => s.id === id).note, '');
+
+    // 400：超长 / 非法 id / 缺 id（中文文案）
+    res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { id, note: 'x'.repeat(201) });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /备注最长 200 字/);
+    res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { id: 0, note: 'x' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /快照 id 应为正整数/);
+    res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { note: 'x' });
+    assert.equal(res.status, 400);
+
+    // 404：不存在的快照
+    res = await callBody(handle, 'PUT', '/api/quota/snapshots/note', { id: 9999, note: 'x' });
+    assert.equal(res.status, 404);
+    assert.match(res.body.error, /快照记录不存在/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('额度估计 API：放弃统计 abandon 路由——归位、无快照、非 running 400 与 404 透传', async () => {
   const { root, db, handle } = makeApp();
   try {
@@ -1763,8 +1801,210 @@ test('静态资源：/score.js 在白名单内可取，未登记路径 404', asy
     assert.equal(res.status, 200);
     assert.ok(String(res.body).includes('模型评分'), 'score.js 应可被面板取到');
 
+    const cmp = { status: null, body: null, writeHead(s) { this.status = s; }, end(b) { this.body = b; } };
+    await handle({ method: 'GET', url: '/quota-benchmark-compare.js' }, cmp);
+    assert.equal(cmp.status, 200);
+    assert.ok(String(cmp.body).includes('QuotaBenchmarkCompare'), 'quota-benchmark-compare.js 应在静态白名单内可取');
+
     const miss = { status: null, body: null, writeHead(s) { this.status = s; }, end(b) { this.body = b; } };
     await handle({ method: 'GET', url: '/not-registered.js' }, miss);
     assert.equal(miss.status, 404);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/* ================= 任务基准 API（quota-snapshot-benchmark 任务 4.3） ================= */
+
+test('任务基准 API：九条配置端点 + 绑定端点（成功路径 / 参数校验 / 中文错误 / err.status 透传）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    // 空树
+    let res = await call(handle, '/api/quota/benchmarks');
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { groups: [] });
+
+    // 新建分组（裸 PUT）；缺名 / 重名 → 400 中文文案
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups', { name: '组A' });
+    assert.equal(res.status, 200);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups', { name: '  ' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /分组名不能为空/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups', { name: '组A' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /已存在同名分组「组A」/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups', { name: '组B' });
+    assert.equal(res.status, 200);
+
+    let groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    const [gA, gB] = groups.map((g) => g.id);
+
+    // 改名（:id PUT）：只动分组自身
+    res = await callBody(handle, 'PUT', `/api/quota/benchmark-groups/${gB}`, { name: '组B改名' });
+    assert.equal(res.status, 200);
+    res = await callBody(handle, 'PUT', `/api/quota/benchmark-groups/不存在`, { name: 'X' });
+    assert.equal(res.status, 404);
+    assert.match(res.body.error, /找不到该分组/);
+
+    // 新建基准；缺名 / 重名（全局）/ 分组不存在 → 400
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gA, name: '基准1', description: '说明', prompt: '提示词' });
+    assert.equal(res.status, 200);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gA, name: '' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /基准名不能为空/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gB, name: '基准1' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /已存在同名基准「基准1」/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: '不存在', name: '基准2' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /请选择所属分组/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gA, name: '基准2' });
+    assert.equal(res.status, 200);
+    // 分组树：组内条目带 description / prompt / usedCount
+    groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    assert.equal(groups.length, 2);
+    assert.equal(groups[0].list.length, 2);
+    assert.equal(groups[0].list[0].prompt, '提示词');
+    assert.equal(groups[0].list[0].usedCount, 0);
+
+    // 更新基准（:id PUT）
+    const bId = groups[0].list[0].id;
+    res = await callBody(handle, 'PUT', `/api/quota/benchmarks/${bId}`, { groupId: gA, name: '基准1', description: '改说明' });
+    assert.equal(res.status, 200);
+    groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    assert.equal(groups[0].list[0].description, '改说明');
+
+    // 组内排序：全量置换；缺成员 / 外来 id → 400
+    let ids = groups[0].list.map((b) => b.id);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks/order', { groupId: gA, ids: [ids[0]] });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /全部成员/);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks/order', { groupId: gA, ids: [ids[1], ids[0]] });
+    assert.equal(res.status, 200);
+    groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    assert.deepEqual(groups[0].list.map((b) => b.name), ['基准2', '基准1']);
+
+    // 分组排序：全量置换
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups/order', { ids: [gB, gA] });
+    assert.equal(res.status, 200);
+    groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    assert.deepEqual(groups.map((g) => g.name), ['组B改名', '组A']);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmark-groups/order', { ids: [gA] });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /全部成员/);
+
+    // 快照标记 / 清除：body {ids, name}
+    insertSnapshot(db, { planName: 'P1', provider: '火山引擎', startMs: 1000 });
+    insertSnapshot(db, { planName: 'P2', provider: '月之暗面', startMs: 2000 });
+    const snapIds = db.prepare('SELECT id FROM quota_snapshots ORDER BY id').all().map((r) => r.id);
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: snapIds, name: '基准1' });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body, { ok: true, updated: 2, cleared: false });
+    // 标记结果落列（JSON 恰含 name/desc）
+    const raw1 = db.prepare('SELECT benchmark_json FROM quota_snapshots WHERE id = ?').get(snapIds[0]).benchmark_json;
+    assert.deepEqual(Object.keys(JSON.parse(raw1)).sort(), ['desc', 'name']);
+    // usedCount 跟随
+    groups = (await call(handle, '/api/quota/benchmarks')).body.groups;
+    const marked = groups.flatMap((g) => g.list).find((b) => b.name === '基准1');
+    assert.equal(marked.usedCount, 2);
+
+    // 绑定参数校验：非数组 / 空数组 / 非正整数 / 基准不存在
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: 'x', name: '基准1' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /请求体应为/);
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: [], name: '基准1' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /请求体应为/);
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: [snapIds[0], 0], name: '基准1' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /快照 id 应为正整数/);
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: snapIds, name: '不存在基准' });
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /找不到基准/);
+
+    // 快照筛选：按名字 / __none__ / 无条件（候选与 unbound）
+    res = await call(handle, `/api/quota/snapshots?benchmark=${encodeURIComponent('基准1')}`);
+    assert.equal(res.body.total, 2);
+    assert.equal(res.body.items[0].benchmark.name, '基准1');
+    res = await call(handle, '/api/quota/snapshots?benchmark=__none__');
+    assert.equal(res.body.total, 0);
+    res = await call(handle, '/api/quota/snapshots');
+    assert.deepEqual(res.body.benchmarks, ['基准1']);
+    assert.equal(res.body.unbound, 0);
+    // 清除（name 空）→ 未设基准可筛
+    res = await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids: [snapIds[0]], name: '' });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.cleared, true);
+    res = await call(handle, '/api/quota/snapshots?benchmark=__none__');
+    assert.equal(res.body.total, 1);
+    assert.equal(res.body.unbound, 1);
+
+    // 删除：非空组拒删；删基准后记录照旧、候选仍含旧名字；重复删除 404
+    res = await callBody(handle, 'DELETE', `/api/quota/benchmark-groups/${gA}`);
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /该分组下还有 2 个基准，请先移走或删除/);
+    res = await callBody(handle, 'DELETE', `/api/quota/benchmarks/${bId}`);
+    assert.equal(res.status, 200);
+    res = await callBody(handle, 'DELETE', `/api/quota/benchmarks/${bId}`);
+    assert.equal(res.status, 404);
+    res = await call(handle, '/api/quota/snapshots');
+    const kept = res.body.items.find((x) => x.id === snapIds[1]);
+    assert.equal(kept.benchmark.name, '基准1'); // 配置删除后记录不变
+    assert.deepEqual(res.body.benchmarks, ['基准1']); // 候选仍含旧名字
+    // 空组可删：gB 从未放入基准（组A 在上面「非空拒删」已覆盖）
+    res = await callBody(handle, 'DELETE', `/api/quota/benchmark-groups/${gB}`);
+    assert.equal(res.status, 200);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 基准比较 API（quota-benchmark-compare 任务 2.2） ================= */
+
+test('基准比较 API：GET /api/quota/benchmarks/compare（200 结果形状 / 缺 name 400 / 未知名字空结果 / 不吃掉既有分支）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    // 造数：分组 + 基准配置，两条同名基准记录（不同套餐 → 两个统计对象）
+    await callBody(handle, 'PUT', '/api/quota/benchmark-groups', { name: '组A' });
+    const gA = (await call(handle, '/api/quota/benchmarks')).body.groups[0].id;
+    await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gA, name: '基准1', description: '比较说明' });
+    insertSnapshot(db, { planName: 'P1', provider: '火山引擎', startMs: 1000 });
+    insertSnapshot(db, { planName: 'P2', provider: '月之暗面', startMs: 2000 });
+    const ids = db.prepare('SELECT id FROM quota_snapshots ORDER BY id').all().map((r) => r.id);
+    await callBody(handle, 'POST', '/api/quota/snapshots/benchmark', { ids, name: '基准1' });
+
+    // 正常返回：200 + 统计对象 / 参照值 / 币种 / 明细（insertSnapshot 固定 tokens 2000+6000+2000）
+    let res = await call(handle, `/api/quota/benchmarks/compare?name=${encodeURIComponent('基准1')}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.recordCount, 2);
+    assert.equal(res.body.desc, '比较说明');
+    assert.equal(res.body.groups.length, 2);
+    assert.ok(res.body.groups.every((g) => g.sampleCount === 1 && g.samples.length === 1 && g.samples[0].T === 10000));
+    assert.equal(res.body.minB, 10000);
+    assert.deepEqual(res.body.currencies, ['CNY']);
+    assert.equal(res.body.baseCurrency, 'CNY');
+    assert.deepEqual(res.body.excluded, { zeroTokens: 0, invalidTokens: 0 });
+    assert.equal(res.body.hasRange, false);
+
+    // 缺 name → 400 中文错误，不触碰数据
+    res = await call(handle, '/api/quota/benchmarks/compare');
+    assert.equal(res.status, 400);
+    assert.match(res.body.error, /请提供基准名 name/);
+
+    // 未知名字 → 200 空结果（查询语义，不是资源查找）
+    res = await call(handle, `/api/quota/benchmarks/compare?name=${encodeURIComponent('不存在')}`);
+    assert.equal(res.status, 200);
+    assert.equal(res.body.recordCount, 0);
+    assert.deepEqual(res.body.groups, []);
+
+    // 新增分支不吃掉既有分支：分组树 GET / 新建 PUT / order PUT 照常工作
+    res = await call(handle, '/api/quota/benchmarks');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.groups[0].list[0].usedCount, 2);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks', { groupId: gA, name: '基准2' });
+    assert.equal(res.status, 200);
+    const allIds = (await call(handle, '/api/quota/benchmarks')).body.groups[0].list.map((b) => b.id);
+    res = await callBody(handle, 'PUT', '/api/quota/benchmarks/order', { groupId: gA, ids: [allIds[1], allIds[0]] });
+    assert.equal(res.status, 200); // 组内全量置换重排照常（新增 GET compare 分支未拦截 PUT）
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

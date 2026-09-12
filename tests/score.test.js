@@ -58,11 +58,11 @@ function dumpOtherTables(db) {
 
 /* ================= 1. 内置数据与迁移 ================= */
 
-test('schema v15：全新库建表、user_version 为 15、内置数据开箱即有', () => {
+test('schema v15+：全新库建表、user_version 为当前版本、内置数据开箱即有', () => {
   const { db, cleanup } = makeDb();
   try {
-    assert.equal(SCHEMA_VERSION, 15);
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 15);
+    assert.equal(SCHEMA_VERSION, 17);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 17);
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'score_%'")
       .all().map((r) => r.name).sort();
     assert.deepEqual(tables, [
@@ -87,7 +87,7 @@ test('schema v15：重复打开同一库不重复写入内置数据（幂等）'
     a.close();
     const b = openDb(file);
     assert.deepEqual(scoreStats(b), first);
-    assert.equal(b.prepare('PRAGMA user_version').get().user_version, 15);
+    assert.equal(b.prepare('PRAGMA user_version').get().user_version, 17);
     b.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -103,7 +103,7 @@ test('schema v15：v14 存量库升级自动建表并写入内置数据，既有
     db.close();
 
     const up = openDb(file);
-    assert.equal(up.prepare('PRAGMA user_version').get().user_version, 15);
+    assert.equal(up.prepare('PRAGMA user_version').get().user_version, 17);
     assert.deepEqual(scoreStats(up), SEED_STATS);
     assert.equal(dumpOtherTables(up), before, '升级不得改动任何既有表');
     up.close();

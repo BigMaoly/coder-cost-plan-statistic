@@ -34,6 +34,12 @@ function containerOf(batches) {
 const sessionHeader = (delegationDepth = 0) => JSON.stringify({
   type: 'session', version: 0, id: 'session-abc', createdAt: T0, cwd: '/p', delegationDepth, agentPreset: 'standard'
 });
+/** 子代理会话头（dsh 实测形态：目录名即裸会话 id，头里带 origin/parentSession/delegationDepth） */
+const SUB_SESSION_ID = '21347e82-3564-4167-9871-21dcd2cba5ed';
+const subagentHeader = (parentId = 'session-abc') => JSON.stringify({
+  type: 'session', version: 0, id: SUB_SESSION_ID, createdAt: T0, cwd: '/p',
+  parentSession: parentId, origin: 'subagent', delegationDepth: 1, agentPreset: 'ptc'
+});
 const reqHeader = (provider, model, seq, time = T0) => JSON.stringify({
   type: 'request/header', seq, time, data: { header: { config: { provider, model, maxTokens: 1024 } }, reason: 'initial' }
 });
@@ -44,8 +50,8 @@ const usage = (input = 100, output = 10, cacheRead = 50, reasoning = 5, extra = 
   inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, reasoningTokens: reasoning, ...extra
 });
 
-function writeSession(root, project, id, buffer, { plain = false } = {}) {
-  const dir = join(root, project, `session-${id}`);
+function writeSession(root, project, id, buffer, { plain = false, dirName = null } = {}) {
+  const dir = join(root, project, dirName ?? `session-${id}`);
   mkdirSync(dir, { recursive: true });
   writeFileSync(join(dir, plain ? 'session.jsonl' : 'session.jsonl.zstd'), buffer);
   return dir;
@@ -103,6 +109,33 @@ test('枚举：三层布局、_no-cwd 桶、双形态并存取 .zstd 防双算',
       '--home-x--/session-a/session.jsonl.zstd',
       '--home-y--/session-c/session.jsonl.zstd'
     ].sort());
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('枚举：裸 uuid 子代理会话目录同样收录，无会话日志的目录不收录（fix-dsh-subagent-scan-gap）', () => {
+  const root = makeRoot();
+  try {
+    writeSession(root, '--p--', 'a', containerOf([batch1()]));
+    // 子代理会话：目录名为裸会话 id（无 session- 前缀）——按名前缀筛选会整份漏扫
+    writeSession(root, '--p--', SUB_SESSION_ID, containerOf([[subagentHeader(), reqHeader('p', 'm', 1, T0), msg(2, T0 + 1, usage())]]), { dirName: SUB_SESSION_ID });
+    // 无会话日志文件的目录（如 dsh 自己的状态目录）不得被当作会话
+    mkdirSync(join(root, '--p--', 'not-a-session'), { recursive: true });
+    writeFileSync(join(root, '--p--', 'not-a-session', 'state.json'), '{}\n');
+    const files = listSessionFiles(root);
+    assert.deepEqual(files.map((f) => f.relPath), [
+      '--p--/session-a/session.jsonl.zstd',
+      `--p--/${SUB_SESSION_ID}/session.jsonl.zstd`
+    ].sort());
+    // 可用性探测共用同一枚举：仅有子代理会话时也算可用
+    const onlySub = makeRoot();
+    try {
+      writeSession(onlySub, '--p--', SUB_SESSION_ID, containerOf([batch1()]), { dirName: SUB_SESSION_ID });
+      assert.equal(isDshAvailable({ dshSessionsRoot: onlySub }), true);
+    } finally {
+      rmSync(onlySub, { recursive: true, force: true });
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -272,6 +305,117 @@ test('扫描：子代理标记与全库只读性（内容/mtime/目录清单零�
     const sub = fx.db.prepare("SELECT is_subagent FROM usage_records WHERE tool = ? AND file_path LIKE '%b/%'").all(TOOL);
     assert.ok(sub.length > 0 && sub.every((r) => r.is_subagent === 1));
     assert.deepEqual(snapshot(), before); // 只读性：内容/mtime/清单不变，无解压落盘
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('扫描：裸 uuid 子代理会话入库并打标，与顶层并行累积且重复扫描零新增', () => {
+  const fx = makeDb();
+  const countRows = (path) => fx.db.prepare(
+    'SELECT COUNT(*) AS n FROM usage_records WHERE tool = ? AND file_path = ?'
+  ).get(TOOL, path).n;
+  try {
+    const topPath = '--p--/session-a/session.jsonl.zstd';
+    const subPath = `--p--/${SUB_SESSION_ID}/session.jsonl.zstd`;
+    writeSession(fx.root, '--p--', 'a', containerOf([batch1()])); // 顶层：2 条
+    writeSession(fx.root, '--p--', SUB_SESSION_ID, containerOf([[
+      subagentHeader(), reqHeader('deepseek-official', 'deepseek-flash', 1, T0 + 3000), msg(2, T0 + 3001, usage(1000, 20, 500, 0))
+    ]]), { dirName: SUB_SESSION_ID });
+
+    const s1 = scanSessions(fx.db, fx.root);
+    assert.equal(s1.totalFiles, 2);
+    assert.equal(s1.changedFiles, 2);
+    assert.equal(countRows(topPath), 2);
+    assert.equal(countRows(subPath), 1);
+    const subRow = fx.db.prepare(
+      'SELECT provider, model, is_subagent, input_other, cache_read, output FROM usage_records WHERE tool = ? AND file_path = ?'
+    ).get(TOOL, subPath);
+    assert.equal(subRow.is_subagent, 1); // 由会话头 delegationDepth 推导，非目录名
+    assert.equal(subRow.provider, 'deepseek-official');
+    assert.equal(subRow.input_other, 1000);
+    assert.equal(subRow.cache_read, 500);
+    assert.equal(subRow.output, 20);
+    // 索引与明细同事务写入：子代理文件也进 file_index
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM file_index WHERE tool = ? AND path = ?').get(TOOL, subPath).n, 1);
+
+    // 重复扫描（内容未变）：未变化短路，零新增
+    const s2 = scanSessions(fx.db, fx.root);
+    assert.equal(s2.changedFiles, 0);
+    assert.equal(countRows(topPath), 2);
+    assert.equal(countRows(subPath), 1);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('扫描：已固化日的晚到子代理明细经 runMaintenance 并入汇总（累加不覆盖）', () => {
+  const fx = makeDb();
+  const day = localDateKey(T0);
+  // 其余适配器一律指向空源：单测绝不触碰真实 ~/.kimi-code / ~/.zcode / ~/.codex / ~/.cc-switch
+  const emptyDir = join(fx.root, 'empty-sessions');
+  const opts = (today) => ({
+    sessionsRoot: emptyDir,
+    codexSessionsRoot: join(fx.root, 'no-codex'),
+    zcodeDbPath: join(fx.root, 'no-zcode.sqlite'),
+    ccsclaudeDbPath: join(fx.root, 'no-cc.db'),
+    dshSessionsRoot: fx.root,
+    today
+  });
+  try {
+    mkdirSync(emptyDir, { recursive: true });
+    // 第一次：只有顶层会话（模拟修复前）→ 维护把它固化进 usage_daily 并删明细
+    writeSession(fx.root, '--p--', 'a', containerOf([batch1()]));
+    runMaintenance(fx.db, opts(localDateKey(T0 + 3 * 86400000)));
+    const before = fx.db.prepare(
+      'SELECT input_other, cache_read, output, turn_count FROM usage_daily WHERE tool = ? AND local_date = ?'
+    ).get(TOOL, day);
+    assert.equal(before.turn_count, 2);
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM usage_records WHERE tool = ?').get(TOOL).n, 0);
+
+    // 第二次：补入子代理会话（修复后首轮扫描的等价场景）→ 晚到明细累加进同日汇总
+    // 子代理与顶层同提供商/模型（真实形态：同一模型名下父子会话共用同一汇总键）
+    writeSession(fx.root, '--p--', SUB_SESSION_ID, containerOf([[
+      subagentHeader(), reqHeader('deepseek-official', 'deepseek-v4-flash', 1, T0 + 3000), msg(2, T0 + 3001, usage(1000, 20, 500, 0))
+    ]]), { dirName: SUB_SESSION_ID });
+    runMaintenance(fx.db, opts(localDateKey(T0 + 3 * 86400000)));
+    const after = fx.db.prepare(
+      'SELECT input_other, cache_read, output, turn_count FROM usage_daily WHERE tool = ? AND local_date = ?'
+    ).get(TOOL, day);
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM usage_daily WHERE tool = ? AND local_date = ?').get(TOOL, day).n, 1);
+    assert.equal(after.turn_count, before.turn_count + 1);
+    assert.equal(after.input_other, before.input_other + 1000);
+    assert.equal(after.cache_read, before.cache_read + 500);
+    assert.equal(after.output, before.output + 20);
+    // 晚到明细并入汇总后即删；全程不触发重建模式（无重建标记、无待决清单）
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM usage_records WHERE tool = ?').get(TOOL).n, 0);
+    assert.equal(fx.db.prepare("SELECT COUNT(*) AS n FROM maintenance_state WHERE kind = 'rebuild_mode' AND tool = ?").get(TOOL).n, 0);
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM reconcile_pending WHERE tool = ?').get(TOOL).n, 0);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('扫描：明文会话文件写入索引水位，两轮扫描不重复入账（水位取 consumed）', () => {
+  const fx = makeDb();
+  const rowCount = () => fx.db.prepare('SELECT COUNT(*) AS n FROM usage_records WHERE tool = ?').get(TOOL).n;
+  try {
+    writeSession(fx.root, '--p--', 'a', Buffer.from(batch1().map((l) => l + '\n').join('')), { plain: true });
+    const s1 = scanSessions(fx.db, fx.root);
+    // 旧实现按 zstd 分支字段名解构 completeEnd（readCompleteLines 实际返回 consumed）→
+    // 索引写入抛「cannot be bound to SQLite parameter 6」被吞进 failures，文件永不入索引
+    assert.deepEqual(s1.failures, []);
+    assert.equal(s1.changedFiles, 1);
+    const idx = fx.db.prepare('SELECT size, scanned_offset, scanned_lines, failed FROM file_index WHERE tool = ?').get(TOOL);
+    assert.ok(idx, '明文会话文件必须写入 file_index');
+    assert.equal(idx.failed, 0);
+    assert.equal(idx.scanned_lines, 4);
+    assert.equal(Number(idx.scanned_offset), Number(idx.size)); // 文件以 \n 结尾 → 水位 = 文件大小
+    assert.equal(rowCount(), 2);
+
+    const s2 = scanSessions(fx.db, fx.root);
+    assert.equal(s2.changedFiles, 0); // 未变化短路：不再整份重扫
+    assert.equal(rowCount(), 2);
   } finally {
     rmSync(fx.root, { recursive: true, force: true });
   }

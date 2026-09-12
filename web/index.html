@@ -521,6 +521,15 @@
   .rd-row .k { color: var(--muted); flex: none; }
   .rd-row .v { text-align: right; font-variant-numeric: tabular-nums; word-break: break-all; }
   .rd-row .v b { color: var(--teal); }
+  /* 快照备注行内输入框（quota-snapshot-note）：右对齐小输入框，随行高协调不撑破详情列 */
+  .rd-note {
+    width: 200px; max-width: 100%;
+    padding: 3px 8px; font-size: 12px; text-align: right;
+    color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 6px; outline: none;
+  }
+  .rd-note::placeholder { color: var(--muted); }
+  .rd-note:focus { border-color: var(--teal); box-shadow: 0 0 0 1px var(--teal-soft); }
   /* 行内说明图标：圆形感叹号 + 悬浮气泡（折算等价金额算法说明） */
   .tip-info {
     display: inline-flex; align-items: center; justify-content: center;
@@ -694,6 +703,165 @@
     .ri-cell { padding-left: 12px; font-size: 12px; }
   }
 
+  /* ===== 基准比较小窗口（quota-benchmark-compare）：摘要条 / 汇率行 / 9 列比较表 / 明细 / 公式区 / 口径注意 =====
+     遮罩层级高于记录窗口（recs-mask 92）；display:flex 容器显式写 [hidden] 兜底（score-combobox 同源踩坑） */
+  .modal-mask.bmk-cmp-mask { z-index: 93; }
+  .bmk-cmp-modal { width: min(1080px, 96vw); height: auto; max-height: 88vh; }
+  .bmk-cmp-body { flex: 1; overflow-y: auto; padding: 14px 18px 18px; }
+  .bmk-cmp-summary[hidden], .bmk-cmp-fx-row[hidden], .bmk-cmp-tools[hidden], .bmk-cmp-detail[hidden] { display: none; }
+  .bmk-cmp-empty { margin-top: 14px; padding: 18px; border: 1px dashed var(--border); border-radius: 12px; font-size: 12.5px; color: var(--muted); }
+
+  /* 摘要条 */
+  .bmk-cmp-summary {
+    display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+    padding: 12px 14px; border: 1px solid var(--border); border-radius: 12px;
+    background: rgba(148, 163, 184, .05);
+  }
+  .bmk-cmp-cs-main { flex: 1; min-width: 260px; }
+  .bmk-cmp-cs-title { font-size: 14.5px; font-weight: 650; display: flex; align-items: center; gap: 7px; }
+  .bmk-cmp-cs-title .bmk-cmp-cs-ico { color: var(--teal); }
+  .bmk-cmp-cs-desc { font-size: 12px; color: var(--muted); line-height: 1.7; margin-top: 5px; }
+  .bmk-cmp-cs-note { font-size: 11.5px; color: #f8b878; margin-top: 5px; }
+  .bmk-cmp-cs-facts { display: flex; flex-direction: column; gap: 5px; align-items: flex-end; flex: none; }
+  .bmk-cmp-fact {
+    font-size: 11.5px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 2px 10px; background: var(--panel-2);
+  }
+  .bmk-cmp-fact b { color: var(--teal); font-variant-numeric: tabular-nums; }
+  .bmk-cmp-fact.warn { color: #f8b878; border-color: rgba(248, 184, 120, .4); }
+
+  /* 汇率行 */
+  .bmk-cmp-fx-row {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    margin-top: 12px; padding: 9px 12px;
+    border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2);
+  }
+  .bmk-cmp-fx-row.single { background: rgba(148, 163, 184, .05); }
+  .bmk-cmp-fx-label { font-size: 12px; color: var(--muted); flex: none; }
+  .bmk-cmp-fx-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text); }
+  .bmk-cmp-fx-input {
+    font-family: inherit; font-size: 12.5px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px 8px; width: 110px; font-variant-numeric: tabular-nums;
+  }
+  .bmk-cmp-fx-input:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  .bmk-cmp-fx-base { font-size: 12px; color: var(--muted); }
+  .bmk-cmp-fx-hint { font-size: 11.5px; color: var(--muted); margin-left: auto; }
+  .bmk-cmp-fx-hint b { color: var(--teal); }
+  .bmk-cmp-fx-clear { font-size: 12px; padding: 4px 10px; }
+  .bmk-cmp-fx-tag {
+    font-size: 10px; margin-left: 4px; padding: 0 5px; border-radius: 999px;
+    color: var(--teal); border: 1px solid rgba(45, 212, 191, .5);
+  }
+
+  /* 排序切换（复用 .seg 外观）与工具行 */
+  .bmk-cmp-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 14px 0 10px; }
+  .bmk-cmp-ct-label { font-size: 12px; color: var(--muted); }
+  .bmk-cmp-ct-note { font-size: 11.5px; color: var(--muted); margin-left: auto; }
+  .bmk-cmp-ct-note b { color: var(--teal); }
+
+  /* 比较表：9 列（套餐/模型 · 样本 · B · b · d · r · n · D′ · U） */
+  .bmk-cmp-table { border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; overflow-y: hidden; }
+  .bmk-cmp-scroll-hint { display: none; font-size: 11.5px; color: var(--muted); margin-bottom: 6px; }
+  .bmk-cmp-head, .bmk-cmp-row {
+    display: grid; grid-template-columns: minmax(150px, 1fr) 52px 104px 74px 104px 150px 140px 124px 132px;
+    align-items: center;
+    min-width: 1030px; /* 9 列的最小可用宽度（末三列按区间文本 a ~ b 校准）：窄于此则整表横向滚动，不裁列 */
+  }
+  .bmk-cmp-head { background: rgba(148, 163, 184, .07); border-bottom: 1px solid var(--border); }
+  .bmk-cmp-head .bmk-cmp-cell { font-size: 11.5px; color: var(--muted); padding: 9px 8px; white-space: nowrap; }
+  .bmk-cmp-row { border-bottom: 1px solid rgba(31, 44, 73, .6); }
+  .bmk-cmp-row:last-child { border-bottom: 0; }
+  .bmk-cmp-row:hover { background: rgba(148, 163, 184, .05); }
+  .bmk-cmp-row.is-base { background: rgba(45, 212, 191, .07); }
+  .bmk-cmp-row .bmk-cmp-cell { padding: 9px 8px; font-size: 12px; min-width: 0; }
+  .bmk-cmp-cell.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bmk-cmp-cell.num.b { font-weight: 600; }
+  .bmk-cmp-cell.num.n { color: var(--teal); font-weight: 600; }
+  .bmk-cmp-cell.num.eq { color: var(--text); }
+  .bmk-cmp-cell.num.u { color: #7ff3e3; font-weight: 650; }
+  /* 区间值（a ~ b）用稍小的字号，避免列被撑开；窄屏分支在媒体查询里再收一档 */
+  .bmk-cmp-cell.rng { font-size: 10.5px; }
+  .bmk-cmp-na { color: #5c6b85; }
+  .bmk-cmp-plan { display: flex; align-items: flex-start; gap: 6px; }
+  .bmk-cmp-plan-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+  .bmk-cmp-plan-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bmk-cmp-plan-model {
+    align-self: flex-start; font-size: 10.5px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 0 7px;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bmk-cmp-toggle {
+    appearance: none; flex: none; width: 18px; height: 18px; line-height: 1; padding: 0;
+    border: 1px solid var(--border); border-radius: 5px; background: var(--panel);
+    color: var(--muted); font-size: 10px; cursor: pointer;
+  }
+  .bmk-cmp-toggle:hover { color: var(--teal); border-color: rgba(45, 212, 191, .5); }
+
+  /* 效率倍数横条 */
+  .bmk-cmp-ratio-wrap { display: block; position: relative; }
+  .bmk-cmp-ratio-bar {
+    display: block; height: 6px; border-radius: 4px;
+    background: linear-gradient(90deg, rgba(91, 141, 239, .8), rgba(91, 141, 239, .3));
+  }
+  .bmk-cmp-ratio-bar.base { background: linear-gradient(90deg, var(--teal), rgba(45, 212, 191, .35)); }
+  .bmk-cmp-ratio-text { display: block; font-size: 11.5px; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .bmk-cmp-base-tag {
+    font-size: 10px; color: var(--teal); border: 1px solid rgba(45, 212, 191, .5);
+    border-radius: 999px; padding: 0 6px; margin-left: 5px;
+  }
+
+  /* 每次测试明细 */
+  .bmk-cmp-detail { background: rgba(9, 20, 34, .55); border-bottom: 1px solid rgba(31, 44, 73, .6); padding: 8px 10px 10px 30px; }
+  .bmk-cmp-d-head, .bmk-cmp-sample {
+    display: grid; grid-template-columns: 130px 1fr 88px 1fr 62px; gap: 8px; align-items: center;
+  }
+  .bmk-cmp-d-head { font-size: 11px; color: var(--muted); padding: 4px 6px; border-bottom: 1px dashed var(--border); margin-bottom: 4px; }
+  .bmk-cmp-sample { font-size: 11.5px; color: var(--text); padding: 3px 6px; border-radius: 6px; font-variant-numeric: tabular-nums; }
+  .bmk-cmp-sample:hover { background: rgba(148, 163, 184, .07); }
+  .bmk-cmp-sample .bmk-cmp-s-est, .bmk-cmp-sample .bmk-cmp-s-tok { text-align: right; }
+  .bmk-cmp-sample .bmk-cmp-s-ratio { text-align: right; color: var(--muted); }
+  .bmk-cmp-sample .bmk-cmp-s-id { text-align: right; color: var(--muted); }
+  .bmk-cmp-s-rng { font-size: 10px; color: #f8b878; margin-left: 5px; }
+  .bmk-cmp-d-foot { font-size: 11px; color: var(--muted); margin-top: 6px; }
+
+  /* 公式区 */
+  .bmk-cmp-formula {
+    margin-top: 14px; border: 1px dashed rgba(45, 212, 191, .35); border-radius: 12px;
+    background: rgba(45, 212, 191, .05); padding: 10px 14px;
+  }
+  .bmk-cmp-formula > summary { cursor: pointer; font-size: 12.5px; font-weight: 600; color: var(--teal); }
+  .bmk-cmp-cf-body { margin-top: 10px; display: flex; flex-direction: column; gap: 7px; }
+  .bmk-cmp-cf-step { font-size: 12px; color: var(--muted); line-height: 1.8; }
+  .bmk-cmp-cf-step b { color: var(--text); }
+  .bmk-cmp-cf-step code, .bmk-cmp-cf-id code {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px;
+    background: rgba(148, 163, 184, .12); border: 1px solid var(--border);
+    border-radius: 6px; padding: 1px 6px; color: #cfe9ff;
+  }
+  .bmk-cmp-cf-id {
+    font-size: 12px; color: var(--teal); border-top: 1px dashed rgba(45, 212, 191, .3); padding-top: 8px;
+  }
+
+  /* 口径注意 */
+  .bmk-cmp-caveats { margin-top: 12px; border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; background: rgba(148, 163, 184, .04); }
+  .bmk-cmp-cv-title { font-size: 12.5px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  .bmk-cmp-caveats ul { margin: 0; padding-left: 18px; }
+  .bmk-cmp-caveats li { font-size: 12px; color: var(--muted); line-height: 1.85; }
+  .bmk-cmp-caveats li b { color: var(--text); }
+
+  @media (max-width: 1000px) {
+    .bmk-cmp-scroll-hint { display: block; }
+    .bmk-cmp-head, .bmk-cmp-row {
+      grid-template-columns: minmax(120px, 1fr) 44px 92px 66px 92px 120px 134px 112px 118px;
+      min-width: 898px;
+    }
+    .bmk-cmp-row .bmk-cmp-cell, .bmk-cmp-head .bmk-cmp-cell { font-size: 11.5px; padding: 8px 6px; }
+    /* 声明在通用字号规则之后：同特异性靠后者胜，保证区间缩小在窄屏不被覆盖 */
+    .bmk-cmp-row .bmk-cmp-cell.rng { font-size: 10px; }
+    .bmk-cmp-d-head, .bmk-cmp-sample { grid-template-columns: 112px 1fr 70px 1fr 52px; }
+  }
+
   /* ===== 模型评分页（model-scorecard, v15）=====
      页面切换：进入评分页时给 body 加 .score-view（首页各区块整体隐藏），
      #scorePage 在标记里带 hidden（无 JS 时不可见），可见性由这里的两条规则决定。 */
@@ -794,6 +962,214 @@
   .sc-row-state { font-size: 11.5px; color: var(--muted); flex: none; }
   .sc-row-state.ok { color: #7ff3e3; }
   .sc-row-state.err { color: #fb7185; }
+  /* ===== 任务基准（quota-snapshot-benchmark）：配置页分组盒 + 标记下拉 + 基准标签 =====
+     视觉对齐 .sc-*（模型信息页）与 .recs-*（记录窗口）；⚠ [hidden] 兜底规则不能删：
+     .bmk-side / .bmk-items / .bmk-picker 用了 display:flex，会盖掉浏览器默认的
+     [hidden]{display:none}（score-combobox 实测踩坑同源）。 */
+  .bmk-side[hidden], .bmk-items[hidden], .bmk-picker[hidden] { display: none; }
+  .bmk-side { border-right: 1px solid var(--border); padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+  .bmk-side-head { font-size: 12px; color: var(--muted); flex: none; margin-top: 2px; }
+  .bmk-side-foot { margin-top: auto; padding-top: 12px; border-top: 1px dashed var(--border); flex: none; }
+  .bmk-btn-block { width: 100%; }
+  .bmk-group { border: 1px solid var(--border); border-radius: 11px; background: var(--panel-2); overflow: hidden; flex: none; }
+  .bmk-group-head { display: flex; align-items: center; gap: 5px; padding: 7px 9px; background: rgba(148, 163, 184, .06); border-bottom: 1px solid var(--border); }
+  .bmk-group-idx { font-size: 11px; color: var(--muted); width: 12px; flex: none; }
+  .bmk-group-name { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; font-weight: 600; color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 7px; padding: 4px 6px; }
+  .bmk-group-name:hover { border-color: var(--border); }
+  .bmk-group-name:focus { outline: none; border-color: rgba(45, 212, 191, .5); background: var(--panel); }
+  .bmk-group-count { font-size: 11px; color: var(--muted); flex: none; }
+  .bmk-items { padding: 6px; display: flex; flex-direction: column; gap: 3px; }
+  .bmk-item { display: flex; align-items: center; gap: 6px; padding: 6px 8px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+  .bmk-item:hover { background: rgba(148, 163, 184, .07); }
+  .bmk-item.active { border-color: rgba(45, 212, 191, .5); background: var(--teal-soft); }
+  .bmk-item-idx { font-size: 11px; color: var(--muted); width: 12px; flex: none; }
+  .bmk-item-name { flex: 1; min-width: 0; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bmk-item-meta { font-size: 10.5px; color: var(--muted); flex: none; white-space: nowrap; }
+  .bmk-item-flag { font-size: 10px; color: var(--teal); opacity: .85; flex: none; cursor: help; }
+  .bmk-item-empty { font-size: 12px; color: var(--muted); padding: 5px 8px; line-height: 1.7; }
+  .bmk-ck { flex: none; accent-color: var(--teal); cursor: pointer; }
+  .bmk-ord-btn {
+    appearance: none; flex: none; width: 22px; height: 22px; line-height: 1; display: inline-grid; place-items: center;
+    border: 1px solid var(--border); border-radius: 7px; background: var(--panel); color: var(--muted);
+    font-size: 11px; cursor: pointer; font-family: inherit; transition: .15s;
+  }
+  .bmk-ord-btn:hover:not(:disabled) { color: var(--teal); border-color: rgba(45, 212, 191, .5); }
+  .bmk-ord-btn:disabled { opacity: .3; cursor: not-allowed; }
+  .bmk-ord-btn.bmk-del:hover { color: #fb7185; border-color: rgba(251, 113, 133, .5); }
+  .ed-new { display: inline-block; font-size: 11.5px; color: var(--teal); border: 1px dashed rgba(45, 212, 191, .5); border-radius: 999px; padding: 2px 10px; margin-bottom: 12px; }
+  textarea.ed-area {
+    font-family: inherit; font-size: 12.5px; line-height: 1.7; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 8px 10px; width: 100%; min-width: 260px; resize: vertical;
+  }
+  textarea.ed-area:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  textarea.ed-area.prompt-area { min-height: 156px; } /* 任务提示词：一整段自由文本，给足高度 */
+  input[type="text"].ed-name.dup { border-color: #fb7185; }
+
+  /* 记录窗口：「◈ 标记为基准」按钮与条目基准标签（悬浮气泡复用 tip-float-layer 机制） */
+  .bmk-mark { display: inline-flex; align-items: center; gap: 6px; }
+  .bmk-mark .caret { font-size: 10px; opacity: .85; }
+  .bmk-mark:disabled { opacity: .45; cursor: not-allowed; }
+  .ri-bmk {
+    flex: 0 1 auto; min-width: 0; max-width: 200px;
+    display: inline-flex; align-items: center; gap: 4px;
+    width: auto; height: auto; margin-left: 0; padding: 1px 9px;
+    font-size: 11px; color: var(--teal);
+    border: 1px solid rgba(45, 212, 191, .45); border-radius: 999px;
+    background: var(--teal-soft); cursor: help; user-select: none;
+  }
+  .ri-bmk:hover, .ri-bmk:focus { border-color: var(--teal); background: rgba(45, 212, 191, .22); }
+  .ri-bmk .ri-bmk-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 标记下拉（body 级 fixed 浮层：.recs-list 是滚动容器，原地渲染会被裁剪） */
+  .bmk-picker {
+    position: fixed; z-index: 95;
+    width: min(460px, 92vw); max-height: 68vh; display: flex; flex-direction: column;
+    background: var(--panel-2); border: 1px solid rgba(45, 212, 191, .35); border-radius: 13px;
+    box-shadow: 0 22px 60px rgba(0, 0, 0, .6); overflow: hidden;
+  }
+  .bp-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  .bp-search {
+    flex: 1; min-width: 0; font-family: inherit; font-size: 12.5px; color: var(--text);
+    background: var(--panel); border: 1px solid var(--border); border-radius: 9px; padding: 6px 10px;
+  }
+  .bp-search:focus { outline: none; border-color: rgba(45, 212, 191, .5); }
+  .bp-selinfo { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+  .bp-selinfo b { color: var(--teal); }
+  .bp-list { flex: 1; overflow-y: auto; padding: 6px; min-height: 60px; }
+  .bp-group { display: flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 650; color: var(--teal); padding: 7px 8px 4px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+  .bp-group-n { font-weight: 400; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bp-opt {
+    appearance: none; width: 100%; text-align: left; font-family: inherit;
+    display: flex; align-items: flex-start; gap: 9px;
+    background: transparent; border: 1px solid transparent; border-radius: 9px;
+    padding: 7px 8px; cursor: pointer; color: var(--text); transition: .12s;
+  }
+  .bp-opt:hover { background: rgba(148, 163, 184, .09); }
+  .bp-opt.on { background: var(--teal-soft); border-color: rgba(45, 212, 191, .5); }
+  .bp-radio { flex: none; width: 13px; height: 13px; margin-top: 2px; border-radius: 50%; border: 1px solid var(--muted); display: grid; place-items: center; }
+  .bp-opt.on .bp-radio { border-color: var(--teal); }
+  .bp-opt.on .bp-radio::after { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--teal); }
+  .bp-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .bp-name { font-size: 12.5px; font-weight: 600; }
+  .bp-desc { font-size: 11.5px; color: var(--muted); line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .bp-used { flex: none; font-size: 11px; color: var(--muted); white-space: nowrap; margin-top: 2px; }
+  .bp-empty { padding: 16px 12px; font-size: 12px; color: var(--muted); line-height: 1.9; text-align: center; }
+  .bp-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 9px 12px; border-top: 1px solid var(--border); }
+  .bp-foot .spacer { flex: 1; }
+  .bp-cur { font-size: 11.5px; color: var(--muted); }
+  .bp-cur b { color: var(--teal); }
+  @media (max-width: 860px) {
+    .ri-bmk { max-width: 130px; }
+    .bmk-side { border-right: none; border-bottom: 1px solid var(--border); max-height: 40%; }
+  }
+  /* ===== 评分维度候选控件：可搜索下拉（变更 score-picker-and-backup）=====
+     组件实现见 web/score-combobox.js；⚠ .scb-panel[hidden] 的兜底规则不能删：
+     面板用了 display:flex，会盖掉浏览器默认的 [hidden]{display:none}，漏写会让所有面板同时常开。 */
+  .sc-row .sc-pick { flex: 1; min-width: 210px; display: flex; }
+  .scb { position: relative; flex: 1; min-width: 210px; }
+  .scb-trigger {
+    width: 100%; display: flex; align-items: center; gap: 8px;
+    font-family: inherit; font-size: 13px; color: var(--text); text-align: left;
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px;
+    padding: 7px 10px; min-height: 34px; cursor: pointer; transition: .15s;
+  }
+  .scb-trigger:hover { border-color: #2c3f66; }
+  .scb.open .scb-trigger { border-color: rgba(45, 212, 191, .55); }
+  .scb-cur { flex: 1; min-width: 0; display: flex; align-items: center; gap: 7px; }
+  .scb-cur-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scb-cur-empty { color: var(--muted); }
+  .scb-caret { flex: none; color: var(--muted); font-size: 10px; transition: transform .15s; }
+  .scb.open .scb-caret { transform: rotate(180deg); color: var(--teal); }
+  .scb-panel[hidden] { display: none; }
+  .scb-panel {
+    position: absolute; top: calc(100% + 6px); left: 0; z-index: 80;
+    width: max(100%, 430px); max-width: min(560px, calc(100vw - 60px));
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, .6);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .scb-search {
+    display: flex; align-items: center; gap: 7px; padding: 9px 11px;
+    border-bottom: 1px solid var(--border); background: rgba(148, 163, 184, .05);
+  }
+  .scb-search-ico { color: var(--teal); font-size: 14px; flex: none; }
+  .scb-input { flex: 1; min-width: 0; font-family: inherit; font-size: 13px; color: var(--text); background: transparent; border: 0; padding: 2px 0; }
+  .scb-input:focus { outline: none; }
+  .scb-input::placeholder { color: #5d7a9e; }
+  .scb-clear {
+    appearance: none; flex: none; width: 20px; height: 20px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+    font-size: 11px; line-height: 1; cursor: pointer;
+  }
+  .scb-clear:hover { color: var(--text); border-color: #2c3f66; }
+  .scb-list { max-height: 296px; overflow-y: auto; padding: 5px; }
+  .scb-opt {
+    display: flex; align-items: center; gap: 8px; padding: 7px 9px;
+    border-radius: 8px; cursor: pointer; border: 1px solid transparent;
+    font-size: 13px; line-height: 1.4;
+  }
+  .scb-opt.active { background: rgba(148, 163, 184, .1); border-color: #2c3f66; }
+  .scb-opt.selected { background: var(--teal-soft); border-color: rgba(45, 212, 191, .45); }
+  .scb-opt.selected.active { border-color: rgba(45, 212, 191, .75); }
+  .scb-opt.disabled { opacity: .45; cursor: not-allowed; }
+  .scb-opt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scb-opt-name mark { background: rgba(45, 212, 191, .28); color: #eafffb; border-radius: 3px; padding: 0 1px; }
+  .scb-opt-group {
+    flex: none; font-size: 11px; color: var(--muted);
+    border: 1px solid var(--border); border-radius: 999px; padding: 1px 7px;
+    background: rgba(148, 163, 184, .06);
+  }
+  .scb-opt-tag {
+    flex: none; font-size: 11px; color: #fbbf24;
+    border: 1px solid rgba(251, 191, 36, .45); border-radius: 999px; padding: 1px 7px;
+    background: rgba(251, 191, 36, .12);
+  }
+  .scb-empty { padding: 18px 14px; text-align: center; font-size: 12.5px; color: var(--muted); line-height: 1.9; }
+  .scb-empty span { display: block; font-size: 11.5px; opacity: .85; }
+  .scb-empty b { color: var(--text); }
+  .scb-foot {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 8px 11px; border-top: 1px solid var(--border);
+    background: rgba(148, 163, 184, .05); font-size: 11.5px; color: var(--muted);
+  }
+  .scb-count b { color: var(--text); font-variant-numeric: tabular-nums; }
+  .scb-hide { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; flex: none; }
+  .scb-hide[hidden] { display: none; }
+  .scb-hide input { width: 13px; height: 13px; margin: 0; accent-color: var(--teal); cursor: pointer; }
+  .scb-hide:hover { color: var(--text); }
+  .scb-keys { margin-left: auto; opacity: .85; }
+  /* 单位徽标（触发器与候选项共用） */
+  .unit-badge {
+    display: inline-block; flex: none; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); background: rgba(148, 163, 184, .07);
+  }
+  .unit-badge.pct { border-color: rgba(45, 212, 191, .4); color: #7ff3e3; background: var(--teal-soft); }
+  .unit-badge.num { border-color: rgba(167, 139, 250, .45); color: #cbb8ff; background: rgba(167, 139, 250, .14); }
+  /* ===== 备份恢复小窗（变更 score-picker-and-backup）===== */
+  .sc-backup-modal { width: min(720px, calc(100vw - 48px)); }
+  .sc-backup-body { display: block; padding: 16px 20px 18px; }
+  .sc-backup-tip { font-size: 12.5px; color: var(--muted); line-height: 1.9; margin-bottom: 12px; }
+  .sc-backup-tip b { color: #fb7185; }
+  .sc-backup-list { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; }
+  .sc-bk-item {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    border: 1px solid var(--border); border-radius: 10px;
+    background: rgba(148, 163, 184, .04); cursor: pointer; transition: .15s;
+  }
+  .sc-bk-item:hover { border-color: #2c3f66; }
+  .sc-bk-item.sel { border-color: rgba(45, 212, 191, .55); background: var(--teal-soft); }
+  .sc-bk-item.bad { opacity: .55; cursor: not-allowed; }
+  .sc-bk-item input { width: 15px; height: 15px; margin: 0; accent-color: var(--teal); flex: none; }
+  .sc-bk-main { flex: 1; min-width: 0; }
+  .sc-bk-time { font-size: 13px; font-weight: 600; }
+  .sc-bk-meta { font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+  .sc-bk-name { font-size: 11px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sc-backup-empty { padding: 22px 14px; text-align: center; font-size: 12.5px; color: var(--muted); line-height: 1.9; border: 1px dashed var(--border); border-radius: 10px; }
+  .sc-backup-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+  .sc-backup-actions .muted { font-size: 11.5px; }
+  @media (max-width: 760px) { .sc-backup-modal { width: calc(100vw - 24px); } }
+
   .sc-footnote { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.9; }
   .sc-footnote b { color: var(--text); }
   .sc-btn-block { display: block; width: 100%; }
@@ -1002,6 +1378,8 @@
         <span class="badge" id="scoreCount">–</span>
         <button type="button" class="btn ghost" id="scoreCriteriaBtn"><span class="ico">⚖</span> 评分标准</button>
         <button type="button" class="btn primary" id="scoreModelsBtn">＋ 模型信息</button>
+        <button type="button" class="btn ghost" id="scoreExportBtn" title="把全部评分标准、模型与分值导出成一份 JSON 备份（目录内滚动保留最近 5 份）">⇩ 导出备份</button>
+        <button type="button" class="btn ghost" id="scoreImportBtn" title="从历史备份里选一份恢复（当前评分数据会被整体替换）">⇧ 导入恢复</button>
         <button type="button" class="btn ghost" id="scoreResetBtn" title="清空当前评分数据并写回内置数据（不可撤销）">↺ 恢复内置数据</button>
       </div>
     </header>
@@ -1089,6 +1467,48 @@
   </div>
 </div>
 
+<!-- ============ 模型评分 · 导入恢复小窗（变更 score-picker-and-backup） ============ -->
+<div class="modal-mask" id="scoreBackupModal" hidden>
+  <div class="modal sc-backup-modal" role="dialog" aria-label="导入恢复">
+    <div class="modal-head">
+      <h2>导入恢复</h2>
+      <span class="muted" id="scoreBackupDir"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" data-close>关闭 ✕</button>
+    </div>
+    <div class="modal-body sc-backup-body">
+      <div class="sc-backup-tip">
+        选一份备份恢复：当前全部评分标准、模型与分值会被<b>清空并整体替换</b>为备份内容（不可撤销）。
+        备份目录内滚动保留最近 5 份；不是本工具生成的备份会灰显且不可选中。
+      </div>
+      <div class="sc-backup-list" id="scoreBackupList"></div>
+      <div class="sc-backup-actions">
+        <button type="button" class="btn primary" id="scoreRestoreBtn" disabled>恢复这份备份</button>
+        <button type="button" class="btn ghost" id="scoreBackupRefresh">↻ 刷新列表</button>
+        <span class="muted" id="scoreBackupHint"></span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 任务基准 · 统计基准配置窗口（quota-snapshot-benchmark：左分组盒侧栏 + 右编辑器） ============
+     内容与装配在 web/quota-benchmark.js（window.QuotaBenchmark.initConfig）；分组盒交互对齐「模型信息」设置页：
+     组头可直接改名 / 分组 ↑↓ 整组排序 / ✕ 删组（组内非空拒绝）/ 组内条目 ↑↓ / 换组走编辑器「所属分组」下拉。 -->
+<div class="modal-mask" id="bmkModal" hidden>
+  <div class="modal" role="dialog" aria-label="统计基准">
+    <div class="modal-head">
+      <h2>统计基准</h2>
+      <span class="muted">基准 = 基准名 + 描述信息 + 任务提示词；标记记录时固化「名字与说明」——此后配置改名 / 改说明 / 删除都不影响已标记记录</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="bmkCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <aside class="bmk-side" id="bmkList"></aside>
+      <section class="map-editor" id="bmkEditor"></section>
+    </div>
+  </div>
+</div>
+
 <!-- 设置入口弹窗（统一设置入口，后续扩展更多设置项） -->
 <div class="modal-mask" id="settingsModal" hidden>
   <div class="settings-dialog" role="dialog" aria-label="设置">
@@ -1124,6 +1544,15 @@
           <div class="si-desc">维护可复用的模型价格模板（含分段与区分星期），可在套餐设置中一键导入</div>
         </div>
         <span class="si-meta" id="settingsTemplateMeta">–</span>
+        <span class="si-arrow">›</span>
+      </div>
+      <div class="settings-item" id="settingsItemBmk" role="button" tabindex="0">
+        <div class="si-ico">◈</div>
+        <div class="si-text">
+          <div class="si-name">统计基准</div>
+          <div class="si-desc">维护「基准名 + 描述 + 任务提示词」的基准配置（可分组排序），供记录页把快照标记到同一任务基准</div>
+        </div>
+        <span class="si-meta" id="settingsBmkMeta">–</span>
         <span class="si-arrow">›</span>
       </div>
       <div class="ed-hint" style="padding:10px 2px 0">更多设置项后续加入，统一由此进入。</div>
@@ -1284,6 +1713,21 @@
   </div>
 </div>
 
+<!-- ============ 基准比较小窗口（quota-benchmark-compare：点记录条目基准标签打开，只读） ============
+     内容与装配在 web/quota-benchmark-compare.js（window.QuotaBenchmarkCompare.open）；摘要条 /
+     汇率行 / 9 列比较表 / 逐次明细 / 公式区 / 口径注意随比较结果动态渲染。 -->
+<div class="modal-mask bmk-cmp-mask" id="bmkCmpModal" hidden>
+  <div class="modal bmk-cmp-modal" role="dialog" aria-label="基准比较">
+    <div class="modal-head">
+      <h2>基准比较</h2>
+      <span class="muted">全库同名基准记录按「套餐 + 模型」分组求均值——只读，不影响任何记录与配置</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="bmkCmpCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="bmk-cmp-body" id="bmkCmpBody"></div>
+  </div>
+</div>
+
 <div id="toastHost" aria-live="polite"></div>
 
 <!-- Chart.js：本地 vendored，缺失时不依赖 CDN -->
@@ -1291,8 +1735,16 @@
 <!-- 套餐额度估算引擎（纯函数、无 DOM）：必须在 app.js 之前加载 -->
 <script src="./quota-eval.js"></script>
 <script src="./app.js"></script>
+<!-- 任务基准模块（quota-snapshot-benchmark）：须在 app.js 之后加载——读取其暴露的
+     window.QuotaBenchmarkBridge 装配记录窗口「标记为基准」下拉，并装配基准配置页 -->
+<script src="./quota-benchmark.js"></script>
+<!-- 基准比较模块（quota-benchmark-compare）：紧随 quota-benchmark.js（仍在 app.js 之后）——
+     点记录条目基准标签打开比较小窗口，拉 GET /api/quota/benchmarks/compare 渲染（只读） -->
+<script src="./quota-benchmark-compare.js"></script>
 <!-- 模型评分页（v15）：自己拉 /api/score、渲染主图与小图、两个子窗口；复用 app.js 暴露的 window.showToast -->
 <script src="./score-filter.js"></script>
+<!-- 可搜索下拉组件（变更 score-picker-and-backup）：评分维度的候选控件，无业务依赖，必须在 score.js 之前 -->
+<script src="./score-combobox.js"></script>
 <script src="./score.js"></script>
 </body>
 </html>
