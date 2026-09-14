@@ -353,8 +353,11 @@ function snapshotView(row) {
   return {
     id: row.id,
     presetId: row.preset_id,
+    source: row.source === 'manual' ? 'manual' : 'estimate',
     createdMs: row.created_ms,
     startMs: row.start_ms,
+    endMs: row.end_ms ?? null,
+    readings: parseJsonColumn(row.readings_json),
     mode: row.mode,
     model: row.model,
     tokens: JSON.parse(row.tokens_json),
@@ -768,13 +771,21 @@ export function migrateQuotaPresetsOwnership(db, fromName, toName) {
 /** 范围自适应：lo===hi 退化为单值，否则 {lo, hi}（前端 fmtMaybeRange 同构处理） */
 const rangeOrValue = (lo, hi) => (lo === hi ? lo : { lo, hi });
 
-/** 快照行 → 记录窗口对外形状（贴近 demo：tokens 四值、限额周期中文、范围字段自适应） */
+/**
+ * 快照行 → 记录窗口对外形状（贴近 demo：tokens 四值、限额周期中文、范围字段自适应）。
+ * manual-quota-snapshot：新增 `source`（'estimate' | 'manual'，存量行按 'estimate'）与
+ * `readings`（手动录入固化的起止官方读数，统计版为空 → null）；
+ * 结束时间改为 `end_ms ?? created_ms`（手动录入写显式窗口结束时间，统计流程不写该列，
+ * 因此既有记录的时间语义逐字不变）。
+ */
 function publicSnapshot(row) {
   const tokens = JSON.parse(row.tokens_json);
   return {
     id: row.id,
+    source: row.source === 'manual' ? 'manual' : 'estimate',
     startTime: row.start_ms,
-    endTime: row.created_ms,
+    endTime: row.end_ms ?? row.created_ms,
+    readings: parseJsonColumn(row.readings_json),
     mode: row.mode,
     model: row.model,
     tokens: {
@@ -807,13 +818,14 @@ const BENCH_NAME_ABSENT = "benchmark_json IS NULL OR NOT json_valid(benchmark_js
 
 /**
  * 快照分页查询（默认最近在前：启动时间倒序）。
- * @param {{plan?: string, provider?: string, benchmark?: string, page?: number, pageSize?: number}} [opts]
+ * @param {{plan?: string, provider?: string, benchmark?: string, source?: 'manual'|'estimate', page?: number, pageSize?: number}} [opts]
  *   page/pageSize 任意正整数（页码超界钳到末页）；plans/providers/benchmarks 为全表去重值
  *   （供筛选下拉，不受当前筛选条件影响；基准候选因此含「配置已删除但记录仍留着」的旧名字）；
  *   benchmark 传 '__none__' 筛未设基准，其它值按 benchmark_json 里的名字等值匹配；
- *   unbound 为未设基准条数（前端「未设基准（N）」计数来源）。
+ *   source 传 'manual' 只看手动录入、'estimate' 只看额度统计（缺省不筛）；
+ *   unbound 为未设基准条数、sources 为两种来源的全表条数（前端计数来源）。
  */
-export function listQuotaSnapshots(db, { plan, provider, benchmark, page = 1, pageSize = 10 } = {}) {
+export function listQuotaSnapshots(db, { plan, provider, benchmark, source, page = 1, pageSize = 10 } = {}) {
   const size = Math.min(200, Math.max(1, Math.floor(Number(pageSize)) || 10));
   const where = [];
   const args = [];
@@ -824,6 +836,10 @@ export function listQuotaSnapshots(db, { plan, provider, benchmark, page = 1, pa
   if (benchmark === '__none__') {
     where.push(`(${BENCH_NAME_ABSENT})`);
   } else if (benchmark) { where.push(BENCH_NAME_MATCH); args.push(benchmark); }
+  // 来源过滤（manual-quota-snapshot）：'manual' 只看手动录入，'estimate' 看除此之外的全部
+  //（与来源列的取值口径一致：非 'manual' 一律视为额度统计）
+  if (source === 'manual') where.push("source = 'manual'");
+  else if (source === 'estimate') where.push("source <> 'manual'");
   const cond = where.length ? `WHERE ${where.join(' AND ')}` : '';
   const total = db.prepare(`SELECT COUNT(*) AS c FROM quota_snapshots ${cond}`).get(...args).c;
   const pages = Math.max(1, Math.ceil(total / size));
@@ -840,7 +856,12 @@ export function listQuotaSnapshots(db, { plan, provider, benchmark, page = 1, pa
     ).all().map((r) => r.v),
     unbound: db.prepare(
       `SELECT COUNT(*) AS c FROM quota_snapshots WHERE ${BENCH_NAME_ABSENT}`
-    ).get().c
+    ).get().c,
+    // 来源计数（工具栏「手动录入（N）」用；恒为全表口径，不受当前筛选影响）
+    sources: {
+      manual: db.prepare("SELECT COUNT(*) AS c FROM quota_snapshots WHERE source = 'manual'").get().c,
+      estimate: db.prepare("SELECT COUNT(*) AS c FROM quota_snapshots WHERE source <> 'manual'").get().c
+    }
   };
 }
 
@@ -1184,4 +1205,450 @@ export function compareBenchmark(db, name) {
     hasRange: groups.some((g) => g.d.lo !== g.d.hi),
     priceZero: groups.some((g) => !(g.price > 0))
   };
+}
+
+/* ================= 手动录入（manual-quota-snapshot） =================
+ * 场景：用户在没有适配的工具 / 别的设备上用过之后，把手上的官方读数与用量直接填进来算成一条快照。
+ *
+ * 复用而非另写口径（与额度统计同源）：
+ *   ΔB 与占比 / 估算总量 → estimateQuota（本文件私有，与停止路径共用）
+ *   逐段取价           → loadPricingContext + priceAt + UNIT_DIVISOR（继承分时段 / 区分星期 / 剩余时段）
+ *   评估时段归属        → loadPlanQuotaCoefs + coefSegmentAt（与 calcEvalJson 同源）
+ *   错误与取整          → quotaError / round2 / round4 / diff4
+ * 既有统计链路（startQuotaPreset / stopQuotaPreset / calcTokenCosts / calcEvalJson）零改动。
+ * 只写 quota_snapshots（source='manual'）与 quota_manual_drafts（草稿），
+ * 不触碰 usage_* / cost_* / 汇总层与完成标记 / quota_presets（铁律）。
+ */
+
+const MIN_MS = 60000;
+const DAY_MINUTES = 1440;
+
+/** 本地零点（毫秒） */
+function localMidnight(ms) {
+  const d = new Date(ms);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+}
+
+const hhmm = (min) => String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0');
+
+/** 时段行的展示名：有名字用名字，否则用时间区间（与 web/quota-eval.js 的 tierCap 同口径） */
+const tierCaption = (t) => t.name || (t.isRest ? '其余时段' : hhmm(t.startMin) + '~' + hhmm(t.endMin));
+
+/** 时段行在某个本地日内的绝对区间（endMin ≤ startMin 视为跨午夜折返） */
+function tierIntervalOf(dayStartMs, t) {
+  const startMin = Number(t.startMin) || 0;
+  const endMin = Number(t.endMin);
+  const spanMin = Number.isFinite(endMin) && endMin > startMin
+    ? endMin - startMin
+    : DAY_MINUTES - (startMin - (Number.isFinite(endMin) ? endMin : 0));
+  const from = dayStartMs + startMin * MIN_MS;
+  return [from, from + Math.max(0, spanMin) * MIN_MS];
+}
+
+/** 区间并集总时长（毫秒） */
+function unionLengthMs(intervals) {
+  if (!intervals.length) return 0;
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  let total = 0;
+  let [curLo, curHi] = sorted[0];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const [lo, hi] = sorted[i];
+    if (lo > curHi) { total += curHi - curLo; curLo = lo; curHi = hi; } else if (hi > curHi) curHi = hi;
+  }
+  return total + (curHi - curLo);
+}
+
+/** 从已覆盖区间的补集里取第一段空档的中点（供「其余时段」段取价用） */
+function firstGapMidpoint(intervals, lo, hi) {
+  const sorted = [...intervals].sort((a, b) => a[0] - b[0]);
+  let cursor = lo;
+  for (const [a, b] of sorted) {
+    if (a > cursor) return Math.floor((cursor + Math.min(a, hi)) / 2);
+    if (b > cursor) cursor = b;
+    if (cursor >= hi) break;
+  }
+  return cursor < hi ? Math.floor((cursor + hi) / 2) : Math.floor((lo + hi) / 2);
+}
+
+/**
+ * 窗口 × 价格时段求交：返回窗口内**实际存在**的计价段（各段窗口内分钟数 + 代表时刻）。
+ * - 逐本地日累加（含起始日的前一天，兼容跨午夜时段与跨多天窗口）
+ * - 只取非 rest 时段行；窗口内未被任何显式时段覆盖的时长归入「其余时段」段（isRest: true），
+ *   其代表时刻取该空档内的时刻 → 取价自然走既有 priceAt 的 rest / 首行兜底，与统计版一致
+ * - 无分时段配置（或窗口非法）→ 空数组（调用方据此判定"不需要分配轴"）
+ */
+function priceSegmentsInWindow(priceEntry, startMs, endMs) {
+  if (!priceEntry || !Number.isFinite(startMs) || !Number.isFinite(endMs) || !(endMs > startMs)) return [];
+  const tiers = (Array.isArray(priceEntry.tiers) ? priceEntry.tiers : []).filter((t) => !t.isRest);
+  if (!tiers.length) return [];
+  const byKey = new Map();
+  const covered = [];                  // 全局已覆盖区间（跨午夜时段会跨日，必须并集后再算未覆盖）
+  const day = new Date(localMidnight(startMs));
+  day.setDate(day.getDate() - 1);
+  let guard = 0;
+  while (day.getTime() <= endMs && guard < 400) {
+    const dayStart = day.getTime();
+    for (const t of tiers) {
+      // 只与**窗口**求交，不按日裁剪：跨午夜时段的尾部落在次日凌晨，
+      // 按日裁剪会把它算成「未覆盖」并把时长错误地推给「其余时段」
+      const [a, b] = tierIntervalOf(dayStart, t);
+      const lo = Math.max(a, startMs);
+      const hi = Math.min(b, endMs);
+      if (!(hi > lo)) continue;
+      covered.push([lo, hi]);
+      const key = (t.startMin ?? '') + '-' + (t.endMin ?? '') + '-' + (t.weekdays ?? '') + '-' + (t.isRest ? 1 : 0);
+      let cur = byKey.get(key);
+      if (!cur) {
+        cur = {
+          key, name: t.name ?? null, cap: tierCaption(t),
+          startMin: t.startMin ?? null, endMin: t.endMin ?? null,
+          isRest: false, weekdays: t.weekdays ?? null, minutes: 0, repMs: null
+        };
+        byKey.set(key, cur);
+      }
+      cur.minutes += (hi - lo) / MIN_MS;
+      if (cur.repMs == null) cur.repMs = Math.floor((lo + hi) / 2);
+    }
+    const next = new Date(dayStart);
+    next.setDate(next.getDate() + 1);
+    next.setHours(0, 0, 0, 0);
+    day.setTime(next.getTime());
+    guard += 1;
+  }
+  const uncoveredMs = (endMs - startMs) - unionLengthMs(covered);
+  const restMinutes = uncoveredMs > 1000 ? uncoveredMs / MIN_MS : 0;
+  const restRep = restMinutes > 0 ? firstGapMidpoint(covered, startMs, endMs) : null;
+  const list = [...byKey.values()].filter((s) => s.minutes > 0);
+  if (restMinutes > 0) {
+    list.push({
+      key: 'rest', name: null, cap: '其余时段', startMin: null, endMin: null,
+      isRest: true, weekdays: null, minutes: restMinutes, repMs: restRep
+    });
+  }
+  return list.sort((a, b) => (a.startMin ?? 10 ** 6) - (b.startMin ?? 10 ** 6));
+}
+
+/** 占比归一：长度不符 / 含非法值 / 全 0 → 回退「各段时长占比」（用户拖动值恒以服务端重算为准） */
+function normalizeShares(shares, segs) {
+  const n = segs.length;
+  if (n === 0) return [];
+  const total = segs.reduce((a, s) => a + s.minutes, 0);
+  const fallback = total > 0 ? segs.map((s) => s.minutes / total) : segs.map(() => 1 / n);
+  if (!Array.isArray(shares) || shares.length !== n) return fallback;
+  const nums = shares.map((v) => Number(v));
+  if (nums.some((v) => !Number.isFinite(v) || v < 0)) return fallback;
+  const sum = nums.reduce((a, b) => a + b, 0);
+  if (!(sum > 0)) return fallback;
+  return nums.map((v) => v / sum);
+}
+
+/** 按占比摊分三分量（命中率与输出占比各段与整体一致 —— 用户口径） */
+function splitTokensByShares(tokens, shares) {
+  return shares.map((s) => ({
+    hit: (tokens.hit || 0) * s,
+    miss: (tokens.miss || 0) * s,
+    output: (tokens.output || 0) * s
+  }));
+}
+
+/**
+ * 逐段等值价格（模型模式）：每段以代表时刻调 priceAt，按 UNIT_DIVISOR 折算金额后汇总。
+ *
+ * 两种窗口形态都必须出金额（缺陷现场：金额只由 byTier 求和，窗口内无时段时恒为 0）：
+ * - 窗口内**存在**计价时段 → 逐段计价（每段代表时刻 = 该段与窗口交集的中点）；
+ * - 窗口内**不存在**计价时段（该模型未开启分时段计价，或时段表里只有「剩余时段」行）
+ *   → 整窗按**单一单价**一次计价，代表时刻取窗口中点 repMs（priceAt 对非分时段条目忽略
+ *   时刻，对分段条目则走「剩余时段 → 首行」兜底链），此时不伪造逐段明细（byTier 为空）。
+ * 只有该模型确实没有价格条目时 amounts 才为 null（缺价）。
+ * @param {number} [repMs] 无计价时段时的代表时刻（调用方传窗口中点）
+ * @returns {{ amounts: null|{hit,miss,output,total}, partial: boolean, byTier: Array }}
+ */
+function calcManualTokenCosts(priceEntry, tokens, segs, shares, repMs) {
+  const divisor = priceEntry ? (UNIT_DIVISOR[priceEntry.unit] ?? 1e3) : 1e3;
+  const parts = splitTokensByShares(tokens, shares);
+  /** 一组三分量按单个价格组计价（合计 = round2 后三分项之和，与统计版同口径） */
+  const amountOf = (t, p) => {
+    const hit = round2((t.hit * p.inputHit) / divisor);
+    const miss = round2((t.miss * p.inputMiss) / divisor);
+    const output = round2((t.output * p.output) / divisor);
+    return { hit, miss, output, total: round2(hit + miss + output) };
+  };
+  const byTier = segs.map((seg, i) => {
+    const t = parts[i];
+    const total = t.hit + t.miss + t.output;
+    const base = {
+      key: seg.key, name: seg.name, cap: seg.cap,
+      startMin: seg.startMin, endMin: seg.endMin, isRest: seg.isRest,
+      share: shares[i], minutes: seg.minutes,
+      tokens: { hit: t.hit, miss: t.miss, output: t.output, total },
+      amounts: null
+    };
+    if (!priceEntry) return base;
+    return { ...base, amounts: amountOf(t, priceAt(priceEntry, seg.repMs)) };
+  });
+  if (!priceEntry) return { amounts: null, partial: true, byTier };
+  // 窗口内不存在计价时段（该模型未开启分时段计价）→ 整窗单一单价一次计价：
+  // byTier 保持为空（不伪造时段行），缺价语义不变（有价格即 partial=false）。
+  if (!byTier.length) return { amounts: amountOf(tokens, priceAt(priceEntry, repMs)), partial: false, byTier };
+  const sum = (k) => round2(byTier.reduce((a, x) => a + (x.amounts ? x.amounts[k] : 0), 0));
+  const amounts = { hit: sum('hit'), miss: sum('miss'), output: sum('output') };
+  amounts.total = round2(amounts.hit + amounts.miss + amounts.output);
+  return { amounts, partial: false, byTier };
+}
+
+/** 时段占比归一（兜底）与派生对象 --- 供 createManualSnapshot 内部使用 */
+function manualAllocation(priceEntry, startMs, endMs, shares) {
+  const segs = priceSegmentsInWindow(priceEntry, startMs, endMs);
+  return { segs, shares: normalizeShares(shares, segs) };
+}
+
+/** 系数时段行的段键（与 web/quota-eval.js 的 segKey 完全一致：读取端可直接消费） */
+const coefTierKey = (t) => (t.startMin ?? '') + '|' + (t.endMin ?? '') + '|' + (t.isRest ? 1 : 0) + '|' + (t.weekdays ?? '');
+
+/** 套餐额度口径（与 calcEvalJson 的固化形态一致） */
+function evalQuotaSpec(plan) {
+  if (plan.quotaMode === 'percent') {
+    return { quotaMode: 'percent', limitPeriod: null, weeklyPoints: null, totalPoints: null, cycleDays: plan.cycleDays };
+  }
+  if (plan.limitPeriod === 'week') {
+    return { quotaMode: 'points', limitPeriod: 'week', weeklyPoints: plan.totalPoints, totalPoints: null, cycleDays: plan.cycleDays };
+  }
+  return { quotaMode: 'points', limitPeriod: 'month', weeklyPoints: null, totalPoints: plan.totalPoints, cycleDays: plan.cycleDays };
+}
+
+/**
+ * 手动录入的套餐额度评估（模型模式）：门槛与统计版一致 —— 该套餐该模型存在抵扣系数条目。
+ * 时段占比 pₜ 来自录入时的分配（无明细可归桶）；每段的系数时段归属由**该段代表时刻**经
+ * coefSegmentAt 判定（因此价格分段与系数分段边界不一致也能正确归属），
+ * 未归桶的段按统计版口径不进入 segments（倍率按 ×1 计）。
+ * @returns {string|null} eval_json 字符串（不满足门槛返回 null）
+ */
+function calcManualEvalJson(db, mapName, plan, { model, tokens, segs, shares, deltaB }) {
+  const entry = loadPlanQuotaCoefs(db)
+    .find((c) => c.mapName === mapName && c.planName === plan.name && c.model === model) ?? null;
+  if (!entry) return null;
+  const tiers = entry.coefTiered && Array.isArray(entry.tiers) && entry.tiers.length > 0 ? entry.tiers : [];
+  const parts = splitTokensByShares(tokens, shares);
+  const buckets = new Map();
+  segs.forEach((seg, i) => {
+    const t = parts[i];
+    const hitTier = tiers.length > 0 ? coefSegmentAt(tiers, seg.repMs) : null;
+    if (!hitTier) return;                       // 未归桶：与统计版一致（不进入 segments）
+    const key = coefTierKey(hitTier);
+    let b = buckets.get(key);
+    if (!b) { b = { key, name: hitTier.name ?? null, hit: 0, miss: 0, output: 0 }; buckets.set(key, b); }
+    b.hit += t.hit;
+    b.miss += t.miss;
+    b.output += t.output;
+  });
+  return JSON.stringify({
+    v: 2,
+    mode: 'model',
+    officialDelta: deltaB ?? null,
+    quota: evalQuotaSpec(plan),
+    models: [{
+      model,
+      tokens: { hit: tokens.hit, miss: tokens.miss, output: tokens.output },
+      coef: { inHit: entry.inHit, inMiss: entry.inMiss, out: entry.out },
+      // 与 calcEvalJson 同形态：非分段系数条目下 tiers / segments 均为 null（读取端按 Array.isArray 容错）
+      tiers: tiers.length > 0
+        ? tiers.map((t) => ({
+            name: t.name ?? null, startMin: t.startMin, endMin: t.endMin,
+            isRest: Boolean(t.isRest), weekdays: t.weekdays ?? null, multiplier: t.multiplier
+          }))
+        : null,
+      segments: buckets.size > 0 ? [...buckets.values()] : null
+    }]
+  });
+}
+
+/**
+ * 手动录入落库（唯一写入点；单事务）。
+ * @param {object} payload
+ *   { startMs, endMs, mapName, planName, mode: 'model'|'total', model,
+ *     tokens: { hit, miss, output }, remainingMode, b1, b2, shares?, note?, draftId? }
+ *   draftId（可选）= 来源草稿行 id：提供时在**同一事务**内删除该行（行不存在不阻断落库）
+ * @returns {{ snapshot: object, draftDeleted: number }} 快照（驼峰视图）+ 本次删除的草稿行数（0/1）
+ * @throws quotaError：缺项 / 时间倒挂 / 套餐悬空 / 读数缺失或反向 / 额度无变化 / 用量全 0
+ */
+export function createManualSnapshot(db, payload = {}) {
+  // 空值（null / undefined / 空白串）必须显式判缺：Number(null) === 0 会被误当合法读数
+  const blank = (v) => v === null || v === undefined || String(v).trim() === '';
+  const startMs = blank(payload.startMs) ? Number.NaN : Number(payload.startMs);
+  const endMs = blank(payload.endMs) ? Number.NaN : Number(payload.endMs);
+  const { mapName, planName, remainingMode = false, note } = payload;
+  const isModel = payload.mode === 'model';
+  const model = isModel ? (payload.model ?? null) : null;
+
+  // ---------- 校验（服务端权威） ----------
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) throw quotaError(400, '请填写启动时间与结束时间');
+  if (endMs <= startMs) throw quotaError(400, '结束时间必须晚于启动时间');
+  if (!mapName || !planName) throw quotaError(400, '请选择提供商与套餐');
+  const cfg = loadPlanConfigs(db).configs.find((c) => c.mapName === mapName) ?? null;
+  const plan = cfg ? (cfg.plans.find((x) => x.name === planName) ?? null) : null;
+  if (!plan) throw quotaError(400, '所选的提供商 / 套餐已不存在，请重新选择');
+  if (isModel && !model) throw quotaError(400, '模型模式请选择该套餐下的统一模型');
+  const tk = {
+    hit: Number(payload.tokens?.hit) || 0,
+    miss: Number(payload.tokens?.miss) || 0,
+    output: Number(payload.tokens?.output) || 0
+  };
+  if (tk.hit < 0 || tk.miss < 0 || tk.output < 0) throw quotaError(400, '用量须为非负数值');
+  const A = tk.hit + tk.miss + tk.output;
+  if (!(A > 0)) throw quotaError(400, '请填写用量（命中 / 未命中 / 输出 不能全为 0）');
+  if (blank(payload.b1) || blank(payload.b2)) {
+    throw quotaError(400, remainingMode ? '请填写起始与结束剩余量' : '请填写起始与结束已用量');
+  }
+  const b1 = Number(payload.b1);
+  const b2 = Number(payload.b2);
+  if (!Number.isFinite(b1) || !Number.isFinite(b2)) {
+    throw quotaError(400, remainingMode ? '请填写起始与结束剩余量' : '请填写起始与结束已用量');
+  }
+  // 护栏方向随读数模式镜像（与 stopQuotaPreset 的 DECREASE / NO_CHANGE 同精神）
+  if (remainingMode ? b2 > b1 : b2 < b1) {
+    throw quotaError(400, remainingMode
+      ? '结束剩余量大于起始剩余量，请确认读数是否填反'
+      : '结束已用量小于起始已用量，请确认读数是否填反', 'DECREASE');
+  }
+  if (b2 === b1) throw quotaError(400, '额度无变化（起止读数相同），未生成记录', 'NO_CHANGE');
+  const deltaB = remainingMode ? round4(b1 - b2) : round4(b2 - b1);
+
+  // ---------- 计算（全部复用既有口径） ----------
+  const { pLo, pHi, quotaText } = estimateQuota(plan, deltaB);
+  const estLo = pHi > 0 ? Math.round(A / pHi) : 0;
+  const estHi = pLo > 0 ? Math.round(A / pLo) : 0;
+  const consumeLo = round2(pLo * 100);
+  const consumeHi = round2(pHi * 100);
+
+  const pricing = loadPricingContext(db);
+  const priceEntry = isModel && pricing ? (pricing.priceIndex.get(mapName + NIL + model) ?? null) : null;
+  const alloc = isModel ? manualAllocation(priceEntry, startMs, endMs, payload.shares) : { segs: [], shares: [] };
+  // 无计价时段时的代表时刻：取窗口中点（与逐段口径「取该段与窗口交集的中点」同一精神）
+  const repMs = Math.floor((startMs + endMs) / 2);
+  // 等值价格：仅模型模式（总量模式无模型分布 → 留空，详情页以「未做等值计价」说明）
+  const cost = isModel && priceEntry ? calcManualTokenCosts(priceEntry, tk, alloc.segs, alloc.shares, repMs) : null;
+  const tokenCosts = isModel
+    ? {
+        currency: getBillingCurrency(db),
+        mode: 'model',
+        amounts: cost ? cost.amounts : null,
+        partial: !(cost && cost.amounts),
+        byModel: [],
+        unpricedModels: (cost && cost.amounts) ? [] : [{ model, tokens: { ...tk, total: A } }],
+        byTier: cost ? cost.byTier : []
+      }
+    : null;
+  let equivLo = null;
+  let equivHi = null;
+  if (isModel && tokenCosts.amounts && A > 0) {
+    const unitCost = tokenCosts.amounts.total / A;   // 每 token 等值成本
+    equivLo = round2(estLo * unitCost);
+    equivHi = round2(estHi * unitCost);
+  }
+  const evalJson = isModel
+    ? calcManualEvalJson(db, mapName, plan, { model, tokens: tk, segs: alloc.segs, shares: alloc.shares, deltaB })
+    : null;
+  const readings = {
+    startMs,
+    startDate: localDateKey(startMs),
+    officialUsed: b1,
+    remainingMode: Boolean(remainingMode),
+    unit: plan.quotaMode === 'percent' ? '%' : '分',
+    endRaw: b2,
+    deltaB
+  };
+
+  // ---------- 来源草稿（可选副作用参数：紧邻事务校验，业务校验优先） ----------
+  const rawDraftId = payload.draftId;
+  let draftId = null;
+  if (rawDraftId !== undefined && rawDraftId !== null && String(rawDraftId).trim() !== '') {
+    const n = Number(rawDraftId);
+    if (!Number.isInteger(n) || n <= 0) throw quotaError(400, '草稿条目 id 非法');
+    draftId = n;
+  }
+
+  const written = runInTransaction(db, () => {
+    const info = db.prepare(
+      `INSERT INTO quota_snapshots (preset_id, created_ms, start_ms, end_ms, mode, model, tokens_json,
+         plan_name, provider, price, limit_period, quota_text,
+         consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+         token_costs_json, eval_json, source, readings_json, note)
+       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?)`
+    ).run(
+      Date.now(), startMs, endMs, isModel ? 'model' : 'total', model,
+      JSON.stringify({ inputHit: tk.hit, inputMiss: tk.miss, output: tk.output }),
+      plan.name, mapName, plan.monthlyFee, plan.limitPeriod, quotaText,
+      consumeLo, consumeHi, estLo, estHi, equivLo, equivHi,
+      tokenCosts ? JSON.stringify(tokenCosts) : null, evalJson,
+      JSON.stringify(readings),
+      (note === undefined || note === null || String(note).trim() === '') ? null : String(note).trim().slice(0, 200)
+    );
+    const sid = Number(info.lastInsertRowid);
+    // 「添加」= 落记录 + 删来源草稿：同一事务内完成；草稿行不存在时 0，绝不阻断落库（幂等）
+    return { snapshotId: sid, draftDeleted: draftId === null ? 0 : deleteDraftRow(db, draftId) };
+  });
+  const row = db.prepare('SELECT * FROM quota_snapshots WHERE id = ?').get(written.snapshotId);
+  return { snapshot: snapshotView(row), draftDeleted: written.draftDeleted };
+}
+
+/* ================= 手动录入草稿（quota_manual_drafts） =================
+ * 录入表单的中间态：信息不全也能「保持」，关闭窗口 / 重启后仍在；「添加」成功后删除。
+ * 草稿与快照完全无关：不参与任何统计口径、比较与列表展示。
+ */
+
+/** 草稿列表（最近更新在前） */
+export function listManualDrafts(db) {
+  const rows = db.prepare(
+    'SELECT id, created_ms, updated_ms, payload_json FROM quota_manual_drafts ORDER BY updated_ms DESC, id DESC'
+  ).all();
+  return {
+    items: rows.map((r) => ({
+      id: r.id,
+      createdMs: r.created_ms,
+      updatedMs: r.updated_ms,
+      payload: parseJsonColumn(r.payload_json) ?? {}
+    }))
+  };
+}
+
+/**
+ * 草稿载荷落库形态：**剥离保留键 id**。
+ * 身份只由表列承载（quota_manual_drafts.id）；前端草稿对象自带 id 字段，
+ * 若原样入库，读取侧合并时陈旧 id 会顶掉行 id（历史缺陷现场：条目 id 变成 null）。
+ */
+function draftPayloadJson(draft) {
+  if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return JSON.stringify(draft ?? {});
+  const rest = { ...draft };
+  delete rest.id;
+  return JSON.stringify(rest);
+}
+
+/** 草稿删除的唯一 SQL 落点：返回删除行数（0 = 该行不存在，语义由调用方决定） */
+function deleteDraftRow(db, id) {
+  return Number(db.prepare('DELETE FROM quota_manual_drafts WHERE id = ?').run(id).changes);
+}
+
+/** 保存草稿：无 id 新建、有 id 覆盖（刷新 updated_ms）；id 不存在 → 404 */
+export function saveManualDraft(db, payload = {}) {
+  const body = draftPayloadJson(payload.draft);
+  const now = Date.now();
+  const id = Number(payload.id);
+  if (Number.isFinite(id) && id > 0) {
+    const info = db.prepare('UPDATE quota_manual_drafts SET payload_json = ?, updated_ms = ? WHERE id = ?')
+      .run(body, now, id);
+    if (Number(info.changes) === 0) throw quotaError(404, '草稿条目不存在');
+    return { id };
+  }
+  const info = db.prepare('INSERT INTO quota_manual_drafts (created_ms, updated_ms, payload_json) VALUES (?, ?, ?)')
+    .run(now, now, body);
+  return { id: Number(info.lastInsertRowid) };
+}
+
+/** 删除草稿（放弃）：id 形状非法 → 400、行不存在 → 404 */
+export function deleteManualDraft(db, id) {
+  const n = Number(id);
+  if (!Number.isInteger(n) || n <= 0) throw quotaError(400, '草稿条目 id 非法');
+  if (deleteDraftRow(db, n) === 0) throw quotaError(404, '草稿条目不存在');
+  return { deleted: 1 };
 }

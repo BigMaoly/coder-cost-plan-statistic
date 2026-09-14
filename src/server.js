@@ -46,7 +46,8 @@ import {
   abandonQuotaPreset, migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots,
   listBenchmarks, saveBenchmark, deleteBenchmark, reorderBenchmarks,
   saveBenchmarkGroup, deleteBenchmarkGroup, reorderBenchmarkGroups,
-  bindSnapshotsBenchmark, compareBenchmark, updateSnapshotNote
+  bindSnapshotsBenchmark, compareBenchmark, updateSnapshotNote,
+  createManualSnapshot, listManualDrafts, saveManualDraft, deleteManualDraft
 } from './quota.js';
 import {
   loadScoreboard, saveCriterionGroup, deleteCriterionGroup, reorderCriterionGroups,
@@ -91,10 +92,26 @@ function readBody(req) {
   });
 }
 
-/** tool 参数解析：缺省 kimi；'all' 合法；不在白名单返回 null（调用方回 400） */
-function parseTool(url) {
-  const tool = url.searchParams.get('tool') || 'kimi';
-  return toolWhitelist().includes(tool) ? tool : null;
+/**
+ * tool 参数解析（多选筛选）：重复 query key + getAll；缺省等效 ['kimi']。
+ * 'all' 仅单值合法（与具体平台混用返回 null → 400）；任一值不在白名单返回 null（调用方回 400）。
+ */
+function parseTools(url) {
+  const values = [...new Set(url.searchParams.getAll('tool').filter(Boolean))];
+  if (values.length === 0) return ['kimi'];
+  if (values.length > 1 && values.includes('all')) return null;
+  const whitelist = toolWhitelist();
+  return values.every((t) => whitelist.includes(t)) ? values : null;
+}
+
+/** tool 多值是否跨全部平台（'all' 或后续扩展：调用方以此决定是否省略 tool WHERE） */
+function isAllTools(tools) {
+  return !Array.isArray(tools) || tools.length === 0 || tools.includes('all');
+}
+
+/** 非法 tool 参数的 400 错误文案（多值时逐个列出原值） */
+function badToolError(url) {
+  return `不支持的 tool：${url.searchParams.getAll('tool').join('、') || '（空）'}（可选 ${toolWhitelist().join(' / ')}）`;
 }
 
 /** 汇总计算：命中率 = 缓存命中输入 ÷ 总输入（三分量之和） */
@@ -116,11 +133,17 @@ function computeTotals(rows) {
   };
 }
 
-/** tool 维度的 WHERE 片段（v3：提供商/模型筛选在映射归并后按展示名匹配，不进 SQL） */
+/**
+ * tool 维度的 WHERE 片段（多选筛选：filter.tools 为平台数组，'all' 或缺省 = 跨全部平台无子句）。
+ * v3：提供商/模型筛选在映射归并后按展示名匹配，不进 SQL。
+ */
 function toolFilter(filter, extraWhere = [], extraParams = []) {
   const where = [...extraWhere];
   const params = [...extraParams];
-  if (filter.tool !== 'all') { where.push('tool = ?'); params.push(filter.tool); }
+  if (!isAllTools(filter.tools)) {
+    where.push(`tool IN (${filter.tools.map(() => '?').join(', ')})`);
+    params.push(...filter.tools);
+  }
   return { where, params };
 }
 
@@ -135,6 +158,11 @@ function addCost(acc, c) {
   acc.pricedTokens += c.pricedTokens;
   acc.unpricedTokens += c.unpricedTokens;
   return acc;
+}
+
+/** 费用表查询的 tool 实参：跨全部平台 → undefined（不过滤）；平台子集 → 数组 */
+function toolArgOf(filter) {
+  return isAllTools(filter.tools) ? undefined : filter.tools;
 }
 
 /**
@@ -180,7 +208,7 @@ function composeCostByKey({ pricing, maps, mappingOn, filter = {}, keyOf, costRo
  */
 function dailyCostMap(db, { from, to, recordBefore, filter, maps, mappingOn, pricing }) {
   if (!pricing) return new Map();
-  const toolArg = filter.tool === 'all' ? undefined : filter.tool;
+  const toolArg = toolArgOf(filter);
   const costRows = listCostDaily(db, { tool: toolArg, from, to })
     .map((r) => ({ ...r, local_date: r.date }));
   const dailyF = toolFilter(filter, ['local_date BETWEEN ? AND ?'], [from, to]);
@@ -389,7 +417,7 @@ function queryYearStats(db, year, filter, maps, mappingOn) {
         .all(...doneF.params)
         .map((r) => r.tool + '\0' + r.period)
     );
-    const toolArg = filter.tool === 'all' ? undefined : filter.tool;
+    const toolArg = toolArgOf(filter);
     // 归档月层：键 = tool + '\0' + 'YYYY-MM'
     const monthlyCostRows = listCostMonthly(db, { tool: toolArg, from: `${year}-01`, to: `${year}-12` })
       .map((r) => ({ ...r, ym: r.month }));
@@ -454,21 +482,22 @@ function queryYearStats(db, year, filter, maps, mappingOn) {
   return { bars, totals };
 }
 
-/** 有数据的年份列表（年视图下拉选项） */
-function queryYears(db, tool) {
-  const where = tool !== 'all' ? 'WHERE tool = ?' : '';
+/** 有数据的年份列表（年视图下拉选项）；tools 为平台数组（'all' 或跨全部平台时不过滤） */
+function queryYears(db, tools) {
+  const all = isAllTools(tools);
+  const where = all ? '' : `WHERE tool IN (${tools.map(() => '?').join(', ')})`;
   return db
     .prepare(`SELECT DISTINCT year FROM usage_monthly ${where} ORDER BY year`)
-    .all(...(tool !== 'all' ? [tool] : []))
+    .all(...(all ? [] : tools))
     .map((r) => r.year);
 }
 
 /** 今日卡片：未固化明细实时聚合（spec: web-dashboard 今日卡片）；v5 费用按记录时刻实时算 */
-function queryToday(db, tool, pricing, maps, mappingOn) {
+function queryToday(db, tools, pricing, maps, mappingOn) {
   const today = todayKey();
   const where = ['local_date = ?'];
   const params = [today];
-  if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+  if (!isAllTools(tools)) { where.push(`tool IN (${tools.map(() => '?').join(', ')})`); params.push(...tools); }
   const rows = db
     .prepare(`SELECT tool, provider, model, ts_ms, input_other, cache_read, cache_creation, output FROM usage_records WHERE ${where.join(' AND ')}`)
     .all(...params);
@@ -500,12 +529,14 @@ function annotateLabel(toolSet, tool, provider) {
  * 分布下钻费用：按展示分组键（与 groupByDisplay 同构）汇总。
  * 冻结行（费用表，原始粒度）映射归并后按键累加；无任何冻结行时 fallbackRows 回退折算；
  * 明细行（含 ts_ms）一律实时算并并入（滞留明细口径）。
+ * filter（多选下钻）：provider / model 数组经 matchFilter 与用量路径同口径收窄（冻结 / 回退 / 实时三路一致）。
  * @returns {{prov: Map, model: Map}} 键：提供商组键 / 提供商组键+'\0'+展示模型名
  */
-function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, recordRows }) {
+function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, recordRows, filter = {} }) {
   const prov = new Map();
   const model = new Map();
   if (!pricing) return { prov, model };
+  const pass = (r) => matchFilter(r, filter.provider ?? null, filter.model ?? null);
   const mappedNames = new Set(mappingOn ? maps.list.map((m) => m.name) : []);
   const pKey = (tool, dp) => (mappedNames.has(dp) ? 'M\0' + dp : 'R\0' + tool + '\0' + dp);
   const add = (tool, dp, dm, c) => {
@@ -514,11 +545,11 @@ function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, r
     const mk = pk + '\0' + dm;
     addCost(model.get(mk) ?? model.set(mk, zeroCost()).get(mk), c);
   };
-  const frozen = applyMappings(costRows, maps, mappingOn);
+  const frozen = applyMappings(costRows, maps, mappingOn).filter(pass);
   for (const r of frozen) add(r.tool, r.dp, r.dm, r);
   const liveRows = [...(frozen.length > 0 ? [] : fallbackRows), ...recordRows];
   if (liveRows.length > 0) {
-    for (const g of calcCost(liveRows, pricing.priceIndex, maps, { enabled: mappingOn })) {
+    for (const g of calcCost(applyMappings(liveRows, maps, mappingOn).filter(pass), pricing.priceIndex, maps, { enabled: mappingOn })) {
       add(g.tool, g.provider, g.model, g);
     }
   }
@@ -531,13 +562,20 @@ function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, r
  * - month=YYYY-MM：年视图月柱下钻，走 usage_monthly
  * - from/to=YYYY-MM-DD（闭区间，窗口汇总详细下钻）：历史日固化 ∪ 现存明细、今日部分实时口径，
  *   费用三口径（冻结 / 回退 / 实时）经 breakdownCostMaps 与单日一致
- * - year=YYYY：该年全部月份合并（年视图窗口详细），走 usage_monthly
+ * - year=YYYY：该年月份合并（年视图窗口详细），走 usage_monthly；
+ *   可选 month_from/month_to（1–12，仅配合 year）把合并范围限定到月份闭区间（summary-range-slider）
  * v3（provider-model-mapping）：取原始行后归并——映射行按统一名跨工具合并为一条
  * （tool 输出为 null，label 用统一名）；未映射行保持 (tool, provider) 独立并沿用 D8 消歧。
  * 模型级按归并后展示名 dm 分组。空时段返回空 providers 数组，不报错。
  * v5：每项与顶层附加 cost 费用字段（冻结值 / 回退 / 实时三口径，同 /api/stats）。
+ * 多选下钻：tool WHERE 由 tools 数组下推；filter.provider / filter.model（数组，展示名编码）
+ * 在归并后经 matchFilter 收窄——providers 仅含命中提供商、models 仅含命中模型，费用同口径。
  */
-function queryBreakdown(db, { date, month, from, to, year }, tool, maps, mappingOn) {
+function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo }, tools, maps, mappingOn, filter = {}) {
+  const toolCond = (where, params) => {
+    if (!isAllTools(tools)) { where.push(`tool IN (${tools.map(() => '?').join(', ')})`); params.push(...tools); }
+  };
+  const costToolArg = isAllTools(tools) ? undefined : tools;
   let rows;
   let costRows = [];     // 费用表冻结行（原始粒度）
   let fallbackRows = []; // 无冻结行时的回退汇总行（无 ts_ms，第一行价）
@@ -546,7 +584,7 @@ function queryBreakdown(db, { date, month, from, to, year }, tool, maps, mapping
     const today = todayKey();
     const where = ['local_date = ?'];
     const params = [date];
-    if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+    toolCond(where, params);
     const cond = where.join(' AND ');
     if (date === today) {
       // 今日：未固化明细实时口径（与今日卡片同源）
@@ -573,27 +611,27 @@ function queryBreakdown(db, { date, month, from, to, year }, tool, maps, mapping
         )
         .all(...params);
       rows = [...dailyRows, ...recordRows];
-      costRows = listCostDaily(db, { tool: tool === 'all' ? undefined : tool, from: date, to: date });
+      costRows = listCostDaily(db, { tool: costToolArg, from: date, to: date });
       fallbackRows = dailyRows;
     }
   } else if (month) {
     const [y, m] = month.split('-').map(Number);
     const where = ['year = ?', 'month = ?'];
     const params = [y, m];
-    if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+    toolCond(where, params);
     rows = db
       .prepare(
         `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
          FROM usage_monthly WHERE ${where.join(' AND ')}`
       )
       .all(...params);
-    costRows = listCostMonthly(db, { tool: tool === 'all' ? undefined : tool, from: month, to: month });
+    costRows = listCostMonthly(db, { tool: costToolArg, from: month, to: month });
     fallbackRows = rows;
   } else if (from) {
     // 日期区间（闭区间）：固化 ∪ 现存明细；今日部分随 recordRows 实时并入
     const where = ['local_date >= ?', 'local_date <= ?'];
     const params = [from, to];
-    if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+    toolCond(where, params);
     const cond = where.join(' AND ');
     const dailyRows = db
       .prepare(
@@ -608,28 +646,37 @@ function queryBreakdown(db, { date, month, from, to, year }, tool, maps, mapping
       )
       .all(...params);
     rows = [...dailyRows, ...recordRows];
-    costRows = listCostDaily(db, { tool: tool === 'all' ? undefined : tool, from, to });
+    costRows = listCostDaily(db, { tool: costToolArg, from, to });
     fallbackRows = dailyRows;
   } else {
-    // year：该年全部月份合并
+    // year：该年月份合并（month_from/month_to 收窄为月区间闭集，summary-range-slider 年视图收窄详细；
+    // 走 usage_monthly —— 已归档月 usage_daily 被滚动清理，日粒度查询会缺历史月）
     const where = ['year = ?'];
     const params = [Number(year)];
-    if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+    if (monthFrom) { where.push('month >= ?'); params.push(monthFrom); }
+    if (monthTo) { where.push('month <= ?'); params.push(monthTo); }
+    toolCond(where, params);
     rows = db
       .prepare(
         `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
          FROM usage_monthly WHERE ${where.join(' AND ')}`
       )
       .all(...params);
-    costRows = listCostMonthly(db, { tool: tool === 'all' ? undefined : tool, from: year + '-01', to: year + '-12' });
+    const mm = (m) => String(m).padStart(2, '0');
+    costRows = listCostMonthly(db, {
+      tool: costToolArg,
+      from: year + '-' + mm(monthFrom || 1),
+      to: year + '-' + mm(monthTo || 12)
+    });
     fallbackRows = rows;
   }
 
-  const merged = applyMappings(rows, maps, mappingOn);
+  const merged = applyMappings(rows, maps, mappingOn)
+    .filter((r) => matchFilter(r, filter.provider, filter.model));
   const groups = groupByDisplay(merged);
   const labels = displayLabels(groups);
   const costMaps = breakdownCostMaps({
-    pricing: loadPricingContext(db), maps, mappingOn, costRows, fallbackRows, recordRows
+    pricing: loadPricingContext(db), maps, mappingOn, costRows, fallbackRows, recordRows, filter
   });
 
   const providers = groups
@@ -663,15 +710,77 @@ function queryBreakdown(db, { date, month, from, to, year }, tool, maps, mapping
 }
 
 /**
- * 筛选选项：从当前视图对应的数据表动态派生提供商→模型树。
- * v3：归并后输出——映射条目 value 为 `map:<统一名>`（tool 为 null）；未映射条目 all 视图
- * value 为 `tool|provider`、单工具视图为裸名（前端据此回传 provider 筛选参数）。
+ * 单日小时构成（hourly-archive-drilldown，只读）：GET /api/hourly?date=YYYY-MM-DD 的取数。
+ * 取数顺序：① usage_hourly 该日有行 → source='archive'（冻结快照，archive 优先且不并入明细，
+ * D4：避免晚到明细固化删除那天小时数值回退）；② 否则 usage_records 该日有行 → source='detail'
+ * （今日 / 尚未固化日的实时口径，JS 侧按 new Date(ts_ms).getHours() 分桶，与切天同源）；
+ * ③ 都无 → available=false（前端整块隐藏，不留空态）。
+ * 聚合行经 applyMappings → groupByDisplay → displayLabels 与饼图完全同键（label 与
+ * /api/breakdown 的 providers[].label 一致）；model 为展示模型名（dm）。行粒度 (hour, label, model)。
+ * 只读 usage_hourly / usage_records / 映射配置三处，SHALL NOT 读 usage_daily / usage_monthly / cost_*。
  */
-function queryFilterOptions(db, range, year, tool, maps, mappingOn) {
+function queryHourly(db, date, tools, maps, mappingOn, filter = {}) {
+  const where = ['local_date = ?'];
+  const params = [date];
+  if (!isAllTools(tools)) {
+    where.push(`tool IN (${tools.map(() => '?').join(', ')})`);
+    params.push(...tools);
+  }
+  const cond = where.join(' AND ');
+
+  let source = 'archive';
+  let hourRows = db.prepare(
+    `SELECT hour, tool, provider, model, input_other, cache_read, cache_creation, output
+     FROM usage_hourly WHERE ${cond}`
+  ).all(...params);
+  if (hourRows.length === 0) {
+    source = 'detail';
+    hourRows = db.prepare(
+      `SELECT tool, provider, model, ts_ms, input_other, cache_read, cache_creation, output
+       FROM usage_records WHERE ${cond}`
+    ).all(...params).map((r) => ({ ...r, hour: new Date(r.ts_ms).getHours() }));
+  }
+  if (hourRows.length === 0) {
+    return { date, available: false, source: null, rows: [] };
+  }
+
+  const merged = applyMappings(hourRows, maps, mappingOn)
+    .filter((r) => matchFilter(r, filter.provider ?? null, filter.model ?? null));
+  const groups = groupByDisplay(merged);
+  const labels = displayLabels(groups);
+  const acc = new Map();
+  for (const g of groups) {
+    const label = labels.get(g);
+    for (const row of g.rows) {
+      const hour = Number(row.hour);
+      const key = hour + '\u0000' + label + '\u0000' + row.dm;
+      let e = acc.get(key);
+      if (!e) {
+        e = { hour, label, mapped: g.mapped, model: row.dm, inputOther: 0, cacheRead: 0, cacheCreation: 0, output: 0 };
+        acc.set(key, e);
+      }
+      e.inputOther += row.input_other;
+      e.cacheRead += row.cache_read;
+      e.cacheCreation += row.cache_creation;
+      e.output += row.output;
+    }
+  }
+  const rows = [...acc.values()].sort((a, b) =>
+    a.hour - b.hour || a.label.localeCompare(b.label) || a.model.localeCompare(b.model));
+  return { date, available: true, source, rows };
+}
+
+/**
+ * 筛选选项：从当前视图对应的数据表动态派生提供商→模型树。
+ * v3：归并后输出——映射条目 value 为 `map:<统一名>`（tool 为 null）；未映射条目在
+ * 多平台口径（tools 含 'all' 或所选平台 ≥2）下 value 为 `tool|provider`、单平台视图为裸名
+ * （前端据此回传 provider 筛选参数）。同名提供商消歧标注范围跟随所选平台集合（query 已限定）。
+ */
+function queryFilterOptions(db, range, year, tools, maps, mappingOn) {
   const table = range === 'year' ? 'usage_monthly' : 'usage_daily';
   const where = [];
   const params = [];
-  if (tool !== 'all') { where.push('tool = ?'); params.push(tool); }
+  if (!isAllTools(tools)) { where.push(`tool IN (${tools.map(() => '?').join(', ')})`); params.push(...tools); }
   if (range === 'year' && year) { where.push('year = ?'); params.push(Number(year)); }
   const rows = db
     .prepare(
@@ -683,12 +792,13 @@ function queryFilterOptions(db, range, year, tool, maps, mappingOn) {
   const merged = applyMappings(rows, maps, mappingOn);
   const groups = groupByDisplay(merged);
   const labels = displayLabels(groups);
+  const multiTool = isAllTools(tools) || tools.length > 1;
   const providers = groups.map((g) => ({
     tool: g.mapped ? null : g.tool,
     provider: g.dp,
     label: labels.get(g),
     mapped: g.mapped,
-    value: g.mapped ? `map:${g.dp}` : (tool === 'all' ? `${g.tool}|${g.provider}` : g.provider),
+    value: g.mapped ? `map:${g.dp}` : (multiTool ? `${g.tool}|${g.provider}` : g.provider),
     models: [...new Set(g.rows.map((r) => r.dm))].sort()
   }));
   return { providers };
@@ -729,12 +839,13 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
 
       if (req.method === 'GET' && path === '/api/stats') {
         const range = url.searchParams.get('range') || '7d';
-        const tool = parseTool(url);
-        if (!tool) return sendJson(res, 400, { error: `不支持的 tool：${url.searchParams.get('tool')}（可选 ${toolWhitelist().join(' / ')}）` });
+        const tools = parseTools(url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        // 多选筛选（multi-select-filters-and-filtered-drilldown）：provider / model 重复 query key 多值
         const filter = {
-          tool,
-          provider: url.searchParams.get('provider') || null,
-          model: url.searchParams.get('model') || null
+          tools,
+          provider: url.searchParams.getAll('provider').filter(Boolean),
+          model: url.searchParams.getAll('model').filter(Boolean)
         };
         const maps = loadMappings(db);
         const mappingOn = isMappingEnabled(db);
@@ -744,7 +855,7 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
           return sendJson(res, 200, { range, currency, ...queryDailyStats(db, days, filter, maps, mappingOn) });
         }
         if (range === 'year') {
-          const years = queryYears(db, tool);
+          const years = queryYears(db, tools);
           const yearParam = url.searchParams.get('year');
           const year = yearParam ? Number(yearParam) : (years.at(-1) || todayKey().slice(0, 4));
           if (!Number.isFinite(year)) return sendJson(res, 200, { range, currency, years: [], bars: [], totals: computeTotals([]) });
@@ -754,10 +865,10 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
       }
 
       if (req.method === 'GET' && path === '/api/today') {
-        const tool = parseTool(url);
-        if (!tool) return sendJson(res, 400, { error: `不支持的 tool：${url.searchParams.get('tool')}（可选 ${toolWhitelist().join(' / ')}）` });
+        const tools = parseTools(url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
         return sendJson(res, 200, {
-          ...queryToday(db, tool, loadPricingContext(db), loadMappings(db), isMappingEnabled(db)),
+          ...queryToday(db, tools, loadPricingContext(db), loadMappings(db), isMappingEnabled(db)),
           currency: getBillingCurrency(db)
         });
       }
@@ -769,11 +880,22 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         const from = url.searchParams.get('from');
         const to = url.searchParams.get('to');
         const year = url.searchParams.get('year');
-        const tool = parseTool(url);
-        if (!tool) return sendJson(res, 400, { error: `不支持的 tool：${url.searchParams.get('tool')}（可选 ${toolWhitelist().join(' / ')}）` });
+        const monthFrom = url.searchParams.get('month_from');
+        const monthTo = url.searchParams.get('month_to');
+        const tools = parseTools(url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
         const modes = [Boolean(date), Boolean(month), Boolean(from || to), Boolean(year)].filter(Boolean).length;
         if (modes !== 1) {
           return sendJson(res, 400, { error: 'date / month / from+to / year 参数必须四选一' });
+        }
+        // 月区间（summary-range-slider）：只配合 year 使用，限定该年合并的月份闭区间（缺省全年）
+        if (monthFrom || monthTo) {
+          if (!year) return sendJson(res, 400, { error: 'month_from / month_to 只能配合 year 参数使用' });
+          const mf = Number(monthFrom), mt = Number(monthTo);
+          if (!monthFrom || !monthTo || !Number.isInteger(mf) || !Number.isInteger(mt) ||
+              mf < 1 || mf > 12 || mt < 1 || mt > 12 || mf > mt) {
+            return sendJson(res, 400, { error: 'month_from / month_to 应为 1–12 的整数且 month_from ≤ month_to' });
+          }
         }
         if (date && !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
           return sendJson(res, 400, { error: 'date 格式应为 YYYY-MM-DD' });
@@ -793,22 +915,48 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
           return sendJson(res, 400, { error: 'year 格式应为 YYYY' });
         }
         return sendJson(res, 200, {
-          ...queryBreakdown(db, { date, month, from, to, year }, tool, loadMappings(db), isMappingEnabled(db)),
+          ...queryBreakdown(db, {
+            date, month, from, to, year,
+            monthFrom: monthFrom ? Number(monthFrom) : null,
+            monthTo: monthTo ? Number(monthTo) : null
+          }, tools, loadMappings(db), isMappingEnabled(db), {
+            // 多选下钻（multi-select-filters-and-filtered-drilldown）：provider / model 多值，缺省不筛选
+            provider: url.searchParams.getAll('provider').filter(Boolean),
+            model: url.searchParams.getAll('model').filter(Boolean)
+          }),
+          currency: getBillingCurrency(db)
+        });
+      }
+
+      // 单日小时构成（hourly-archive-drilldown）：只读独立端点，不触碰 /api/breakdown
+      if (req.method === 'GET' && path === '/api/hourly') {
+        const date = url.searchParams.get('date');
+        if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+          return sendJson(res, 400, { error: 'date 必填，格式应为 YYYY-MM-DD' });
+        }
+        const tools = parseTools(url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        return sendJson(res, 200, {
+          ...queryHourly(db, date, tools, loadMappings(db), isMappingEnabled(db), {
+            // 与 /api/breakdown 同构的多值筛选（provider / model，展示名编码）
+            provider: url.searchParams.getAll('provider').filter(Boolean),
+            model: url.searchParams.getAll('model').filter(Boolean)
+          }),
           currency: getBillingCurrency(db)
         });
       }
 
       if (req.method === 'GET' && path === '/api/filter-options') {
         const range = url.searchParams.get('range') || '7d';
-        const tool = parseTool(url);
-        if (!tool) return sendJson(res, 400, { error: `不支持的 tool：${url.searchParams.get('tool')}（可选 ${toolWhitelist().join(' / ')}）` });
+        const tools = parseTools(url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
         const year = url.searchParams.get('year');
         const maps = loadMappings(db);
         const mappingOn = isMappingEnabled(db);
         if (range === 'year') {
-          return sendJson(res, 200, { providers: queryFilterOptions(db, 'year', year, tool, maps, mappingOn).providers, years: queryYears(db, tool) });
+          return sendJson(res, 200, { providers: queryFilterOptions(db, 'year', year, tools, maps, mappingOn).providers, years: queryYears(db, tools) });
         }
-        return sendJson(res, 200, queryFilterOptions(db, range, null, tool, maps, mappingOn));
+        return sendJson(res, 200, queryFilterOptions(db, range, null, tools, maps, mappingOn));
       }
 
       // ---- v3 映射管理 API（provider-model-mapping）----
@@ -1176,6 +1324,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
           plan: url.searchParams.get('plan') || undefined,
           provider: url.searchParams.get('provider') || undefined,
           benchmark: url.searchParams.get('benchmark') || undefined,
+          // 来源过滤（manual-quota-snapshot）：'manual' 只看手动录入、'estimate' 只看额度统计
+          source: url.searchParams.get('source') || undefined,
           page: url.searchParams.get('page') || undefined,
           pageSize: url.searchParams.get('pageSize') || undefined
         }));
@@ -1207,6 +1357,40 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         try {
           const result = bindSnapshotsBenchmark(db, body?.ids, body?.name);
           return sendJson(res, 200, { ok: true, ...result });
+        } catch (error) {
+          return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+        }
+      }
+
+      // 手动录入落库（manual-quota-snapshot）：body 见 createManualSnapshot；
+      // 与 stop 路径同族：计算与校验全在核心层，路由只做 readBody → 调用 → 透传结果
+      if (req.method === 'POST' && path === '/api/quota/snapshots/manual') {
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          const result = createManualSnapshot(db, body || {});
+          return sendJson(res, 200, { ok: true, ...result });
+        } catch (error) {
+          return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+        }
+      }
+
+      // 手动录入草稿（manual-quota-snapshot）：GET 列表 / PUT 保存（无 id 新建、有 id 覆盖）/ DELETE 删除
+      if (path === '/api/quota/manual-drafts') {
+        if (req.method === 'GET') return sendJson(res, 200, listManualDrafts(db));
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          if (req.method === 'PUT') return sendJson(res, 200, { ok: true, ...saveManualDraft(db, body || {}) });
+          if (req.method === 'DELETE') return sendJson(res, 200, { ok: true, ...deleteManualDraft(db, body?.id) });
         } catch (error) {
           return sendJson(res, error.status || 400, { error: error.message, code: error.code });
         }
@@ -1377,14 +1561,21 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         return sendJson(res, 404, { error: `未知路径：${path}` });
       }
 
-      // 静态文件（白名单内，防目录穿越）：quota-eval.js 为套餐额度估算引擎（纯函数，app.js 依赖它）
+      // 静态文件（白名单内，防目录穿越）：quota-eval.js 为套餐额度估算引擎（纯函数，app.js 依赖它）；
+      // summary-range.js / range-slider.js(+css) 为汇总范围滑动条（summary-range-slider，app.js 依赖它们）；
+      // hourly-range.js 为小时时段构成引擎（hourly-archive-drilldown，app.js 依赖它）
       if (req.method === 'GET') {
         const allow = {
           '/': 'index.html', '/index.html': 'index.html',
           '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js',
+          '/summary-range.js': 'summary-range.js', '/range-slider.js': 'range-slider.js',
+          '/hourly-range.js': 'hourly-range.js',
+          '/range-slider.css': 'range-slider.css',
           '/score.js': 'score.js', '/score-filter.js': 'score-filter.js',
           '/score-combobox.js': 'score-combobox.js', '/quota-benchmark.js': 'quota-benchmark.js',
-          '/quota-benchmark-compare.js': 'quota-benchmark-compare.js'
+          '/quota-benchmark-compare.js': 'quota-benchmark-compare.js',
+          '/link-solve.js': 'link-solve.js', '/tier-alloc.js': 'tier-alloc.js',
+          '/manual-entry.js': 'manual-entry.js'
         };
         const file = allow[path];
         if (file) {

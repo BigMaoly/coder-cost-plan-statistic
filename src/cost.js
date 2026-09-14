@@ -158,11 +158,24 @@ export function rollupCostMonthly(db, tool, ym) {
   ).run(tool, ym);
 }
 
-/** 按日期范围查询费用日表（闭区间，'YYYY-MM-DD'）；tool / from / to 均可缺省 */
+/** tool 条件片段：单值 / 数组（平台子集）/ 缺省（不过滤）通用 */
+function toolWhere(tool, column, where, args) {
+  if (!tool) return;
+  if (Array.isArray(tool)) {
+    if (tool.length === 0) return;
+    where.push(`${column} IN (${tool.map(() => '?').join(', ')})`);
+    args.push(...tool);
+    return;
+  }
+  where.push(`${column} = ?`);
+  args.push(tool);
+}
+
+/** 按日期范围查询费用日表（闭区间，'YYYY-MM-DD'）；tool（单值或数组）/ from / to 均可缺省 */
 export function listCostDaily(db, { tool, from, to } = {}) {
   const where = [];
   const args = [];
-  if (tool) { where.push('tool = ?'); args.push(tool); }
+  toolWhere(tool, 'tool', where, args);
   if (from) { where.push('local_date >= ?'); args.push(from); }
   if (to) { where.push('local_date <= ?'); args.push(to); }
   return db.prepare(
@@ -173,11 +186,11 @@ export function listCostDaily(db, { tool, from, to } = {}) {
   ).all(...args);
 }
 
-/** 按月份范围查询费用月表（闭区间，'YYYY-MM'）；tool / from / to 均可缺省 */
+/** 按月份范围查询费用月表（闭区间，'YYYY-MM'）；tool（单值或数组）/ from / to 均可缺省 */
 export function listCostMonthly(db, { tool, from, to } = {}) {
   const where = [];
   const args = [];
-  if (tool) { where.push('tool = ?'); args.push(tool); }
+  toolWhere(tool, 'tool', where, args);
   if (from) { where.push('month >= ?'); args.push(from); }
   if (to) { where.push('month <= ?'); args.push(to); }
   return db.prepare(

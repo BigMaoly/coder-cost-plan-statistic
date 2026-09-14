@@ -26,7 +26,8 @@ import {
   migrateQuotaPresetsOwnership, listQuotaSnapshots, deleteQuotaSnapshots, updateSnapshotNote,
   listBenchmarkGroups, saveBenchmarkGroup, deleteBenchmarkGroup, reorderBenchmarkGroups,
   listBenchmarks, saveBenchmark, deleteBenchmark, reorderBenchmarks,
-  bindSnapshotsBenchmark, compareBenchmark
+  bindSnapshotsBenchmark, compareBenchmark,
+  createManualSnapshot, listManualDrafts, saveManualDraft, deleteManualDraft
 } from '../src/quota.js';
 
 function tempDb() {
@@ -2220,6 +2221,572 @@ test('快照备注：列表回读 note（NULL → 空串口径）/ 备注与基�
     for (const k of ['created_ms', 'start_ms', 'mode', 'tokens_json', 'plan_name', 'provider', 'price', 'quota_text', 'benchmark_json']) {
       assert.equal(raw1b[k], raw1[k], `改备注不应改动字段 ${k}`);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 手动录入（manual-quota-snapshot） =================
+ * 覆盖：落库字段全量（来源 / 窗口结束时间 / 官方读数 / 三列与统计流程互不干扰）、
+ * 总量模式与模型模式差异、逐段取价（继承分时段与剩余时段规则）、分配占比归一与回退、
+ * 套餐额度评估（门槛 / 段键与统计版一致 / 非分段为 null）、折算等价金额、
+ * 六类校验分支、草稿 CRUD、来源过滤与计数。
+ */
+
+/** 手动录入最小可用 payload（总量模式，月积分套餐） */
+function manualPayload(over = {}) {
+  const today = todayKey();
+  return {
+    startMs: atLocal(today, '10:00'),
+    endMs: atLocal(today, '11:00'),
+    mapName: '火山引擎',
+    planName: '积分包',
+    mode: 'total',
+    model: null,
+    tokens: { hit: 200_000, miss: 4_000_000, output: 88_000 },
+    remainingMode: false,
+    b1: 40,
+    b2: 48.56,
+    ...over
+  };
+}
+
+function seedPointsPlan(db, prices = []) {
+  savePlanConfig(db, {
+    mapName: '火山引擎',
+    plans: [{ name: '积分包', cycleDays: 30, monthlyFee: 50, quotaMode: 'points', limitPeriod: 'month', totalPoints: 1000 }],
+    currentPlan: '积分包',
+    prices
+  });
+}
+
+/** 捕获同步抛出的错误（node:assert 的 throws 不返回错误对象） */
+function catchErr(fn) {
+  try { fn(); } catch (e) { return e; }
+  return null;
+}
+
+const TIERED_M1 = [{
+  model: 'm1', unit: 'K', tiered: true, tiers: [
+    { start: '09:00', end: '18:00', inputHit: 1, inputMiss: 4, output: 16 },
+    { rest: true, inputHit: 0.5, inputMiss: 2, output: 8 }
+  ]
+}];
+
+test('手动录入·总量模式：全字段落库、与统计同公式、等值价格与评估留空', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    const before = Date.now();
+    const payload = manualPayload({ note: '  在别的机器上用了一天  ' });
+    const { snapshot } = createManualSnapshot(db, payload);
+
+    // 落库列：来源 / 窗口结束时间 / 官方读数 / 三分量 / 套餐固化
+    const row = snapshotRows(db)[0];
+    assert.equal(row.source, 'manual');
+    assert.equal(row.end_ms, payload.endMs);
+    assert.equal(row.start_ms, payload.startMs);
+    assert.ok(row.created_ms >= before && row.created_ms <= Date.now() + 1000, 'created_ms 为写入时刻');
+    assert.deepEqual(JSON.parse(row.tokens_json), { inputHit: 200_000, inputMiss: 4_000_000, output: 88_000 });
+    assert.equal(row.plan_name, '积分包');
+    assert.equal(row.provider, '火山引擎');
+    assert.equal(row.price, 50);
+    assert.equal(row.limit_period, 'month');
+    assert.equal(row.quota_text, '1000 积分/月');
+    assert.equal(row.preset_id, null);
+    assert.equal(row.note, '在别的机器上用了一天', '备注 trim 后落库');
+
+    // 读数固化：字段名与预设基线对齐
+    const readings = JSON.parse(row.readings_json);
+    assert.equal(readings.officialUsed, 40);
+    assert.equal(readings.endRaw, 48.56);
+    assert.equal(readings.remainingMode, false);
+    assert.equal(readings.unit, '分');
+    assert.equal(readings.deltaB, 8.56);
+    assert.equal(readings.startDate, todayKey());
+    assert.equal(readings.startMs, payload.startMs);
+
+    // 与统计同公式：P = round4(8.56/1000) = 0.0086 → 占比 0.86%
+    assert.equal(row.consume_pct_lo, 0.86);
+    assert.equal(row.consume_pct_hi, 0.86);
+    assert.equal(row.est_total_lo, Math.round(4_288_000 / 0.0086));
+    assert.equal(row.est_total_hi, row.est_total_lo);
+    // 总量模式：等值价格与评估留空
+    assert.equal(row.token_costs_json, null);
+    assert.equal(row.eval_json, null);
+    assert.equal(row.equiv_cost_lo, null);
+
+    // 对外形状：来源 / 结束时间回退口径 / 读数
+    assert.equal(snapshot.source, 'manual');
+    assert.equal(snapshot.endMs, payload.endMs);
+    const view = listQuotaSnapshots(db, {}).items[0];
+    assert.equal(view.source, 'manual');
+    assert.equal(view.endTime, payload.endMs, '手动录入的结束时间取 end_ms 而非写入时刻');
+    assert.equal(view.readings.officialUsed, 40);
+    assert.equal(view.tokens.total, 4_288_000);
+    assert.equal(view.estTotal, Math.round(4_288_000 / 0.0086));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·模型模式跨时段：逐段取价（分时段 + 剩余时段兜底）、占比归一与长度不符回退', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db, TIERED_M1);
+    const today = todayKey();
+    // 窗口 10:00~20:00：命中「09:00~18:00」8h + 「其余时段」2h → 默认占比 0.8 / 0.2
+    const base = manualPayload({
+      startMs: atLocal(today, '10:00'), endMs: atLocal(today, '20:00'),
+      mode: 'model', model: 'm1',
+      tokens: { hit: 2000, miss: 1000, output: 500 }
+    });
+    createManualSnapshot(db, base);
+    let row = snapshotRows(db)[0];
+    let tc = JSON.parse(row.token_costs_json);
+    assert.equal(tc.mode, 'model');
+    assert.equal(tc.partial, false);
+    assert.equal(tc.byTier.length, 2, '两个时段段');
+    assert.equal(tc.byTier[0].cap, '09:00~18:00');
+    assert.ok(Math.abs(tc.byTier[0].share - 0.8) < 1e-9, '默认占比 = 各段窗口内时长比例');
+    assert.equal(tc.byTier[1].cap, '其余时段');
+    // 段1：hit1600×1 + miss800×4 + out400×16 = 1.6 + 3.2 + 6.4 = 11.2
+    // 段2（其余时段价）：hit400×0.5 + miss200×2 + out100×8 = 0.2 + 0.4 + 0.8 = 1.4
+    assert.deepEqual(tc.amounts, { hit: 1.8, miss: 3.6, output: 7.2, total: 12.6 });
+
+    // 显式占比 0.5 / 0.5：段1 = 1 + 2 + 4 = 7、段2 = 0.5 + 1 + 2 = 3.5
+    db.prepare('DELETE FROM quota_snapshots').run();
+    createManualSnapshot(db, { ...base, shares: [0.5, 0.5] });
+    tc = JSON.parse(snapshotRows(db)[0].token_costs_json);
+    assert.deepEqual(tc.amounts, { hit: 1.5, miss: 3, output: 6, total: 10.5 });
+
+    // 占比长度不符 / 非法值 / 全 0 → 回退默认时长占比
+    db.prepare('DELETE FROM quota_snapshots').run();
+    createManualSnapshot(db, { ...base, shares: [1] });
+    tc = JSON.parse(snapshotRows(db)[0].token_costs_json);
+    assert.ok(Math.abs(tc.byTier[0].share - 0.8) < 1e-9, '长度不符回退默认');
+    db.prepare('DELETE FROM quota_snapshots').run();
+    createManualSnapshot(db, { ...base, shares: [-1, 2] });
+    tc = JSON.parse(snapshotRows(db)[0].token_costs_json);
+    assert.ok(Math.abs(tc.byTier[0].share - 0.8) < 1e-9, '非法值回退默认');
+    db.prepare('DELETE FROM quota_snapshots').run();
+    createManualSnapshot(db, { ...base, shares: [0, 0] });
+    tc = JSON.parse(snapshotRows(db)[0].token_costs_json);
+    assert.ok(Math.abs(tc.byTier[0].share - 0.8) < 1e-9, '全 0 回退默认');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·模型模式无价格：amounts 为 null、partial 标记、缺价名单含所选模型', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);           // 无任何模型价格
+    createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1' }));
+    const tc = JSON.parse(snapshotRows(db)[0].token_costs_json);
+    assert.equal(tc.amounts, null);
+    assert.equal(tc.partial, true);
+    assert.deepEqual(tc.unpricedModels.map((u) => u.model), ['m1']);
+    assert.deepEqual(tc.byTier, []);
+    // 无价格 → 不产出折算等价金额
+    assert.equal(snapshotRows(db)[0].equiv_cost_lo, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·套餐额度评估：有系数时产出（段键与统计版一致），非分段时 tiers/segments 为 null，无系数时不产出', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db, TIERED_M1);
+    savePlanQuotaCoefs(db, '火山引擎', [{
+      planName: '积分包', model: 'm1', inHit: 1, inMiss: 4, out: 20,
+      coefTiered: 1,
+      tiers: [{ name: '白天', start: '09:00', end: '18:00', multiplier: 2 }, { name: '其余', rest: true, multiplier: 0.5 }]
+    }]);
+    const today = todayKey();
+    createManualSnapshot(db, manualPayload({
+      startMs: atLocal(today, '10:00'), endMs: atLocal(today, '20:00'),
+      mode: 'model', model: 'm1', tokens: { hit: 2000, miss: 1000, output: 500 }, b1: 40, b2: 48.56
+    }));
+    const ev = JSON.parse(snapshotRows(db)[0].eval_json);
+    assert.equal(ev.v, 2);
+    assert.equal(ev.mode, 'model');
+    assert.equal(ev.officialDelta, 8.56);
+    assert.deepEqual(ev.quota, { quotaMode: 'points', limitPeriod: 'month', weeklyPoints: null, totalPoints: 1000, cycleDays: 30 });
+    const m = ev.models[0];
+    assert.equal(m.model, 'm1');
+    assert.deepEqual(m.tokens, { hit: 2000, miss: 1000, output: 500 });
+    assert.deepEqual(m.coef, { inHit: 1, inMiss: 4, out: 20 });
+    assert.equal(m.tiers.length, 2);
+    assert.equal(m.tiers[0].multiplier, 2);
+    // 段键与 web/quota-eval.js 的 segKey 同形态（startMin|endMin|isRest|weekdays）
+    assert.equal(m.segments.length, 2);
+    assert.deepEqual(m.segments.map((s) => s.key), ['540|1080|0|', '||1|']);
+    // 段内三分量按占比摊分（0.8 / 0.2）
+    assert.equal(m.segments[0].hit, 1600);
+    assert.equal(m.segments[0].miss, 800);
+    assert.equal(m.segments[0].output, 400);
+    assert.equal(m.segments[1].hit, 400);
+    assert.equal(m.segments[1].output, 100);
+
+    // 非分段系数条目：tiers / segments 均为 null（与 calcEvalJson 同形态）
+    db.prepare('DELETE FROM quota_snapshots').run();
+    savePlanQuotaCoefs(db, '火山引擎', [{ planName: '积分包', model: 'm1', inHit: 1, inMiss: 4, out: 20 }]);
+    createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1' }));
+    const ev2 = JSON.parse(snapshotRows(db)[0].eval_json);
+    assert.equal(ev2.models[0].tiers, null);
+    assert.equal(ev2.models[0].segments, null);
+
+    // 无系数条目：不产出评估
+    db.prepare('DELETE FROM quota_snapshots').run();
+    savePlanQuotaCoefs(db, '火山引擎', []);
+    createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1' }));
+    assert.equal(snapshotRows(db)[0].eval_json, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·折算等价金额：模型模式按单位成本 × 估算总量（区间两端各算一次）', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db, TIERED_M1);
+    const today = todayKey();
+    createManualSnapshot(db, manualPayload({
+      startMs: atLocal(today, '10:00'), endMs: atLocal(today, '11:00'),
+      mode: 'model', model: 'm1', tokens: { hit: 2000, miss: 1000, output: 500 }, b1: 40, b2: 48.56
+    }));
+    const row = snapshotRows(db)[0];
+    const tc = JSON.parse(row.token_costs_json);
+    const A = 3500;
+    const unitCost = tc.amounts.total / A;
+    assert.equal(row.equiv_cost_lo, Math.round(row.est_total_lo * unitCost * 100) / 100);
+    assert.equal(row.equiv_cost_hi, Math.round(row.est_total_hi * unitCost * 100) / 100);
+    assert.notEqual(row.equiv_cost_lo, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·校验分支：时间 / 套餐 / 模型 / 读数 / 用量 六类拒绝', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    const ok = manualPayload();
+    const expect400 = (over, msg, code) => {
+      const err = catchErr(() => createManualSnapshot(db, { ...ok, ...over }));
+      assert.ok(err, '应抛出错误');
+      assert.match(err.message, msg);
+      if (code) assert.equal(err.code, code);
+      assert.equal(err.status, 400);
+    };
+    expect400({ startMs: Number.NaN }, /请填写启动时间与结束时间/);
+    expect400({ endMs: ok.startMs }, /结束时间必须晚于启动时间/);
+    expect400({ planName: '不存在的套餐' }, /已不存在/);
+    expect400({ mode: 'model', model: null }, /请选择该套餐下的统一模型/);
+    expect400({ b1: null }, /请填写起始与结束已用量/);
+    expect400({ remainingMode: true, b1: 10, b2: 20 }, /结束剩余量大于起始剩余量/, 'DECREASE');
+    expect400({ b1: 40, b2: 30 }, /结束已用量小于起始已用量/, 'DECREASE');
+    expect400({ b1: 40, b2: 40 }, /额度无变化/, 'NO_CHANGE');
+    expect400({ tokens: { hit: 0, miss: 0, output: 0 } }, /不能全为 0/);
+    expect400({ tokens: { hit: -1, miss: 0, output: 5 } }, /非负数值/);
+    assert.equal(snapshotRows(db).length, 0, '全部拒绝路径都不落库');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·剩余模式：ΔB = 起始剩余 − 结束剩余，读数模式与单位随记录固化', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    createManualSnapshot(db, manualPayload({ remainingMode: true, b1: 100, b2: 91.44 }));
+    const row = snapshotRows(db)[0];
+    const readings = JSON.parse(row.readings_json);
+    assert.equal(readings.remainingMode, true);
+    assert.equal(readings.deltaB, 8.56);
+    assert.equal(row.consume_pct_lo, 0.86);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·草稿 CRUD：新建 / 覆盖 / 列表 / 删除 / 404 / 不触碰快照表', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    const a = saveManualDraft(db, { draft: { planName: '积分包', b1: 40 } });
+    const b = saveManualDraft(db, { draft: { planName: '积分包', b2: 48.56 } });
+    const list = listManualDrafts(db).items;
+    assert.equal(list.length, 2);
+    assert.equal(list[0].id, b.id, '最近更新在前');
+    assert.deepEqual(list[0].payload, { planName: '积分包', b2: 48.56 });
+
+    saveManualDraft(db, { id: a.id, draft: { planName: '积分包', b1: 41 } });
+    assert.equal(listManualDrafts(db).items.find((x) => x.id === a.id).payload.b1, 41);
+    const e404 = catchErr(() => saveManualDraft(db, { id: 9999, draft: {} }));
+    assert.equal(e404?.status, 404);
+
+    assert.deepEqual(deleteManualDraft(db, a.id), { deleted: 1 });
+    assert.equal(listManualDrafts(db).items.length, 1);
+    const e404b = catchErr(() => deleteManualDraft(db, a.id));
+    assert.equal(e404b?.status, 404);
+    const e400 = catchErr(() => deleteManualDraft(db, 0));
+    assert.equal(e400?.status, 400);
+
+    // 草稿操作不触碰快照表
+    assert.equal(snapshotRows(db).length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== 草稿身份唯一来源（fix-manual-entry-draft-and-pricing） =====
+ * 缺陷现场：前端首次「保持」提交的载荷自带 id: null，读回时用载荷覆盖行 id →
+ * 条目 id 变 null → 添加不删草稿 / 放弃删不掉 / 切条目自动保持变成新增。
+ * 契约：行 id 是唯一身份，载荷里的 id 键既不参与落库也不参与读取。
+ */
+
+test('手动录入·草稿身份：载荷带 id 被剥离，列表项 id 恒等于行 id', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    const created = saveManualDraft(db, { draft: { id: null, planName: '积分包', b1: 40 } });
+    const item = listManualDrafts(db).items[0];
+    assert.equal(item.id, created.id, '列表项 id 取行 id');
+    assert.ok(!Object.hasOwn(item.payload, 'id'), '载荷不应携带 id 键（首次保持写下的 id: null 必须被剥离）');
+    assert.equal(item.payload.planName, '积分包', '其余字段照常落库');
+
+    // 陈旧数字 id 同样被剥离；带行 id 的提交是原地覆盖，不新增行
+    saveManualDraft(db, { id: created.id, draft: { id: 9999, planName: '积分包', b2: 48.56 } });
+    const items = listManualDrafts(db).items;
+    assert.equal(items.length, 1, '覆盖更新不新增行');
+    assert.equal(items[0].id, created.id, '行 id 不被载荷里的陈旧值顶掉');
+    assert.ok(!Object.hasOwn(items[0].payload, 'id'), '覆盖写同样剥离 id');
+    assert.equal(items[0].payload.b2, 48.56);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== 添加落库与草稿删除的同事务语义 ===== */
+
+test('手动录入·添加与删草稿同事务：draftId 三态、缺省兼容与失败回滚', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    const draftsOf = () => listManualDrafts(db).items;
+
+    // ① 带合法 draftId：记录落库 + 草稿行同一事务删除
+    const d1 = saveManualDraft(db, { draft: { id: null, planName: '积分包', b1: 40 } });
+    const ok = createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1', draftId: d1.id }));
+    assert.equal(ok.draftDeleted, 1, '应删除 1 行草稿');
+    assert.equal(draftsOf().length, 0, '草稿行随记录一并消失');
+    assert.equal(snapshotRows(db).length, 1, '记录照常生成');
+
+    // ② draftId 指向不存在的行：不阻断落库（幂等）
+    const ghost = createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1', draftId: 99999 }));
+    assert.equal(ghost.draftDeleted, 0, '没删到行如实返回 0');
+    assert.equal(snapshotRows(db).length, 2);
+
+    // ③ draftId 非法：400（与 deleteManualDraft 同口径）
+    for (const bad of [0, -1, 'x']) {
+      const e = catchErr(() => createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1', draftId: bad })));
+      assert.equal(e?.status, 400, '非法 draftId 应 400：' + JSON.stringify(bad));
+    }
+    assert.equal(snapshotRows(db).length, 2, '非法 draftId 不产生记录');
+
+    // ④ 缺省 draftId：草稿表不被触碰
+    const d2 = saveManualDraft(db, { draft: { id: null, planName: '积分包', b1: 40 } });
+    const noDraftId = createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1' }));
+    assert.equal(noDraftId.draftDeleted, 0);
+    assert.equal(draftsOf().length, 1, '缺省 draftId 时草稿保持原样');
+    assert.equal(draftsOf()[0].id, d2.id);
+
+    // ⑤ 落库校验失败：事务回滚，草稿保留、记录不增
+    const snapshotsBefore = snapshotRows(db).length;
+    const e = catchErr(() => createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1', draftId: d2.id, b2: 40 })));
+    assert.equal(e?.code, 'NO_CHANGE');
+    assert.equal(snapshotRows(db).length, snapshotsBefore, '校验失败不写记录');
+    assert.equal(draftsOf().length, 1, '校验失败不删草稿');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== 等值价格的整窗单一单价兜底 =====
+ * 缺陷现场：未开启分时段计价的价格条目在窗口内不产生时段 → byTier 为空 →
+ * 四项金额只由 byTier 求和 → 恒为 0（且 partial=false 不报缺价）。
+ * 契约：窗口内无计价时段时按整窗单一单价计价，与统计版同口径。
+ */
+
+const FLAT_M1 = [{ model: 'm1', unit: 'K', inputHit: 2, inputMiss: 20, output: 100 }];
+
+test('手动录入·未开启分时段计价的模型照常计价（整窗单一单价兜底）', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db, FLAT_M1);
+    const { snapshot } = createManualSnapshot(db, manualPayload({
+      mode: 'model', model: 'm1', tokens: { hit: 230_560, miss: 54_440, output: 2_000 }
+    }));
+    const tc = snapshot.tokenCosts;
+    // 230.56K×2 + 54.44K×20 + 2K×100（单价按 K 计）
+    assert.deepEqual(tc.amounts, { hit: 461.12, miss: 1088.8, output: 200, total: 1749.92 });
+    assert.deepEqual(tc.byTier, [], '未开启分时段 → 不产出逐段明细');
+    assert.equal(tc.partial, false, '有价格不算缺价');
+    assert.deepEqual(tc.unpricedModels, []);
+
+    // 折算等价金额 = 单位成本 × 估算每月总量（与统计版同公式）
+    const row = snapshotRows(db)[0];
+    const unitCost = tc.amounts.total / (230_560 + 54_440 + 2_000);
+    assert.equal(row.equiv_cost_lo, Math.round(row.est_total_lo * unitCost * 100) / 100);
+    assert.equal(row.equiv_cost_hi, Math.round(row.est_total_hi * unitCost * 100) / 100);
+    assert.ok(row.equiv_cost_lo > 0, '折算等价金额不应为 0');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入·来源过滤与计数：source 筛选与统计记录互不干扰，基准比较同样可用', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    seedPointsPlan(db);
+    // 统计版记录（直插，模拟既有数据）：end_ms 为空 → 结束时间回退写入时刻
+    db.prepare(
+      `INSERT INTO quota_snapshots (created_ms, start_ms, mode, tokens_json,
+         plan_name, provider, price, limit_period, quota_text,
+         consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi)
+       VALUES (900, 500, 'total', '{"inputHit":10,"inputMiss":20,"output":5}', '积分包', '火山引擎', 50, 'month', '1000 积分/月', 1, 1, 1000, 1000)`
+    ).run();
+    const today = todayKey();
+    createManualSnapshot(db, manualPayload({ mode: 'model', model: 'm1', b1: 40, b2: 48.56 }));
+
+    const all = listQuotaSnapshots(db, {});
+    assert.equal(all.total, 2);
+    assert.deepEqual(all.sources, { manual: 1, estimate: 1 });
+    const manualOnly = listQuotaSnapshots(db, { source: 'manual' });
+    assert.equal(manualOnly.total, 1);
+    assert.equal(manualOnly.items[0].source, 'manual');
+    const estOnly = listQuotaSnapshots(db, { source: 'estimate' });
+    assert.equal(estOnly.total, 1);
+    assert.equal(estOnly.items[0].source, 'estimate');
+    assert.equal(estOnly.items[0].endTime, 900, '既有记录结束时间仍取写入时刻');
+    assert.equal(estOnly.items[0].readings, null);
+    // 来源筛选与其它条件叠加
+    assert.equal(listQuotaSnapshots(db, { source: 'estimate', provider: '火山引擎' }).total, 1);
+    assert.equal(listQuotaSnapshots(db, { source: 'manual', plan: '不存在' }).total, 0);
+
+    // 手动记录可标记基准并参与基准比较（与统计记录同一条链路）
+    const manualId = manualOnly.items[0].id;
+    saveBenchmarkGroup(db, { name: '手动补录' });
+    const g = listBenchmarkGroups(db).find((x) => x.name === '手动补录');
+    saveBenchmark(db, { groupId: g.id, name: '手动补录基准', description: '离线补录' });
+    bindSnapshotsBenchmark(db, [manualId], '手动补录基准');
+    const cmp = compareBenchmark(db, '手动补录基准');
+    assert.equal(cmp.recordCount, 1);
+    assert.equal(cmp.groups[0].planName, '积分包');
+    assert.equal(cmp.groups[0].model, 'm1');
+    assert.ok(cmp.groups[0].B > 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+/* ================= 手动录入与既有统计的隔离（铁律回归，spec: 手动录入与既有统计的隔离） ================= */
+
+/** 手动录入 SHALL NOT 触碰的表（沉淀保护 + 套餐配置 + 完成标记；完成标记是 maintenance_state 里的 kind） */
+const IRON_TABLES = [
+  'usage_records', 'file_index', 'reconcile_pending', 'usage_daily', 'usage_monthly', 'maintenance_state',
+  'cost_daily', 'cost_monthly', 'quota_presets',
+  'map_providers', 'map_provider_bindings', 'map_model_sources',
+  'plan_configs', 'plan_settings', 'plan_model_prices', 'plan_model_price_tiers',
+  'plan_quota_coefs', 'plan_quota_coef_tiers'
+];
+/** 整表逐行指纹（含 rowid 顺序；sqlite_sequence 之类的自增游标不在保护范围） */
+const dumpIronTables = (db) => Object.fromEntries(IRON_TABLES.map((t) => [
+  t, JSON.stringify(db.prepare('SELECT * FROM ' + t + ' ORDER BY rowid').all())
+]));
+
+test('铁律回归：一次手动录入（含草稿增删改）前后，用量 / 费用 / 汇总层 / 完成标记 / 预设 / 套餐配置逐行不变', () => {
+  const { root, db } = tempDb();
+  try {
+    seedMapping(db);
+    savePlanConfig(db, {
+      mapName: '火山引擎',
+      plans: [
+        { name: 'P', cycleDays: 31, monthlyFee: 99, quotaMode: 'percent' },
+        { name: 'P2', cycleDays: 31, monthlyFee: 199, quotaMode: 'percent' }
+      ],
+      currentPlan: 'P',
+      prices: [{ model: 'm1', unit: 'K', inputHit: 1, inputMiss: 4, output: 16 }]
+    });
+    savePlanQuotaCoefs(db, '火山引擎', [{ planName: 'P', model: 'm1', inHit: 1, inMiss: 1, out: 1 }]);
+    // 明细 + 汇总层 + 费用表 + 完成标记全部直插成有数据（避免「空表比空表」的假绿）。
+    // 刻意不走 runMaintenance：它会按真实 HOME 扫描各工具会话目录（既慢又依赖环境）。
+    insertRecord(db, { tsMs: atLocal('2026-03-05', '10:00'), localDate: '2026-03-05', inputOther: 100, cacheRead: 200, output: 50 });
+    insertRecord(db, { tsMs: atLocal('2026-03-05', '11:00'), localDate: '2026-03-05', inputOther: 10, cacheRead: 20, output: 5 });
+    db.prepare("INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('kimi','2026-03-05','volc','m1',110,220,0,55,2)").run();
+    db.prepare("INSERT INTO usage_monthly (tool, year, month, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('kimi',2026,3,'volc','m1',110,220,0,55,2)").run();
+    db.prepare("INSERT INTO cost_daily (tool, local_date, provider, model, cost, priced_tokens, unpriced_tokens) VALUES ('kimi','2026-03-05','volc','m1',1.23,385,0)").run();
+    db.prepare("INSERT INTO cost_monthly (tool, month, provider, model, cost, priced_tokens, unpriced_tokens) VALUES ('kimi','2026-03','volc','m1',1.23,385,0)").run();
+    db.prepare("INSERT INTO maintenance_state (kind, tool, period, done_at_ms, value) VALUES ('daily_done','kimi','2026-03-05',1,NULL)").run();
+    db.prepare("INSERT INTO maintenance_state (kind, tool, period, done_at_ms, value) VALUES ('monthly_done','kimi','2026-03',1,NULL)").run();
+    db.prepare("INSERT INTO file_index (tool, path, size, mtime_ms, content_hash, scanned_offset, scanned_lines) VALUES ('kimi','f-fixture',1,1,'h',0,1)").run();
+    // 预设：一条统计中（start_json 非空）、一条已停止并固化过基线
+    const running = mkPreset(db, { mapName: '火山引擎', planName: 'P', officialUsed: 40 });
+    startQuotaPreset(db, running.id);
+    const stopped = mkPreset(db, { mapName: '火山引擎', planName: 'P2', officialUsed: 12 });
+    startQuotaPreset(db, stopped.id);
+    stopQuotaPreset(db, stopped.id, 20, { refresh: () => {} });
+
+    const before = dumpIronTables(db);
+    for (const t of ['usage_records', 'usage_daily', 'cost_daily', 'maintenance_state', 'quota_presets']) {
+      assert.ok(JSON.parse(before[t]).length > 0, '前置数据应存在：' + t);
+    }
+    const snapshotsBefore = snapshotRows(db);
+
+    // ---- 被测行为：两条手动录入 + 草稿新建 / 覆盖 / 删除 ----
+    const model = createManualSnapshot(db, {
+      startMs: atLocal('2026-03-05', '10:00'), endMs: atLocal('2026-03-05', '20:00'),
+      mapName: '火山引擎', planName: 'P', mode: 'model', model: 'm1',
+      remainingMode: false, b1: 40, b2: 48.56,
+      tokens: { hit: 2000, miss: 1000, output: 500 }, note: '铁律回归'
+    });
+    createManualSnapshot(db, {
+      startMs: atLocal('2026-03-05', '08:00'), endMs: atLocal('2026-03-05', '12:00'),
+      mapName: '火山引擎', planName: 'P', mode: 'total',
+      remainingMode: false, b1: 10, b2: 15.5, tokens: { hit: 800, miss: 400, output: 200 }
+    });
+    const draft = saveManualDraft(db, { mapName: '火山引擎', planName: 'P', b1: 1 });
+    saveManualDraft(db, { id: draft.id, mapName: '火山引擎', planName: 'P2', b1: 2 });
+    deleteManualDraft(db, draft.id);
+
+    // ---- 断言：受保护表逐行不变 ----
+    const after = dumpIronTables(db);
+    for (const t of IRON_TABLES) assert.equal(after[t], before[t], '受保护表应逐行不变：' + t);
+    assert.equal(presetRow(db, running.id).status, 'running', '统计中的预设不受影响');
+    assert.equal(presetRow(db, stopped.id).official_used, 20, '已停止预设的基线读数不受影响');
+    // 快照表：既有 estimate 行原样，只多出两条 manual 行
+    const snapshotsAfter = snapshotRows(db);
+    assert.equal(snapshotsAfter.length, snapshotsBefore.length + 2, '只应新增两条手动录入快照');
+    assert.deepEqual(snapshotsAfter.slice(0, snapshotsBefore.length), snapshotsBefore, '既有快照行应逐列不变');
+    assert.deepEqual(snapshotsAfter.slice(-2).map((r) => r.source), ['manual', 'manual']);
+    assert.equal(model.snapshot.source, 'manual');
+    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM quota_manual_drafts').get().n, 0, '草稿删净');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

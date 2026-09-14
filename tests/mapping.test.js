@@ -145,6 +145,33 @@ test('applyMappings + matchFilter：map:/tool|/裸名三种筛选编码，同名
   });
 });
 
+test('matchFilter 多选：维度内任一命中（OR）、跨维度交集（AND）、空值等效不筛选', () => {
+  withDb((db) => {
+    seed(db);
+    seedMappings(db);
+    const maps = loadMappings(db);
+    const rows = applyMappings(
+      db.prepare('SELECT tool, provider, model, input_other, cache_read, cache_creation, output FROM usage_daily').all(),
+      maps, true
+    );
+    // 提供商多值：map: 与裸名混合编码任一命中（DeepSeek 两行 + volc 一行）
+    assert.equal(rows.filter((r) => matchFilter(r, ['map:DeepSeek', 'volc'], null)).length, 3);
+    // 模型多值任一命中（GLM 两行 + ark 一行）
+    assert.equal(rows.filter((r) => matchFilter(r, null, ['GLM-5.3-Flash', 'ark-code-latest'])).length, 3);
+    // 跨维度 AND：提供商集合 × 模型集合取交集（智谱∩GLM 两行 + volc∩ark 一行）
+    assert.equal(
+      rows.filter((r) => matchFilter(r, ['map:智谱', 'volc'], ['GLM-5.3-Flash', 'ark-code-latest'])).length, 3
+    );
+    // AND 无交集：DeepSeek 名下没有 GLM
+    assert.equal(rows.filter((r) => matchFilter(r, ['map:DeepSeek'], ['GLM-5.3-Flash'])).length, 0);
+    // 空数组 / 全空串等效不筛选
+    assert.equal(rows.filter((r) => matchFilter(r, [], [])).length, rows.length);
+    assert.equal(rows.filter((r) => matchFilter(r, [''], [''])).length, rows.length);
+    // tool| 编码多值锁定原始归属
+    assert.equal(rows.filter((r) => matchFilter(r, ['kimi|deepseek', 'zcode|b67e45e8-886d'], null)).length, 2);
+  });
+});
+
 test('删除映射恢复原始显示；开关持久化；候选携带 boundBy', () => {
   withDb((db) => {
     seed(db);

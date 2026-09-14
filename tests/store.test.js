@@ -958,8 +958,10 @@ test('schema v12：v11 存量库补三配置表排序/分组列，sort_order 按
   try {
     const dbPath = join(root, 'statistic.db');
     // 构造 v11 形态的三张配置表（无 v12 列），行按将来 rowid 序故意交错插入
+    // （app_settings 自 v3 即存在，真实 v11 库必有 —— v19 迁移要写 hourly_since 水位）
     const raw = new DatabaseSync(dbPath);
     raw.exec(`
+      CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE map_providers (name TEXT PRIMARY KEY);
       CREATE TABLE plan_configs (map_name TEXT PRIMARY KEY, current_plan TEXT);
       CREATE TABLE model_cost_templates (
@@ -1471,6 +1473,212 @@ test('schema v17：v16 存量库递进到 v17——历史快照 note 为 NULL、
     assert.equal(again.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
     const cols2 = again.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
     assert.equal(cols2.filter((c) => c === 'note').length, 1);
+    again.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== schema v18（manual-quota-snapshot）：快照来源 / 窗口结束时间 / 官方读数三列 + 手动录入草稿表 ===== */
+
+test('schema v18：全新库快照表带 source / end_ms / readings_json 三列，且草稿表齐备', () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, 'statistic.db'));
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const snapCols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    for (const col of ['source', 'end_ms', 'readings_json']) {
+      assert.ok(snapCols.includes(col), 'quota_snapshots 应含 ' + col + ' 列');
+    }
+    const draft = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quota_manual_drafts'").get();
+    assert.ok(draft, '应存在 quota_manual_drafts 表');
+    // 统计流程（不含来源列）写入的快照：source 取默认值 'estimate'，另两列为 NULL
+    db.prepare(
+      `INSERT INTO quota_snapshots (created_ms, start_ms, mode, tokens_json,
+         plan_name, provider, price, quota_text, consume_pct_lo, consume_pct_hi,
+         est_total_lo, est_total_hi)
+       VALUES (1000, 500, 'total', '{"inputHit":10,"inputMiss":20,"output":5}', '套餐A', '火山引擎', 200, '100%/月', 0.1, 0.1, 1000, 1000)`
+    ).run();
+    const row = db.prepare('SELECT source, end_ms, readings_json FROM quota_snapshots').get();
+    assert.equal(row.source, 'estimate');
+    assert.equal(row.end_ms, null);
+    assert.equal(row.readings_json, null);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schema v18：v17 存量库递进——历史快照 source 回填 estimate、另两列 NULL、既有字段逐行不变、幂等', () => {
+  const root = makeRoot();
+  try {
+    const dbPath = join(root, 'statistic.db');
+    // 先用当前代码建库并写入快照样本，再降级为 v17 形态（无 v18 三列、无草稿表）
+    const db = openDb(dbPath);
+    db.prepare(
+      `INSERT INTO quota_snapshots (created_ms, start_ms, mode, model, tokens_json,
+         plan_name, provider, price, limit_period, quota_text,
+         consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+         token_costs_json, eval_json, benchmark_json, note)
+       VALUES (1000, 500, 'total', NULL, '{"inputHit":10,"inputMiss":20,"output":5}',
+         '套餐A', '火山引擎', 200, 'month', '100%/月', 0.1, 0.1, 1000, 1000, NULL, NULL,
+         '{"currency":"CNY"}', '{"v":2}', '{"name":"基准一","desc":"说明"}', '历史备注')`
+    ).run();
+    db.close();
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      DROP TABLE IF EXISTS quota_manual_drafts;
+      CREATE TABLE quota_snapshots_v17 (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        preset_id      INTEGER,
+        created_ms     INTEGER NOT NULL,
+        start_ms       INTEGER NOT NULL,
+        mode           TEXT NOT NULL,
+        model          TEXT,
+        tokens_json    TEXT NOT NULL,
+        plan_name      TEXT NOT NULL,
+        provider       TEXT NOT NULL,
+        price          REAL NOT NULL,
+        limit_period   TEXT,
+        quota_text     TEXT NOT NULL,
+        consume_pct_lo REAL NOT NULL,
+        consume_pct_hi REAL NOT NULL,
+        est_total_lo   REAL NOT NULL,
+        est_total_hi   REAL NOT NULL,
+        equiv_cost_lo  REAL,
+        equiv_cost_hi  REAL,
+        token_costs_json TEXT,
+        eval_json TEXT,
+        benchmark_json TEXT,
+        note TEXT
+      );
+      INSERT INTO quota_snapshots_v17 (preset_id, created_ms, start_ms, mode, model, tokens_json,
+        plan_name, provider, price, limit_period, quota_text,
+        consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+        token_costs_json, eval_json, benchmark_json, note)
+        SELECT preset_id, created_ms, start_ms, mode, model, tokens_json,
+          plan_name, provider, price, limit_period, quota_text,
+          consume_pct_lo, consume_pct_hi, est_total_lo, est_total_hi, equiv_cost_lo, equiv_cost_hi,
+          token_costs_json, eval_json, benchmark_json, note
+        FROM quota_snapshots;
+      DROP TABLE quota_snapshots;
+      ALTER TABLE quota_snapshots_v17 RENAME TO quota_snapshots;
+      PRAGMA user_version = 17;
+    `);
+    raw.close();
+
+    const migrated = openDb(dbPath);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols = migrated.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    for (const col of ['source', 'end_ms', 'readings_json']) assert.ok(cols.includes(col));
+    assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'quota_manual_drafts'").get());
+    const row = migrated.prepare(`SELECT id, plan_name, tokens_json, token_costs_json, eval_json,
+      benchmark_json, note, source, end_ms, readings_json FROM quota_snapshots`).get();
+    // 来源列回填为额度统计（语义与升级前一致），窗口结束时间与读数为空
+    assert.equal(row.source, 'estimate');
+    assert.equal(row.end_ms, null);
+    assert.equal(row.readings_json, null);
+    // 既有字段逐行不变（含 v11 / v13 / v16 / v17 引入的列）
+    assert.equal(row.plan_name, '套餐A');
+    assert.equal(row.tokens_json, '{"inputHit":10,"inputMiss":20,"output":5}');
+    assert.equal(row.token_costs_json, '{"currency":"CNY"}');
+    assert.equal(row.eval_json, '{"v":2}');
+    assert.equal(row.benchmark_json, '{"name":"基准一","desc":"说明"}');
+    assert.equal(row.note, '历史备注');
+    migrated.close();
+
+    // 幂等：再开不再变化（不重复加列、草稿表仍在且只有一张）
+    const again = openDb(dbPath);
+    assert.equal(again.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols2 = again.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+    assert.equal(cols2.filter((c) => c === 'source').length, 1);
+    assert.equal(cols2.filter((c) => c === 'end_ms').length, 1);
+    assert.equal(cols2.filter((c) => c === 'readings_json').length, 1);
+    const drafts = again.prepare("SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'table' AND name = 'quota_manual_drafts'").get();
+    assert.equal(drafts.c, 1);
+    again.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== schema v19（hourly-archive-drilldown）：每小时汇总表 + 小时沉淀水位 ===== */
+
+test('schema v19：全新库建 usage_hourly 表与索引，hourly_since 写入当日，清空路径不触碰水位', () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, 'statistic.db'));
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    // 表结构与索引齐备
+    const hourlyCols = db.prepare('PRAGMA table_info(usage_hourly)').all().map((c) => c.name);
+    for (const col of ['tool', 'local_date', 'hour', 'provider', 'model',
+      'input_other', 'cache_read', 'cache_creation', 'output', 'turn_count']) {
+      assert.ok(hourlyCols.includes(col), 'usage_hourly 应含 ' + col + ' 列');
+    }
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_hourly_tool_date'").get();
+    assert.ok(idx, '应存在 idx_hourly_tool_date 索引');
+    // 水位写入当日
+    const since = db.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get().value;
+    assert.match(since, /^\d{4}-\d{2}-\d{2}$/);
+
+    // 写入业务数据后 clearAllData：usage_hourly 清空、水位仍在
+    db.prepare(
+      "INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('kimi', '2026-09-02', 9, 'p', 'm', 1, 2, 0, 3, 1)"
+    ).run();
+    clearAllData(db);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly').get().c, 0);
+    assert.equal(db.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get().value, since);
+    // clearToolData 同样清小时行、不动水位
+    db.prepare(
+      "INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('zcode', '2026-09-02', 9, 'p', 'm', 1, 2, 0, 3, 1)"
+    ).run();
+    clearToolData(db, 'zcode');
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly').get().c, 0);
+    assert.equal(db.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get().value, since);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schema v19：v18 存量库递进建表写水位（幂等，值不变），存量数据无损', () => {
+  const root = makeRoot();
+  try {
+    const dbPath = join(root, 'statistic.db');
+    // 先用当前代码建库写样本，再降级为 v18 形态（无 usage_hourly、无 hourly_since）
+    const db = openDb(dbPath);
+    db.prepare(
+      `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', '2026-09-02', 'p', 'm', 10, 100, 0, 20, 2)`
+    ).run();
+    db.close();
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      DROP TABLE usage_hourly;
+      DELETE FROM app_settings WHERE key = 'hourly_since';
+      PRAGMA user_version = 18;
+    `);
+    raw.close();
+
+    // 首次迁移：建表 + 写水位（当日）
+    const migrated = openDb(dbPath);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const idx = migrated.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_hourly_tool_date'").get();
+    assert.ok(idx);
+    const since1 = migrated.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get().value;
+    assert.match(since1, /^\d{4}-\d{2}-\d{2}$/);
+    const daily = migrated.prepare('SELECT input_other FROM usage_daily').get();
+    assert.equal(daily.input_other, 10); // 存量无损
+    migrated.close();
+
+    // 幂等：改小水位后再次打开（迁移重跑路径），水位不被改写
+    const lower = new DatabaseSync(dbPath);
+    lower.exec("UPDATE app_settings SET value = '2020-01-01' WHERE key = 'hourly_since'; PRAGMA user_version = 18;");
+    lower.close();
+    const again = openDb(dbPath);
+    const since2 = again.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get().value;
+    assert.equal(since2, '2020-01-01'); // INSERT OR IGNORE：已有值不动
     again.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -1,5 +1,6 @@
 /**
- * dsh（DeepSeek Harness）平台适配器：只读扫描 ~/.dsh/sessions 下各会话目录的 session.jsonl[.zstd]
+ * dsh（DeepSeek Harness）平台适配器：只读扫描 ~/.dsh/sessions 下各会话目录的会话日志
+ * （session.jsonl[.zstd] 旧格式与 session.v3.jsonl[.zstd] v3 格式，见 add-dsh-v3-session-support）
  * 逐调用用量。（变更 dsh-scan-adapter；口径权威依据 docs/reports/2026-09-07-dsh-scan-adapter-feasibility.md）
  * 口径：
  *  - 只认 assistant/message 事件（会话日志唯一携带 usage 的事件，全库 2267 条实测无第二来源）；
@@ -9,9 +10,9 @@
  *    reasoningTokens 为信息性字段（dsh 四桶互斥总和不含），不另计
  *  - 降级声明：标题生成等不产生 assistant/message 的辅助 LLM 调用不计数，相对账单轻微低估；
  *    缓存写入统计恒 0 为数据源缺失，非程序缺陷
- *  - 会话目录枚举：判据为「目录内存在 session.jsonl / session.jsonl.zstd」，不看目录名
- *    （顶层会话目录 `session-<id>`、子代理会话目录为裸 `<id>`）；子代理会话用量同等收录，
- *    与顶层会话明细并行累积（变更 fix-dsh-subagent-scan-gap）
+ *  - 会话目录枚举：判据为「目录内存在会话日志文件（旧格式 session.jsonl[.zstd] / v3 格式
+ *    session.v3.jsonl[.zstd]）」，不看目录名（顶层会话目录 `session-<id>`、子代理会话目录为
+ *    裸 `<id>`）；子代理会话用量同等收录，与顶层会话明细并行累积（变更 fix-dsh-subagent-scan-gap）
  *  - 模型/提供商行序归因：取事件之前最近一次 request/header 的 config.provider / config.model
  *    原值（dsh 官方 UI findLast 折叠同语义；header 仅首录+配置变化补录，每会话 1–4 条）；
  *    header 前事件记 'unknown' 哨兵（明细两列 NOT NULL，不得写 SQL NULL；对齐 zcode/ccsclaude
@@ -152,7 +153,14 @@ function readdirSafe(dir) {
  * `origin:"subagent"` / `parentSession` / `delegationDepth:1`）——按名前缀筛选会整份漏扫
  * 子代理会话（变更 fix-dsh-subagent-scan-gap；实测损失见
  * docs/reports/2026-09-12-deepseek-snapshot-reconciliation.md）。
- * 同一部署单一物理编码（dsh logSuffix 配置二选一）；万一并存取 .zstd 终态，防双算。 */
+ * 同一部署单一物理编码（dsh logSuffix 配置二选一）；万一并存取 .zstd 终态，防双算。
+ * v3 会话日志（add-dsh-v3-session-support）：dsh 升级后新会话出生即写 `session.v3.jsonl[.zstd]`
+ * （会话头 version:3，容器与事件结构与旧格式兼容），升级时在途会话被整份重写为 v3、旧文件
+ * 留在原地（内容等价、v3 mtime 更新）——同一目录按代际优先单选终态文件（v3 > 旧格式，同代际
+ * 取 .zstd），被弃选文件不进枚举，由 scanSessions 既有「消失文件清理」路径删除其明细与水位，
+ * 切换不双算。 */
+const SESSION_LOG_CANDIDATES = ['session.v3.jsonl.zstd', 'session.v3.jsonl', 'session.jsonl.zstd', 'session.jsonl'];
+
 export function listSessionFiles(sessionsRoot) {
   const files = [];
   if (!existsSync(sessionsRoot)) return files;
@@ -160,9 +168,11 @@ export function listSessionFiles(sessionsRoot) {
     const projectDir = join(sessionsRoot, project);
     for (const session of readdirSafe(projectDir)) {
       const dir = join(projectDir, session);
-      const zstdPath = join(dir, 'session.jsonl.zstd');
-      const plainPath = join(dir, 'session.jsonl');
-      const pick = existsSync(zstdPath) ? zstdPath : existsSync(plainPath) ? plainPath : null;
+      let pick = null;
+      for (const name of SESSION_LOG_CANDIDATES) {
+        const candidate = join(dir, name);
+        if (existsSync(candidate)) { pick = candidate; break; }
+      }
       if (!pick) continue;
       try {
         if (!statSync(pick).isFile()) continue;

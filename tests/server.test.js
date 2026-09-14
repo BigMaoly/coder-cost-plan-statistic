@@ -159,6 +159,65 @@ test('分布查询：按月查询年视图月柱分布', async () => {
   }
 });
 
+test('分布查询：year + month_from/month_to 月区间合并，缺省全年向后兼容', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const ins = insertMonthly(db);
+    ins.run(2026, 1, 'volc', 'glm-latest', 1, 10, 0, 5);    // 总计 16
+    ins.run(2026, 6, 'volc', 'glm-latest', 2, 20, 0, 10);   // 总计 32
+    ins.run(2026, 12, 'kimi-code', 'kimi-for-coding', 4, 40, 0, 8); // 总计 52
+
+    // 缺省 = 全年（向后兼容：三行合并，kimi 52 > volc 48）
+    const full = await call(handle, '/api/breakdown?year=2026');
+    assert.equal(full.status, 200);
+    assert.equal(full.body.providers.length, 2);
+    assert.equal(full.body.providers[0].provider, 'kimi-code');
+
+    // 月区间 1–6：仅 volc（16 + 32 = 48），12 月不并入
+    const range = await call(handle, '/api/breakdown?year=2026&month_from=1&month_to=6');
+    assert.equal(range.status, 200);
+    assert.equal(range.body.providers.length, 1);
+    assert.equal(range.body.providers[0].provider, 'volc');
+    assert.equal(range.body.providers[0].total, 48);
+
+    // 单月闭区间
+    const dec = await call(handle, '/api/breakdown?year=2026&month_from=12&month_to=12');
+    assert.equal(dec.status, 200);
+    assert.equal(dec.body.providers.length, 1);
+    assert.equal(dec.body.providers[0].provider, 'kimi-code');
+
+    // 区间内无数据 → 空 providers 不报错
+    const empty = await call(handle, '/api/breakdown?year=2026&month_from=2&month_to=5');
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.body.providers, []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('分布查询：month_from/month_to 非法参数返回 400 中文错误', async () => {
+  const { root, handle } = makeApp();
+  try {
+    const noYear = await call(handle, '/api/breakdown?month_from=1&month_to=6');
+    assert.equal(noYear.status, 400);
+    assert.match(noYear.body.error, /year/);
+    const reversed = await call(handle, '/api/breakdown?year=2026&month_from=8&month_to=3');
+    assert.equal(reversed.status, 400);
+    assert.match(reversed.body.error, /month_from/);
+    const outOfRange = await call(handle, '/api/breakdown?year=2026&month_from=0&month_to=13');
+    assert.equal(outOfRange.status, 400);
+    const nonInt = await call(handle, '/api/breakdown?year=2026&month_from=1.5&month_to=6');
+    assert.equal(nonInt.status, 400);
+    const half = await call(handle, '/api/breakdown?year=2026&month_from=1');
+    assert.equal(half.status, 400);
+    // 月区间只配合 year：date 模式携带月区间 → 400
+    const withDate = await call(handle, '/api/breakdown?date=2026-09-01&month_from=1&month_to=6');
+    assert.equal(withDate.status, 400);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('分布查询：空时段返回空数组 200，不报错', async () => {
   const { root, handle } = makeApp();
   try {
@@ -261,6 +320,134 @@ test('分布查询：all 视图同名提供商按 (tool, provider) 拆分并消�
     const kimiOnly = await call(handle, '/api/breakdown?date=' + day);
     assert.equal(kimiOnly.body.providers.length, 2);
     assert.deepEqual(kimiOnly.body.providers.map((p) => p.label), ['deepseek', 'volc']);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---- 多选筛选（multi-select-filters-and-filtered-drilldown）----
+
+test('breakdown 筛选下钻：provider 收窄一级、provider+model 收窄两级、无命中空数组', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const day = '2026-09-01';
+    const insK = insertDaily(db, 'kimi');
+    insK.run(day, 'kimi-code', 'k3', 0, 50, 0, 10);                // 总计 60
+    insK.run(day, 'kimi-code', 'kimi-for-coding', 10, 100, 0, 20); // 总计 130
+    insK.run(day, 'deepseek', 'deepseek-v4-flash', 1, 2, 0, 3);    // 总计 6
+
+    // 单提供商筛选：一级仅一个提供商，models 为该提供商全部模型
+    const one = await call(handle, `/api/breakdown?date=${day}&tool=kimi&provider=deepseek`);
+    assert.equal(one.status, 200);
+    assert.equal(one.body.providers.length, 1);
+    assert.equal(one.body.providers[0].provider, 'deepseek');
+    assert.equal(one.body.providers[0].total, 6);
+    assert.deepEqual(one.body.providers[0].models.map((m) => m.model), ['deepseek-v4-flash']);
+
+    // 提供商 + 模型同时筛选：两级同时收窄
+    const two = await call(handle, `/api/breakdown?date=${day}&tool=kimi&provider=kimi-code&model=k3`);
+    assert.equal(two.status, 200);
+    assert.equal(two.body.providers.length, 1);
+    assert.deepEqual(two.body.providers[0].models.map((m) => m.model), ['k3']);
+    assert.equal(two.body.providers[0].total, 60);
+
+    // 模型多值任一命中
+    const multiModel = await call(handle, `/api/breakdown?date=${day}&tool=kimi&provider=kimi-code&model=k3&model=kimi-for-coding`);
+    assert.equal(multiModel.body.providers[0].models.length, 2);
+
+    // 交集无命中：deepseek 名下没有 k3 → 空 providers 200 不报错
+    const none = await call(handle, `/api/breakdown?date=${day}&tool=kimi&provider=deepseek&model=k3`);
+    assert.equal(none.status, 200);
+    assert.deepEqual(none.body.providers, []);
+
+    // 缺省（不传 provider/model）向后兼容：全部提供商
+    const plain = await call(handle, `/api/breakdown?date=${day}&tool=kimi`);
+    assert.equal(plain.body.providers.length, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('breakdown 平台子集与映射：tool 多值合并 + map: 筛选跨工具汇总', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const day = '2026-09-01';
+    const insK = insertDaily(db, 'kimi');
+    const insZ = insertDaily(db, 'zcode');
+    insK.run(day, 'deepseek', 'deepseek-v4-flash', 1, 2, 0, 3); // 6
+    insZ.run(day, 'deepseek', 'deepseek-v4-flash', 2, 4, 0, 6); // 12
+    insK.run(day, 'kimi-code', 'k3', 0, 50, 0, 10);             // 60
+    saveMapping(db, {
+      name: 'DeepSeek',
+      bindings: [{ tool: 'kimi', provider: 'deepseek' }, { tool: 'zcode', provider: 'deepseek' }],
+      modelMaps: []
+    });
+
+    // 平台子集（kimi+zcode）：映射统一名跨工具合并为一个条目
+    const subset = await call(handle, `/api/breakdown?date=${day}&tool=kimi&tool=zcode`);
+    assert.equal(subset.status, 200);
+    assert.equal(subset.body.providers.length, 2);
+    assert.equal(subset.body.providers[0].provider, 'kimi-code'); // 60 > 18
+    const ds = subset.body.providers.find((p) => p.provider === 'DeepSeek');
+    assert.equal(ds.total, 18); // 6 + 12 跨工具合并
+    assert.equal(ds.tool, null); // 映射条目无工具归属
+
+    // map: 筛选命中统一名：一级仅 DeepSeek 一个提供商（跨工具汇总）
+    const mapped = await call(handle, `/api/breakdown?date=${day}&tool=kimi&tool=zcode&provider=${encodeURIComponent('map:DeepSeek')}`);
+    assert.equal(mapped.status, 200);
+    assert.equal(mapped.body.providers.length, 1);
+    assert.equal(mapped.body.providers[0].provider, 'DeepSeek');
+    assert.equal(mapped.body.providers[0].total, 18);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('stats/today/filter-options：平台子集合并、provider 多值、all 混用 400、子集编码', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const day = localDateAddDays(todayKey(), -1); // 窗口内（D-1）
+    const insK = insertDaily(db, 'kimi');
+    const insZ = insertDaily(db, 'zcode');
+    insK.run(day, 'p1', 'm1', 10, 100, 0, 20); // kimi p1：input 110
+    insZ.run(day, 'p2', 'm2', 5, 50, 0, 10);   // zcode p2：input 55
+
+    // 平台子集合并（介于单平台与 all 之间）；单平台不受影响（向后兼容）
+    const subset = await call(handle, '/api/stats?range=7d&tool=kimi&tool=zcode');
+    assert.equal(subset.status, 200);
+    assert.equal(subset.body.totals.input, 165);
+    const single = await call(handle, '/api/stats?range=7d&tool=zcode');
+    assert.equal(single.body.totals.input, 55);
+
+    // provider 多值任一命中（tool| 编码混合）
+    const multi = await call(handle, '/api/stats?range=7d&tool=all&provider=' + encodeURIComponent('kimi|p1') + '&provider=' + encodeURIComponent('zcode|p2'));
+    assert.equal(multi.body.totals.input, 165);
+    // 多值仅命中其一
+    const pinned = await call(handle, '/api/stats?range=7d&tool=all&provider=' + encodeURIComponent('zcode|p2'));
+    assert.equal(pinned.body.totals.input, 55);
+
+    // all 与具体平台混用 → 400 中文错误
+    const mixed = await call(handle, '/api/stats?range=7d&tool=all&tool=kimi');
+    assert.equal(mixed.status, 400);
+    assert.match(mixed.body.error, /tool/);
+
+    // 今日聚合跟随平台子集
+    const today = todayKey();
+    insertRecord(db, 'zcode').run('f1', 1, 'm2', 'p2', 0, today, 3, 30, 0, 6);
+    const todaySubset = await call(handle, '/api/today?tool=kimi&tool=zcode');
+    assert.equal(todaySubset.status, 200);
+    assert.equal(todaySubset.body.input, 33);
+    const todaySingle = await call(handle, '/api/today?tool=kimi');
+    assert.equal(todaySingle.status, 200);
+    assert.equal(todaySingle.body.input, 0);
+    const todayMixed = await call(handle, '/api/today?tool=all&tool=kimi');
+    assert.equal(todayMixed.status, 400);
+
+    // filter-options：子集（≥2 平台）→ tool|provider 编码；单平台 → 裸名
+    const optsSubset = await call(handle, '/api/filter-options?range=7d&tool=kimi&tool=zcode');
+    assert.deepEqual(optsSubset.body.providers.map((p) => p.value).sort(), ['kimi|p1', 'zcode|p2']);
+    const optsSingle = await call(handle, '/api/filter-options?range=7d&tool=zcode');
+    assert.deepEqual(optsSingle.body.providers.map((p) => p.value), ['p2']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2004,6 +2191,347 @@ test('基准比较 API：GET /api/quota/benchmarks/compare（200 结果形状 / 
     const allIds = (await call(handle, '/api/quota/benchmarks')).body.groups[0].list.map((b) => b.id);
     res = await callBody(handle, 'PUT', '/api/quota/benchmarks/order', { groupId: gA, ids: [allIds[1], allIds[0]] });
     assert.equal(res.status, 200); // 组内全量置换重排照常（新增 GET compare 分支未拦截 PUT）
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== 手动录入 API（manual-quota-snapshot）：落库路由 / 草稿 CRUD / 来源筛选 ===== */
+
+function seedManualPlan(db) {
+  saveMapping(db, {
+    name: '火山引擎',
+    bindings: [{ tool: 'kimi', provider: 'volc' }],
+    modelMaps: [{ name: 'm1', sources: [{ tool: 'kimi', provider: 'volc', model: 'm1' }] }]
+  });
+  savePlanConfig(db, {
+    mapName: '火山引擎',
+    plans: [{ name: '积分包', cycleDays: 30, monthlyFee: 50, quotaMode: 'points', limitPeriod: 'month', totalPoints: 1000 }],
+    currentPlan: '积分包',
+    prices: []
+  });
+}
+
+function manualBody(over = {}) {
+  const today = todayKey();
+  return {
+    startMs: new Date(today + 'T10:00:00').getTime(),
+    endMs: new Date(today + 'T11:00:00').getTime(),
+    mapName: '火山引擎',
+    planName: '积分包',
+    mode: 'total',
+    tokens: { hit: 200000, miss: 4000000, output: 88000 },
+    remainingMode: false,
+    b1: 40,
+    b2: 48.56,
+    ...over
+  };
+}
+
+test('手动录入 API：POST /api/quota/snapshots/manual 落库 200，缺项 / 读数异常 400（含 code）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    seedManualPlan(db);
+    const ok = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ note: 'API 测试' }));
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.ok, true);
+    assert.equal(ok.body.snapshot.source, 'manual');
+    assert.equal(ok.body.snapshot.planName, '积分包');
+    assert.equal(ok.body.snapshot.consumePctLo, 0.86);
+    assert.equal(ok.body.snapshot.endMs, manualBody().endMs);
+
+    const miss = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ planName: undefined }));
+    assert.equal(miss.status, 400);
+    assert.match(miss.body.error, /请选择提供商与套餐/);
+
+    const noChange = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ b2: 40 }));
+    assert.equal(noChange.status, 400);
+    assert.equal(noChange.body.code, 'NO_CHANGE');
+
+    const decrease = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ b2: 30 }));
+    assert.equal(decrease.status, 400);
+    assert.equal(decrease.body.code, 'DECREASE');
+
+    // 只有一次成功落库
+    const list = await call(handle, '/api/quota/snapshots');
+    assert.equal(list.body.total, 1);
+    assert.equal(list.body.items[0].note, 'API 测试');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入 API：草稿 CRUD（PUT 新建 / PUT 覆盖 / GET 列表 / DELETE 删除与 404）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    seedManualPlan(db);
+    const created = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { draft: { planName: '积分包', b1: 40 } });
+    assert.equal(created.status, 200);
+    const id = created.body.id;
+    assert.ok(id > 0);
+
+    const updated = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { id, draft: { planName: '积分包', b2: 48.56 } });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.id, id);
+
+    const list = await call(handle, '/api/quota/manual-drafts');
+    assert.equal(list.status, 200);
+    assert.equal(list.body.items.length, 1);
+    assert.deepEqual(list.body.items[0].payload, { planName: '积分包', b2: 48.56 });
+
+    // 缺陷回归（fix-manual-entry-draft-and-pricing）：载荷自带 id（前端 state.draft 整包提交）
+    // 时，列表项 id 必须仍取行 id —— 否则前端选中的条目 id 变 null，添加不删草稿、放弃删不掉。
+    const withId = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { draft: { id: null, planName: '积分包', b1: 41 } });
+    assert.equal(withId.status, 200);
+    const idList = await call(handle, '/api/quota/manual-drafts');
+    const itemWithId = idList.body.items.find((x) => x.id === withId.body.id);
+    assert.ok(itemWithId, '列表项 id 应等于行 id（不被载荷里的 id 顶掉）');
+    assert.ok(!Object.hasOwn(itemWithId.payload, 'id'), '落库载荷不应携带保留键 id');
+    assert.equal(idList.body.items.length, 2, '新增一条草稿');
+    // 二次 PUT 带行 id → 原地覆盖，不新增（对应「切条目自动保持」不得凭空多一条）
+    const overwrite = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { id: withId.body.id, draft: { id: withId.body.id, planName: '积分包', b2: 48.56 } });
+    assert.equal(overwrite.status, 200);
+    assert.equal(overwrite.body.id, withId.body.id);
+    assert.equal((await call(handle, '/api/quota/manual-drafts')).body.items.length, 2, '覆盖更新不新增行');
+
+    const del = await callBody(handle, 'DELETE', '/api/quota/manual-drafts', { id });
+    assert.equal(del.status, 200);
+    assert.equal(del.body.deleted, 1);
+    const del404 = await callBody(handle, 'DELETE', '/api/quota/manual-drafts', { id });
+    assert.equal(del404.status, 404);
+    const put404 = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { id: 9999, draft: {} });
+    assert.equal(put404.status, 404);
+
+    // 草稿不产生任何快照
+    const snaps = await call(handle, '/api/quota/snapshots');
+    assert.equal(snaps.body.total, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入 API：POST 携带 draftId 的三态（删到 / 没删到 / 非法 / 缺省）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    seedManualPlan(db);
+    // ① 删到：记录落库 + 草稿行同一事务删除
+    const draft = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { draft: { id: null, planName: '积分包', b1: 40 } });
+    const ok = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ draftId: draft.body.id }));
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.draftDeleted, 1);
+    assert.equal(ok.body.snapshot.source, 'manual');
+    assert.equal((await call(handle, '/api/quota/manual-drafts')).body.items.length, 0, '草稿行随记录一并消失');
+    assert.equal((await call(handle, '/api/quota/snapshots')).body.total, 1);
+
+    // ② 没删到：草稿行不存在不阻断落库（幂等）
+    const ghost = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ draftId: 99999 }));
+    assert.equal(ghost.status, 200);
+    assert.equal(ghost.body.draftDeleted, 0);
+    assert.equal((await call(handle, '/api/quota/snapshots')).body.total, 2);
+
+    // ③ 非法 draftId：400（与 DELETE 同口径），不产生记录
+    const bad = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody({ draftId: 0 }));
+    assert.equal(bad.status, 400);
+    assert.equal(bad.body.error, '草稿条目 id 非法');
+    assert.equal((await call(handle, '/api/quota/snapshots')).body.total, 2);
+
+    // ④ 缺省 draftId：只落记录，草稿表不被触碰（兼容旧调用方）
+    const keep = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { draft: { planName: '积分包', b1: 40 } });
+    const plain = await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody());
+    assert.equal(plain.status, 200);
+    assert.equal(plain.body.draftDeleted, 0);
+    const left = await call(handle, '/api/quota/manual-drafts');
+    assert.equal(left.body.items.length, 1);
+    assert.equal(left.body.items[0].id, keep.body.id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('手动录入 API：GET /api/quota/snapshots?source=manual 只返回手动记录并带来源计数', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    seedManualPlan(db);
+    const today = todayKey();
+    insertSnapshot(db, { planName: '积分包', provider: '火山引擎', startMs: new Date(today + 'T09:00:00').getTime() });
+    await callBody(handle, 'POST', '/api/quota/snapshots/manual', manualBody());
+
+    const all = await call(handle, '/api/quota/snapshots');
+    assert.equal(all.body.total, 2);
+    assert.deepEqual(all.body.sources, { manual: 1, estimate: 1 });
+
+    const manual = await call(handle, '/api/quota/snapshots?source=manual');
+    assert.equal(manual.body.total, 1);
+    assert.equal(manual.body.items[0].source, 'manual');
+
+    const est = await call(handle, '/api/quota/snapshots?source=estimate');
+    assert.equal(est.body.total, 1);
+    assert.equal(est.body.items[0].source, 'estimate');
+    assert.equal(est.body.items[0].readings, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 单日小时构成 /api/hourly（hourly-archive-drilldown） ================= */
+
+const insertHourly = (db, tool = 'kimi') => {
+  const stmt = db.prepare(
+    `INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  return { run: (...args) => stmt.run(tool, ...args) };
+};
+
+test('小时构成：已固化历史日走 usage_hourly 冻结快照（archive），不并入滞留明细', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    insertHourly(db).run('2026-09-01', 9, 'p1', 'm1', 10, 100, 0, 20, 2);
+    insertHourly(db).run('2026-09-01', 10, 'p1', 'm1', 1, 10, 0, 2, 1);
+    // 晚到滞留明细同日存在：archive 口径 SHALL NOT 并入
+    insertRecord(db).run('f1', 1, 'm1', 'p1', 0, '2026-09-01', 999, 0, 0, 0);
+
+    const { status, body } = await call(handle, '/api/hourly?date=2026-09-01');
+    assert.equal(status, 200);
+    assert.equal(body.available, true);
+    assert.equal(body.source, 'archive');
+    assert.equal(body.currency, 'CNY');
+    assert.equal(body.rows.length, 2);
+    assert.deepEqual(body.rows.map((r) => r.hour), [9, 10]);
+    assert.equal(body.rows[0].inputOther, 10);
+    assert.equal(body.rows[0].cacheRead, 100);
+    assert.equal(body.rows[0].label, 'p1');
+    assert.equal(body.rows[0].model, 'm1');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时构成：今日无小时行走明细实时口径（JS 按本地小时分桶），只到已过去的小时', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const today = todayKey();
+    const nowHour = new Date().getHours();
+    const at = (h) => { const d = new Date(); d.setHours(h, 15, 0, 0); return d.getTime(); };
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm1', 'p1', at(nowHour), today, 5, 50, 0, 10);
+    if (nowHour > 0) ins.run('f2', 1, 'm2', 'p1', at(nowHour - 1), today, 1, 0, 0, 2);
+
+    const { status, body } = await call(handle, '/api/hourly?date=' + today);
+    assert.equal(status, 200);
+    assert.equal(body.available, true);
+    assert.equal(body.source, 'detail');
+    // 只覆盖已过去的小时：最大小时 == 当前小时，无未来小时
+    const maxHour = Math.max(...body.rows.map((r) => r.hour));
+    assert.equal(maxHour, nowHour);
+    if (nowHour > 0) {
+      const cur = body.rows.filter((r) => r.hour === nowHour);
+      assert.equal(cur.length, 1);
+      assert.equal(cur[0].inputOther, 5);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时构成：无数据日 available=false；参数校验 400（date 缺失/非法、tool 非法）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const none = await call(handle, '/api/hourly?date=2026-01-01');
+    assert.equal(none.status, 200);
+    assert.equal(none.body.available, false);
+    assert.equal(none.body.source, null);
+    assert.deepEqual(none.body.rows, []);
+
+    const noDate = await call(handle, '/api/hourly');
+    assert.equal(noDate.status, 400);
+    const badDate = await call(handle, '/api/hourly?date=2026-9-1');
+    assert.equal(badDate.status, 400);
+    const badTool = await call(handle, '/api/hourly?date=2026-09-01&tool=nope');
+    assert.equal(badTool.status, 400);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时构成：provider / model 多值筛选生效；label 集合与 /api/breakdown 提供商集合同键', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    insertHourly(db).run('2026-09-01', 9, 'p1', 'm1', 10, 100, 0, 20, 2);
+    insertHourly(db).run('2026-09-01', 9, 'p2', 'm2', 1, 10, 0, 2, 1);
+    insertHourly(db).run('2026-09-01', 10, 'p1', 'm2', 0, 5, 0, 1, 1);
+    // 日汇总镜像同一组 (provider, model)：供 /api/breakdown 对比 label 同键
+    const insDaily = (p, m, io, cr, cc, out) =>
+      db.prepare(
+        `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+         VALUES ('kimi', '2026-09-01', ?, ?, ?, ?, ?, ?, 1)`
+      ).run(p, m, io, cr, cc, out);
+    insDaily('p1', 'm1', 10, 100, 0, 20);
+    insDaily('p1', 'm2', 0, 5, 0, 1);
+    insDaily('p2', 'm2', 1, 10, 0, 2);
+
+    const filtered = await call(handle, '/api/hourly?date=2026-09-01&provider=p1&model=m2');
+    assert.equal(filtered.status, 200);
+    assert.deepEqual(filtered.body.rows, [
+      { hour: 10, label: 'p1', mapped: false, model: 'm2', inputOther: 0, cacheRead: 5, cacheCreation: 0, output: 1 }
+    ]);
+
+    // label 集合与 /api/breakdown 的 provider 集合同键（同一映射归并与消歧路径）
+    const hourlyAll = await call(handle, '/api/hourly?date=2026-09-01');
+    const breakdown = await call(handle, '/api/breakdown?date=2026-09-01');
+    const hourlyLabels = new Set(hourlyAll.body.rows.map((r) => r.label));
+    const breakdownLabels = new Set(breakdown.body.providers.map((p) => p.label));
+    assert.deepEqual([...hourlyLabels].sort(), [...breakdownLabels].sort());
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('守门人回归（I4 不污染）：usage_hourly 有无数据，既有一切接口响应逐字节相等', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    // 铺满四层口径数据：明细（今日 + 滞留历史）、日汇总、月汇总、小时归档
+    const today = todayKey();
+    const yesterday = localDateAddDays(today, -1);
+    insertRecord(db).run('f1', 1, 'm1', 'p1', 0, today, 5, 50, 0, 10);
+    insertRecord(db).run('f2', 1, 'm1', 'p1', 0, yesterday, 3, 30, 0, 6);
+    const insDaily = (d, p, m, io, cr, cc, out) =>
+      db.prepare(
+        `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+         VALUES ('kimi', ?, ?, ?, ?, ?, ?, ?, 1)`
+      ).run(d, p, m, io, cr, cc, out);
+    insDaily('2026-09-01', 'p1', 'm1', 10, 100, 0, 20);
+    insDaily('2026-08-15', 'p2', 'm2', 1, 2, 0, 3);
+    db.prepare(
+      `INSERT INTO usage_monthly (tool, year, month, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', 2026, 8, 'p2', 'm2', 1, 2, 0, 3, 1)`
+    ).run();
+    insertHourly(db).run('2026-09-01', 9, 'p1', 'm1', 10, 100, 0, 20, 2);
+    insertHourly(db).run(today, 9, 'p1', 'm1', 999, 999, 0, 999, 999); // 恶意样本：小时层不得泄漏进既有接口
+
+    const urls = [
+      '/api/stats?range=7d',
+      '/api/stats?range=year',
+      '/api/today',
+      '/api/breakdown?date=' + yesterday,
+      '/api/breakdown?month=2026-08',
+      '/api/breakdown?from=2026-08-01&to=' + today,
+      '/api/breakdown?year=2026',
+      '/api/filter-options?range=7d'
+    ];
+    const withHourly = [];
+    for (const url of urls) {
+      const { status, body } = await call(handle, url);
+      assert.equal(status, 200, url);
+      withHourly.push([url, status, JSON.stringify(body)]);
+    }
+
+    db.prepare('DELETE FROM usage_hourly').run(); // 清空小时层（唯一变量）
+    for (const [url, status, text] of withHourly) {
+      const again = await call(handle, url);
+      assert.equal(again.status, status, url);
+      assert.equal(JSON.stringify(again.body), text, '响应应逐字节相等：' + url);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

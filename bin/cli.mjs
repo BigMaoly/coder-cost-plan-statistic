@@ -86,7 +86,8 @@ function printSummary(summary) {
   }
   console.log(`日固化：${summary.rolledDays.length} 天${summary.rolledDays.length ? `（${summary.rolledDays.join('、')}）` : ''}`);
   console.log(`月归档：${summary.archivedMonths.length} 个月${summary.archivedMonths.length ? `（${summary.archivedMonths.join('、')}）` : ''}`);
-  console.log(`滚动清理：${summary.deletedDaily} 条每日汇总条目`);
+  console.log(`滚动清理：${summary.deletedDaily} 条每日汇总条目` +
+    (summary.deletedHourly ? `、${summary.deletedHourly} 条每小时汇总条目` : ''));
   // 对账信号（变更 zcode-usage-loss-prevention）：滞留明细与待补结算队列可见化
   const recon = summary.reconciliation;
   if (recon?.staleDetailRows > 0) {

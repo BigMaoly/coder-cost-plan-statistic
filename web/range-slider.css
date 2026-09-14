@@ -1,0 +1,78 @@
+/*
+ * range-slider.css —— 主页「汇总范围」双端滑动条样式（summary-range-slider）
+ * 配套 web/range-slider.js 生成的 DOM 结构；主题变量复用 index.html 内联 :root。
+ */
+
+/* ===== 汇总范围滑动条（位于柱状图面板底部） ===== */
+.rs { margin-top: 8px; padding-top: 10px; border-top: 1px dashed var(--border); user-select: none; }
+
+/* rs-main 左右外边距由 JS setAlign 设置，使轨道/刻度与柱状图绘图区（chartArea）对齐 */
+.rs-main { position: relative; }
+
+/* 信息行在滑块下方：左侧范围文案，右侧复原按钮 */
+.rs-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.rs-title { font-size: 12.5px; font-weight: 600; }
+.rs-range { font-size: 12.5px; color: var(--teal); font-variant-numeric: tabular-nums; }
+.rs-reset { font-size: 12px; padding: 3px 10px; margin-left: auto; }
+.rs-reset[hidden] { display: none; }
+
+/* 轨道：rail 全宽底轨，band 高亮选中段，双 handle 吸附到槽位边界 */
+.rs-track { position: relative; height: 26px; cursor: pointer; touch-action: none; }
+.rs-rail {
+  position: absolute; left: 0; right: 0; top: 50%; height: 8px; transform: translateY(-50%);
+  border-radius: 999px; background: rgba(148, 163, 184, .14);
+  border: 1px solid rgba(148, 163, 184, .18);
+}
+.rs-band {
+  position: absolute; top: 50%; height: 8px; transform: translateY(-50%);
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(45, 212, 191, .45), rgba(45, 212, 191, .8));
+  box-shadow: 0 0 10px rgba(45, 212, 191, .22);
+}
+.rs.dragging .rs-band { box-shadow: 0 0 14px rgba(45, 212, 191, .5); }
+
+.rs-handle {
+  position: absolute; top: 50%; width: 18px; height: 18px; border-radius: 50%;
+  transform: translate(-50%, -50%);
+  display: flex; align-items: center; justify-content: center;
+  background: #0d1526; border: 2px solid var(--teal);
+  box-shadow: 0 0 0 3px rgba(45, 212, 191, .15);
+  cursor: grab; z-index: 2;
+}
+.rs-handle::after { content: ''; width: 4px; height: 4px; border-radius: 50%; background: var(--teal); }
+.rs-handle:hover, .rs-handle:focus-visible, .rs.dragging .rs-handle {
+  box-shadow: 0 0 0 5px rgba(45, 212, 191, .22); background: #12203a; outline: none;
+}
+.rs.dragging .rs-handle { cursor: grabbing; }
+
+/* 手柄气泡：拖拽 / 悬浮 / 键盘聚焦时显示所选边界日期
+   起点气泡向右展开、终点气泡向左展开：轨道两端（a=0 / b=max）时天然内收不溢出面板 */
+.rs-tip {
+  position: absolute; top: -4px;
+  padding: 3px 8px; border-radius: 7px; white-space: nowrap;
+  background: rgba(8, 15, 30, .95); border: 1px solid rgba(45, 212, 191, .35);
+  color: #e7eef8; font-size: 11px; font-variant-numeric: tabular-nums;
+  opacity: 0; pointer-events: none; transition: opacity .12s; z-index: 3;
+}
+[data-rs=tipmin] { transform: translate(-10px, -100%); }
+[data-rs=tipmax] { transform: translate(calc(-100% + 10px), -100%); }
+.rs-track:hover .rs-tip, .rs.dragging .rs-tip,
+.rs-handle:focus-visible ~ .rs-tip { opacity: 1; }
+
+/* 刻度：grid 每列一个槽位，与 band/handle 百分比定位天然对齐（对准柱心） */
+.rs-ticks { display: grid; margin-top: 4px; }
+.rs-tick { position: relative; height: 22px; }
+.rs-tick::before {
+  content: ''; position: absolute; left: 50%; top: 0;
+  width: 1px; height: 5px; background: rgba(148, 163, 184, .35);
+}
+.rs-tick span {
+  position: absolute; left: 50%; top: 7px; transform: translateX(-50%);
+  font-size: 10px; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.rs-tick:first-child span { left: 0; transform: none; }   /* 首尾标签内收，避免溢出面板 */
+.rs-tick:last-child span { left: auto; right: 0; transform: none; }
+
+@media (max-width: 720px) {
+  .rs-tick span { font-size: 9px; }
+}

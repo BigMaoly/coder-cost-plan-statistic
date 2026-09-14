@@ -57,6 +57,19 @@
  * 单行 ≤200 字，纯空白 = 清除落 NULL；旧行 NULL = 无备注，无回填）；
  * 纯加列：usage_* / cost_* / 汇总层与完成标记 / plan_* / map_* 表零改动，
  * note 写入收口 src/quota.js（额度家族表铁律），不参与防重复统计与增量统计。
+ * schema v18（manual-quota-snapshot）：quota_snapshots 幂等加列 source TEXT NOT NULL DEFAULT 'estimate'
+ * （来源：'estimate' 额度统计启动 / 停止产生（默认值与存量行）、'manual' 手动录入产生）、
+ * end_ms INTEGER（手动录入的窗口结束时间；统计流程不写，旧行 NULL = 读取侧回退 created_ms）、
+ * readings_json TEXT（手动录入固化的起止官方读数，字段名与 quota_presets.start_json 对齐；
+ * 统计流程不写、旧行 NULL）；并新增手动录入草稿表 quota_manual_drafts
+ * （id / created_ms / updated_ms / payload_json，纯前端表单草稿，不参与任何统计与比较）；
+ * 纯增量：usage_* / cost_* / 汇总层与完成标记 / plan_* / map_* 表零改动，
+ * 三列与草稿表读写收口 src/quota.js（额度家族表铁律），不参与防重复统计与增量统计。
+ * schema v19（hourly-archive-drilldown）：新增每小时汇总表 usage_hourly
+ * （主键 (tool, local_date, hour, provider, model)，五值列与 usage_daily 对齐 + turn_count，
+ * 汇总层新成员：核心层独占写入、write-once、不参与任何既有聚合）+ 索引 idx_hourly_tool_date；
+ * app_settings 新增 hourly_since 小时沉淀水位（安装 / 升级当日，写一次永不改写）。
+ * 纯增量迁移，存量数据与既有表零改动。
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -64,8 +77,9 @@ import { mkdirSync, copyFileSync, readdirSync, unlinkSync, existsSync } from 'no
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { SCORE_SEED } from './score-seed.js';
+import { localDateKey } from './parser.js';
 
-export const SCHEMA_VERSION = 17;
+export const SCHEMA_VERSION = 19;
 
 /** 运行数据根目录（测试可通过 envOverride 注入临时 HOME） */
 export function dataDir(envOverride = process.env) {
@@ -337,7 +351,10 @@ CREATE TABLE IF NOT EXISTS quota_snapshots (
   token_costs_json TEXT,
   eval_json TEXT,
   benchmark_json TEXT,
-  note TEXT
+  note TEXT,
+  source         TEXT NOT NULL DEFAULT 'estimate',
+  end_ms         INTEGER,
+  readings_json  TEXT
 );
 `;
 
@@ -523,6 +540,26 @@ function ensureSnapshotNoteColumn(db) {
   }
 }
 
+/**
+ * v18 列迁移（manual-quota-snapshot）：quota_snapshots 无 source / end_ms / readings_json 列则逐列补
+ * （v17 及更早存量库），幂等。全新库的 SCHEMA_SQL 已含三列，此处为空操作。
+ * `source` 带 `DEFAULT 'estimate'` → 存量行一次性回填为「额度统计」来源（语义与升级前一致）；
+ * `end_ms` / `readings_json` 保持 NULL（统计流程本就不写这两项，读取侧 endTime 回退 created_ms）。
+ * 只加列、不改任何既有行数据。
+ */
+function ensureSnapshotManualColumns(db) {
+  const cols = db.prepare('PRAGMA table_info(quota_snapshots)').all().map((c) => c.name);
+  if (!cols.includes('source')) {
+    db.exec("ALTER TABLE quota_snapshots ADD COLUMN source TEXT NOT NULL DEFAULT 'estimate'");
+  }
+  if (!cols.includes('end_ms')) {
+    db.exec('ALTER TABLE quota_snapshots ADD COLUMN end_ms INTEGER');
+  }
+  if (!cols.includes('readings_json')) {
+    db.exec('ALTER TABLE quota_snapshots ADD COLUMN readings_json TEXT');
+  }
+}
+
 /** v13→v14 重建 SQL（见 rebuildQuotaPresetsForPlanName）：建 new → 回填 → DROP → RENAME */
 const V13_TO_V14_SQL = `
 CREATE TABLE quota_presets_new (
@@ -662,6 +699,65 @@ CREATE TABLE IF NOT EXISTS quota_benchmarks (
  * score_values 缺行 = 该模型在该评分标准上未评分（不存 NULL、不存 0）。
  * 一次性建表（幂等），存量库由 v14→v15 递进路径补建。
  */
+/**
+ * 手动录入草稿表（manual-quota-snapshot，schema v18）：
+ * 录入表单的中间态（信息不全也能「保持」），与快照/统计完全无关 —— 不参与任何统计口径、
+ * 不参与基准比较、不被任何统计路径读取；「添加」成功后该行删除（条目自动消失）。
+ * 读写恒收口 src/quota.js（额度家族表铁律）。
+ */
+const MANUAL_DRAFT_SQL = `
+CREATE TABLE IF NOT EXISTS quota_manual_drafts (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_ms   INTEGER NOT NULL,
+  updated_ms   INTEGER NOT NULL,
+  payload_json TEXT    NOT NULL
+);
+`;
+
+/**
+ * 每小时汇总表 + 索引（hourly-archive-drilldown，schema v19）：
+ * 汇总层新成员（核心层独占写入，适配器 SHALL NOT 读写）——每日固化事务内、明细删除前，
+ * 由 rollupDaily 对「首次固化 ∧ 非重建 ∧ 不早于 hourly_since 水位」的日期一次性沉淀（write-once，
+ * 晚到明细不回写、重建不生成）；是 usage_daily 在小时维度上的同源投影，
+ * SHALL NOT 参与每日 / 每月汇总、费用表或任何既有聚合的数值构成。
+ * 五值列与 usage_daily 完全对齐（hour 为 JS 侧 new Date(ts_ms).getHours() 的本地自然小时）。
+ */
+const HOURLY_SQL = `
+CREATE TABLE IF NOT EXISTS usage_hourly (
+  tool           TEXT NOT NULL,
+  local_date     TEXT NOT NULL,
+  hour           INTEGER NOT NULL,
+  provider       TEXT NOT NULL,
+  model          TEXT NOT NULL,
+  input_other    INTEGER NOT NULL,
+  cache_read     INTEGER NOT NULL,
+  cache_creation INTEGER NOT NULL,
+  output         INTEGER NOT NULL,
+  turn_count     INTEGER NOT NULL,
+  PRIMARY KEY (tool, local_date, hour, provider, model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hourly_tool_date ON usage_hourly (tool, local_date);
+`;
+
+/**
+ * 小时沉淀水位（hourly-archive-drilldown）：首次建库 / 首次迁移到 v19 时写入当日本地日期，
+ * INSERT OR IGNORE 幂等 —— 重复迁移 / 重复调用都是空操作，此后永不改写（P1/P2：小时数据
+ * 不追溯，早于水位的日期不产生也不补写小时行）。存 app_settings（纯配置 KV）而非
+ * maintenance_state：clearAllData / clearToolData / beginToolRebuild 全都不碰它。
+ */
+export function ensureHourlySince(db) {
+  db.prepare(
+    "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('hourly_since', ?)"
+  ).run(localDateKey(Date.now()));
+}
+
+/** 读小时沉淀水位；缺失返回 null（视为未启用小时沉淀，最保守） */
+export function getHourlySince(db) {
+  const row = db.prepare("SELECT value FROM app_settings WHERE key = 'hourly_since'").get();
+  return row?.value ?? null;
+}
+
 const SCORE_SQL = `
 CREATE TABLE IF NOT EXISTS score_criterion_groups (
   id         TEXT PRIMARY KEY,
@@ -872,7 +968,7 @@ export function migrate(db) {
     // + v8 费用模板表 + v9 套餐额度分段计价表一次建齐（套餐价格表的 v8 列、
     // quota_presets 的 v10/v14 列与组合唯一约束、条目排序与模板分组的 v12 列、
     // 快照的 v11/v13/v16 JSON 列已含在 CREATE 定义中），
-    // 最后建 v15 模型评分表并写入内置评分数据、建 v16 任务基准两张配置表
+    // 最后建 v15 模型评分表并写入内置评分数据、建 v16 任务基准两张配置表、建 v18 手动录入草稿表
     db.exec(SCHEMA_SQL);
     db.exec(MAPPING_SQL);
     db.exec(PLAN_SQL);
@@ -883,6 +979,9 @@ export function migrate(db) {
     db.exec(SCORE_SQL);
     seedScoreTables(db);
     db.exec(BENCHMARK_SQL);
+    db.exec(MANUAL_DRAFT_SQL);
+    db.exec(HOURLY_SQL);
+    ensureHourlySince(db);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }
@@ -903,6 +1002,9 @@ export function migrate(db) {
   //（quota-snapshot-benchmark，均幂等，不改既有行数据；旧行 NULL = 未设基准）
   // v16→v17 quota_snapshots 补 note 列（quota-snapshot-note，幂等纯加列，不改既有行数据；
   // 旧行 NULL = 无备注）
+  // v17→v18 quota_snapshots 补 source / end_ms / readings_json 三列 + 新增手动录入草稿表
+  //（manual-quota-snapshot，幂等；source 存量行回填 'estimate'，另两列 NULL）
+  // v18→v19 建每小时汇总表 + 索引 + 写小时沉淀水位（hourly-archive-drilldown，幂等纯新增）
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     runInTransaction(db, () => {
@@ -939,6 +1041,18 @@ export function migrate(db) {
         // 快照补 note 列（quota-snapshot-note，幂等纯加列，不改既有行数据）
         ensureSnapshotNoteColumn(db);
       }
+      if (current < 18) {
+        // 快照补来源 / 窗口结束时间 / 官方读数三列 + 建手动录入草稿表
+        //（manual-quota-snapshot，幂等纯加列 + 纯新增表，不改既有行数据）
+        ensureSnapshotManualColumns(db);
+        db.exec(MANUAL_DRAFT_SQL);
+      }
+      if (current < 19) {
+        // 建每小时汇总表 + 索引 + 写小时沉淀水位（hourly-archive-drilldown，
+        // 幂等纯新增，不改既有行数据；水位写一次永不改写）
+        db.exec(HOURLY_SQL);
+        ensureHourlySince(db);
+      }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });
   } finally {
@@ -954,6 +1068,7 @@ export function migrate(db) {
 export function clearAllData(db) {
   db.exec(
     'DELETE FROM usage_records; DELETE FROM usage_daily; DELETE FROM usage_monthly; ' +
+    'DELETE FROM usage_hourly; ' +
     'DELETE FROM maintenance_state; DELETE FROM file_index; DELETE FROM reconcile_pending;'
   );
 }
@@ -1030,6 +1145,7 @@ export function clearToolData(db, tool) {
     db.prepare('DELETE FROM file_index WHERE tool = ?').run(tool);
     db.prepare('DELETE FROM usage_daily WHERE tool = ?').run(tool);
     db.prepare('DELETE FROM usage_monthly WHERE tool = ?').run(tool);
+    db.prepare('DELETE FROM usage_hourly WHERE tool = ?').run(tool);
     db.prepare('DELETE FROM maintenance_state WHERE tool = ?').run(tool);
     db.prepare('DELETE FROM reconcile_pending WHERE tool = ?').run(tool);
   });

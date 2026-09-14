@@ -9,11 +9,15 @@
  * 月归档节奏内由 cost_daily 汇总写 cost_monthly。费用归档不改变明细固化/删除/标记的既有行为。
  * v6 另在「今天」推进时收割跨天的额度统计预设（reapStaleRuns：自动放弃、不写快照，
  * 摘要携带 quotaReaped）；预设 / 快照的 CRUD 与启停逻辑见 quota.js。
+ * v19（hourly-archive-drilldown）：逐日固化事务内、明细删除前，对「首次固化 ∧ 非重建 ∧
+ * 不早于水位」的日期一次性沉淀 usage_hourly（write-once，晚到明细不回写、重建不生成）；
+ * 滚动清理同谓词覆盖小时条目，摘要新增 deletedHourly。小时行是 usage_daily 的同源投影，
+ * SHALL NOT 参与任何既有聚合数值。
  */
 
 import { runAdapters } from './scanners/index.js';
 import { localDateKey } from './parser.js';
-import { runInTransaction } from './store.js';
+import { runInTransaction, getHourlySince } from './store.js';
 import { loadPricingContext, calcCost, saveCostDaily, rollupCostMonthly } from './cost.js';
 import { reapStaleRuns } from './quota.js';
 
@@ -187,12 +191,59 @@ function reconcileArchivedMonth(db, tool, ym, dayAggs, overwrite, collector, isD
 }
 
 /**
+ * 一次性沉淀某日小时汇总（hourly-archive-drilldown）：读该日明细 → JS 侧按本地自然小时分桶
+ * （D1：new Date(ts_ms).getHours() 与 parser.js localDateKey 同时区同源，不用 SQLite localtime）
+ * → 聚合为 (hour, provider, model) 五值行 → INSERT … ON CONFLICT DO NOTHING（write-once 双保险，
+ * 永不累加 / 覆盖）。仅由 rollupDaily 在「首次固化」事务内调用；晚到明细 / 复活明细 / 重建对账
+ * 均不进入本函数。返回写入行数（供测试与摘要）。
+ */
+function archiveHourly(db, tool, day) {
+  const rows = db.prepare(
+    `SELECT provider, model, ts_ms, input_other, cache_read, cache_creation, output
+     FROM usage_records WHERE tool = ? AND local_date = ?`
+  ).all(tool, day);
+  if (rows.length === 0) return 0;
+  const buckets = new Map();
+  for (const r of rows) {
+    const hour = new Date(r.ts_ms).getHours();
+    const key = hour + '\u0000' + r.provider + '\u0000' + r.model;
+    let b = buckets.get(key);
+    if (!b) {
+      b = { hour, provider: r.provider, model: r.model, input_other: 0, cache_read: 0, cache_creation: 0, output: 0, turn_count: 0 };
+      buckets.set(key, b);
+    }
+    b.input_other += r.input_other;
+    b.cache_read += r.cache_read;
+    b.cache_creation += r.cache_creation;
+    b.output += r.output;
+    b.turn_count += 1;
+  }
+  const insert = db.prepare(
+    `INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(tool, local_date, hour, provider, model) DO NOTHING`
+  );
+  let written = 0;
+  for (const b of buckets.values()) {
+    written += Number(insert.run(
+      tool, day, b.hour, b.provider, b.model,
+      b.input_other, b.cache_read, b.cache_creation, b.output, b.turn_count
+    ).changes);
+  }
+  return written;
+}
+
+/**
  * 逐日固化（幂等合并语义，变更 zcode-usage-loss-prevention）：
  * 每个 tool 独立处理「早于 today 且 usage_records 存在该日明细」的日期，从旧到新逐日：
  * 该日该工具明细按 (日期,提供商,模型) 聚合 UPSERT 进 usage_daily → 删除该日明细 → 写/刷新标记（同一事务）。
  * 完成标记不再封板：已标记日期的现存明细（晚到部分）同样会被合并（二次固化）；
  * 「合并进汇总」与「删除明细」同事务，故汇总值与现存明细永不重叠、合并天然幂等。
  * 所属月份已有 monthly_done 标记时，本次合并增量同步并入 usage_monthly（否则月统计永久缺晚到量）。
+ *
+ * 小时沉淀（hourly-archive-drilldown）：常时路径「首次固化」且不早于水位（options.hourlySince，
+ * runMaintenance 开头读一次传入避免循环内查库）时，在明细删除前写入一次 usage_hourly（write-once）；
+ * 重建路径与对账分支零改动。
  *
  * 复活明细保护（rebuild-rollup-protection D2，常时生效）：已标记日期且 daily 已有该日条目时，
  * 当前明细聚合与既有汇总逐行等值 → 判定复活明细，跳过合并直接删明细刷新标记；有差异维持累加。
@@ -203,7 +254,10 @@ function reconcileArchivedMonth(db, tool, ym, dayAggs, overwrite, collector, isD
  *
  * @param {Map<string, Set<string>>} [graceByTool] 固化宽限：tool → 仍存在未定型行的日期集合，命中则本轮跳过
  * @param {{rebuildTools?: Set<string>, overwriteIncrease?: boolean,
- *          reconcile?: {entries: object[], applied: object[]}}} [options]
+ *          reconcile?: {entries: object[], applied: object[]},
+ *          hourlySince?: string|null}} [options]
+ *   hourlySince：小时沉淀水位（hourly-archive-drilldown）——runMaintenance 开头读一次传入，
+ *   避免逐日循环内查库；缺省时回退为「不启用」（不写小时行）。
  * @returns {string[]} 本次固化的日期列表（从旧到新，去重）
  */
 export function rollupDaily(db, today, graceByTool = new Map(), options = {}) {
@@ -213,6 +267,8 @@ export function rollupDaily(db, today, graceByTool = new Map(), options = {}) {
   );
   const overwrite = Boolean(options.overwriteIncrease);
   const collector = options.reconcile || { entries: [], applied: [] };
+  // 水位：runMaintenance 开头读一次传入（避免逐日循环查库）；直接调用方缺省回退读库
+  const hourlySince = options.hourlySince !== undefined ? options.hourlySince : getHourlySince(db);
 
   const pending = db
     .prepare(
@@ -309,6 +365,11 @@ export function rollupDaily(db, today, graceByTool = new Map(), options = {}) {
         if (monthAlreadyDone) mergeMonthlyDelta(db, tool, local_date, row);
       }
       if (!dayDoneBefore) archiveCostDaily(tool, local_date); // 合并后、明细删除前，同事务冻结当日费用
+      // 一次性沉淀小时行（hourly-archive-drilldown）：只在该日首次固化、非重建、不早于水位时写入；
+      // 此后永不改写（晚到 / 复活明细走 dayDoneBefore 分支进不来，重建路径在 else 分支也进不来）
+      if (!dayDoneBefore && hourlySince && local_date >= hourlySince) {
+        archiveHourly(db, tool, local_date);
+      }
       deleteDay.run(tool, local_date);
       markDone.run(tool, local_date, Date.now());
       if (!rolled.includes(local_date)) rolled.push(local_date);
@@ -420,19 +481,20 @@ export function rollupMonthly(db, today) {
 /**
  * 滚动清理：删除「日期早于 today-30 天 且 所属月份已有同工具 monthly_done 标记」的每日条目。
  * 月份未完成该工具月统计的不清理；本月条目因日期恒不早于窗口边界天然不清理。
- * @returns {number} 删除的条目数
+ * 小时条目（hourly-archive-drilldown）在同一谓词下同节奏删除（H4：可用范围 = 近 30 天 ∪ 本月）。
+ * @param {{deletedHourly?: number}} [sink] 可选回传通道：小时条目删除数写入 sink.deletedHourly
+ * @returns {number} 删除的每日条目数（既有语义不变；小时删除数经 sink 回传）
  */
-export function cleanupDaily(db, today) {
+export function cleanupDaily(db, today, sink = null) {
   const cutoff = localDateAddDays(today, -30);
-  const result = db
-    .prepare(
-      `DELETE FROM usage_daily
-       WHERE local_date < ?
-         AND EXISTS (SELECT 1 FROM maintenance_state ms
-                     WHERE ms.kind = 'monthly_done' AND ms.tool = usage_daily.tool
-                       AND ms.period = substr(usage_daily.local_date, 1, 7))`
-    )
-    .run(cutoff);
+  const monthDone = (table) =>
+    `local_date < ?
+     AND EXISTS (SELECT 1 FROM maintenance_state ms
+                 WHERE ms.kind = 'monthly_done' AND ms.tool = ${table}.tool
+                   AND ms.period = substr(${table}.local_date, 1, 7))`;
+  const result = db.prepare(`DELETE FROM usage_daily WHERE ${monthDone('usage_daily')}`).run(cutoff);
+  const hourly = db.prepare(`DELETE FROM usage_hourly WHERE ${monthDone('usage_hourly')}`).run(cutoff);
+  if (sink) sink.deletedHourly = Number(hourly.changes);
   return Number(result.changes);
 }
 
@@ -614,13 +676,16 @@ export function discardReconcileEntries(db, ids) {
  *   overwriteIncrease：覆盖模式，仅作用于重建模式对账——「新值 > 沉淀」条目直接内联入账
  *   （日行覆盖、月行差量补月），并一次性应用清单中全部既有 pending 条目；正常增量维护不受影响。
  * @returns {{scan: object, tools: Map, rolledDays: string[], archivedMonths: string[], deletedDaily: number,
- *            quotaReaped: number,
+ *            deletedHourly: number, quotaReaped: number,
  *            reconciliation: {staleDetailRows: number, pendingByTool: object, pending: object[],
  *                             applied: number[], stale: number[]}}}
  */
 export function runMaintenance(db, options) {
   const { sessionsRoot, configTomlPath, codexSessionsRoot, zcodeDbPath, ccsclaudeDbPath, dshSessionsRoot, full, overwriteIncrease } = options;
   const today = options.today || todayKey();
+
+  // 小时沉淀水位（hourly-archive-drilldown）：开头读一次，rollupDaily 逐日循环复用
+  const hourlySince = getHourlySince(db);
 
   // 额度估计：跨天自动放弃（统计中的预设基线停留在旧日期 → 回 stopped、清基线、不写快照）
   const quotaReaped = reapStaleRuns(db, today);
@@ -652,11 +717,13 @@ export function runMaintenance(db, options) {
 
   // 步骤 2-5：固化/统计/清理/状态（同一事务，保证「先统计后清理」与标记原子性）
   const reconcile = { entries: [], applied: [] };
-  let rolledDays, archivedMonths, deletedDaily;
+  let rolledDays, archivedMonths, deletedDaily, deletedHourly;
   runInTransaction(db, () => {
-    rolledDays = rollupDaily(db, today, graceByTool, { rebuildTools, overwriteIncrease, reconcile });
+    rolledDays = rollupDaily(db, today, graceByTool, { rebuildTools, overwriteIncrease, reconcile, hourlySince });
     archivedMonths = rollupMonthly(db, today);
-    deletedDaily = cleanupDaily(db, today);
+    const cleanSink = {};
+    deletedDaily = cleanupDaily(db, today, cleanSink);
+    deletedHourly = cleanSink.deletedHourly ?? 0;
     // 重建模式标记清除：当轮重扫成功的工具；重扫失败保留，下一轮继续按对账规则处理
     const clearRebuild = db.prepare("DELETE FROM maintenance_state WHERE kind = 'rebuild_mode' AND tool = ?");
     for (const tool of rebuildTools) {
@@ -679,7 +746,8 @@ export function runMaintenance(db, options) {
         changedFiles: scanTotals(tools).changedFiles,
         rolledDays: rolledDays.length,
         archivedMonths: archivedMonths.length,
-        deletedDaily
+        deletedDaily,
+        deletedHourly
       })
     );
   });
@@ -703,5 +771,5 @@ export function runMaintenance(db, options) {
     stale: applyResult.stale
   };
 
-  return { scan: scanTotals(tools), tools, rolledDays, archivedMonths, deletedDaily, quotaReaped, reconciliation };
+  return { scan: scanTotals(tools), tools, rolledDays, archivedMonths, deletedDaily, deletedHourly, quotaReaped, reconciliation };
 }

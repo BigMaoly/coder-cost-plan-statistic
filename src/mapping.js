@@ -85,24 +85,32 @@ export function applyMappings(rows, maps, enabled) {
   });
 }
 
+/** 筛选参数归一化：string | string[] → 非空字符串数组；空 / 全空 → null（等效不筛选） */
+function filterValues(v) {
+  if (v == null || v === '') return null;
+  const list = (Array.isArray(v) ? v : [v]).filter((x) => typeof x === 'string' && x !== '');
+  return list.length > 0 ? list : null;
+}
+
 /**
- * 展示名筛选匹配（provider 筛选值编码：'map:统一名' / 'tool|provider' / 裸名；model 为展示模型名）。
+ * 展示名筛选匹配（多选筛选）：providerValue / modelValue 均接受 string 或 string[]，
+ * 同一维度多个取值之间为「任一命中」（OR），provider × model 跨维度为「同时命中」（AND）。
+ * provider 筛选值编码：'map:统一名' / 'tool|provider' / 裸名；model 为展示模型名。
  * 同名即合并：'map:NAME' 命中所有展示名为 NAME 的行（含未映射同名原始行）。
  */
 export function matchFilter(row, providerValue, modelValue) {
-  if (providerValue) {
-    if (providerValue.startsWith('map:')) {
-      if (row.dp !== providerValue.slice(4)) return false;
-    } else {
-      const sep = providerValue.indexOf('|');
-      if (sep > 0) {
-        if (row.tool !== providerValue.slice(0, sep) || row.provider !== providerValue.slice(sep + 1)) return false;
-      } else if (row.dp !== providerValue) {
-        return false;
-      }
-    }
+  const providers = filterValues(providerValue);
+  if (providers) {
+    const hit = providers.some((pv) => {
+      if (pv.startsWith('map:')) return row.dp === pv.slice(4);
+      const sep = pv.indexOf('|');
+      if (sep > 0) return row.tool === pv.slice(0, sep) && row.provider === pv.slice(sep + 1);
+      return row.dp === pv;
+    });
+    if (!hit) return false;
   }
-  if (modelValue && row.dm !== modelValue) return false;
+  const models = filterValues(modelValue);
+  if (models && !models.includes(row.dm)) return false;
   return true;
 }
 

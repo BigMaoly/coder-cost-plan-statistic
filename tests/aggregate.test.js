@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { openDb, clearAllData } from '../src/store.js';
+import { openDb, clearAllData, runInTransaction } from '../src/store.js';
 import { rollupDaily, rollupMonthly, cleanupDaily, runMaintenance, localDateAddDays,
   applyReconcileEntries, discardReconcileEntries, listPendingReconcile } from '../src/aggregate.js';
 import { saveMapping } from '../src/mapping.js';
@@ -883,6 +883,202 @@ test('applyReconcileEntries：日覆盖+月增量入账；基值漂移判失效�
     assert.deepEqual(r3.stale, [driftId]);
     assert.equal(dailyOf(db, '2026-08-20').input_other, 150); // 未按过期基值入账
     assert.equal(db.prepare("SELECT status FROM reconcile_pending WHERE id=?").get(driftId).status, 'stale');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ================= 小时粒度一次性沉淀（hourly-archive-drilldown） ================= */
+
+// 本地时区 2026-09-02 某小时第 m 分的 epoch ms（与 localDateKey 同源切天）
+const atDayHour = (h, m = 30) => new Date(2026, 8, 2, h, m).getTime();
+
+test('小时沉淀：首次固化写 usage_hourly（JS 侧按小时分桶），五值合计与日汇总相等', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'kimi-for-coding', 'kimi-code', atDayHour(9), '2026-09-02', 100, 1000, 0, 200);
+    ins.run('f1', 2, 'kimi-for-coding', 'kimi-code', atDayHour(10), '2026-09-02', 10, 100, 0, 20); // 另一小时
+    ins.run('f1', 3, 'deepseek-v4', 'deepseek', atDayHour(9), '2026-09-02', 1, 2, 0, 3); // 同小时不同模型
+
+    const rolled = rollupDaily(db, '2026-09-04', new Map(), { hourlySince: '2026-09-01' });
+    assert.deepEqual(rolled, ['2026-09-02']);
+    const hourly = db.prepare('SELECT * FROM usage_hourly WHERE tool = ? ORDER BY hour, provider').all('kimi');
+    assert.equal(hourly.length, 3); // (9, deepseek) (9, kimi-code) (10, kimi-code)
+    assert.deepEqual(hourly.map((r) => [r.hour, r.provider]), [[9, 'deepseek'], [9, 'kimi-code'], [10, 'kimi-code']]);
+    assert.equal(hourly[1].turn_count, 1);
+    assert.equal(hourly[2].input_other, 10);
+
+    // 无晚到明细时：小时五值合计 == 日汇总五值（逐字段；日侧跨 (provider, model) 全聚合）
+    const hsum = db.prepare(
+      'SELECT SUM(input_other) io, SUM(cache_read) cr, SUM(cache_creation) cc, SUM(output) out, SUM(turn_count) tc FROM usage_hourly WHERE tool = ? AND local_date = ?'
+    ).get('kimi', '2026-09-02');
+    const daily = db.prepare(
+      'SELECT SUM(input_other) io, SUM(cache_read) cr, SUM(cache_creation) cc, SUM(output) out, SUM(turn_count) tc FROM usage_daily WHERE tool = ? AND local_date = ?'
+    ).get('kimi', '2026-09-02');
+    assert.equal(hsum.io, daily.io);
+    assert.equal(hsum.cr, daily.cr);
+    assert.equal(hsum.cc, daily.cc);
+    assert.equal(hsum.out, daily.out);
+    assert.equal(hsum.tc, daily.tc);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时沉淀：晚到明细二次固化并入日汇总，小时行逐行不变（write-once / I2）', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-09-02', 10, 100, 0, 20);
+    rollupDaily(db, '2026-09-04', new Map(), { hourlySince: '2026-09-01' });
+    const before = db.prepare('SELECT * FROM usage_hourly ORDER BY hour, provider, model').all();
+
+    // 晚到明细：同日二次固化
+    ins.run('f2', 9, 'm', 'p', atDayHour(15), '2026-09-02', 7, 0, 0, 1);
+    rollupDaily(db, '2026-09-05', new Map(), { hourlySince: '2026-09-01' });
+
+    const after = db.prepare('SELECT * FROM usage_hourly ORDER BY hour, provider, model').all();
+    assert.deepEqual(after, before); // 小时行逐行不变
+    const daily = db.prepare('SELECT input_other, turn_count FROM usage_daily WHERE tool = ? AND local_date = ?').get('kimi', '2026-09-02');
+    assert.equal(daily.input_other, 17); // 日汇总已并入晚到量
+    assert.equal(daily.turn_count, 2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时沉淀：复活明细等值丢弃分支后小时行不变', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-09-02', 10, 100, 0, 20);
+    rollupDaily(db, '2026-09-04', new Map(), { hourlySince: '2026-09-01' });
+    const before = db.prepare('SELECT * FROM usage_hourly').all();
+    const dailyBefore = db.prepare('SELECT * FROM usage_daily').all();
+
+    // 原样明细重新入库（复活明细：聚合与既有汇总逐行等值 → 等值丢弃）
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-09-02', 10, 100, 0, 20);
+    rollupDaily(db, '2026-09-05', new Map(), { hourlySince: '2026-09-01' });
+
+    assert.deepEqual(db.prepare('SELECT * FROM usage_hourly').all(), before);
+    assert.deepEqual(db.prepare('SELECT * FROM usage_daily').all(), dailyBefore); // 日汇总不累加
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时沉淀：重建模式不生成小时行，日/月对账行为不受影响（R4）', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-09-02', 10, 100, 0, 20);
+    markDone(db, 'rebuild_mode', '*', 'kimi');
+    const rolled = rollupDaily(db, '2026-09-04', new Map(), {
+      rebuildTools: new Set(['kimi']),
+      hourlySince: '2026-09-01'
+    });
+    assert.deepEqual(rolled, ['2026-09-02']);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly').get().c, 0); // 重建不生成
+    // 未归档月重建路径按对账规则走「无沉淀补写」：日汇总行为与既有语义一致，小时层不参与
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_daily').get().c, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时沉淀：早于水位的日期不生成，之后维护也不补写（R5 / 不追溯）', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-08-20', 10, 100, 0, 20); // 早于水位
+    ins.run('f1', 2, 'm', 'p', atDayHour(9), '2026-09-02', 1, 2, 0, 3);     // 水位当日之后
+    rollupDaily(db, '2026-09-04', new Map(), { hourlySince: '2026-09-01' });
+    const dates = db.prepare('SELECT DISTINCT local_date FROM usage_hourly').all().map((r) => r.local_date);
+    assert.deepEqual(dates, ['2026-09-02']);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly WHERE local_date = ?').get('2026-08-20').c, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('小时沉淀：同事务原子性——固化中途回滚时小时行与日行、明细删除一并回滚（R6）', () => {
+  const { root, db } = makeDb();
+  try {
+    const ins = insertRecord(db);
+    ins.run('f1', 1, 'm', 'p', atDayHour(9), '2026-09-02', 10, 100, 0, 20);
+    assert.throws(() => {
+      runInTransaction(db, () => {
+        rollupDaily(db, '2026-09-04', new Map(), { hourlySince: '2026-09-01' });
+        throw new Error('模拟中途失败');
+      });
+    }, /模拟中途失败/);
+    // 全部回到事务前状态：明细还在、日/小时汇总与标记都没有
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_records').get().c, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly').get().c, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_daily').get().c, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) c FROM maintenance_state WHERE kind = 'daily_done'").get().c, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('滚动清理：小时条目与每日条目同节奏删除/保留，返回值仍只计日条目（deletedHourly 走 sink）', () => {
+  const { root, db } = makeDb();
+  try {
+    // 超窗（2026-06-10 < today-30）且所属月已归档 → 日/小时条目同轮删除
+    markDone(db, 'monthly_done', '2026-06', 'kimi');
+    insertDaily(db).run('2026-06-10', 'p', 'm', 1, 2, 0, 3, 1);
+    db.prepare(
+      "INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('kimi', '2026-06-10', 9, 'p', 'm', 1, 2, 0, 3, 1)"
+    ).run();
+    // 超窗但月未归档（2026-07 无 monthly_done）→ 两者一并保留
+    insertDaily(db).run('2026-07-11', 'p', 'm', 1, 2, 0, 3, 1);
+    db.prepare(
+      "INSERT INTO usage_hourly (tool, local_date, hour, provider, model, input_other, cache_read, cache_creation, output, turn_count) VALUES ('kimi', '2026-07-11', 9, 'p', 'm', 1, 2, 0, 3, 1)"
+    ).run();
+
+    const sink = {};
+    const deleted = cleanupDaily(db, '2026-09-04', sink);
+    assert.equal(deleted, 1); // 返回值语义不变：只统计日条目
+    assert.equal(sink.deletedHourly, 1); // 小时删除数独立回传
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_hourly').get().c, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) c FROM usage_hourly WHERE local_date = '2026-07-11'").get().c, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('runMaintenance 摘要携带 deletedHourly；小时行随首轮固化沉淀', () => {
+  const { root, db } = makeDb();
+  try {
+    const sessions = join(root, 'sessions');
+    const wire = join(sessions, 'wd', 'session_x', 'agents', 'main', 'wire.jsonl');
+    mkdirSync(join(sessions, 'wd', 'session_x', 'agents', 'main'), { recursive: true });
+    const line = JSON.stringify({
+      type: 'usage.record', model: 'kimi-code/k3',
+      usage: { inputOther: 2, inputCacheRead: 20, inputCacheCreation: 1, output: 4 },
+      usageScope: 'turn', time: Date.parse('2026-09-03T01:30:00Z') // 本地 9/3 09:30 → hour 9
+    });
+    writeFileSync(wire, line + '\n');
+    // 水位为建库当日（夹具运行日），fixture 明细在历史日 → 把水位改早，模拟「升级前已在用」
+    db.prepare("UPDATE app_settings SET value = '2026-09-01' WHERE key = 'hourly_since'").run();
+    const summary = runMaintenance(db, {
+      sessionsRoot: sessions,
+      zcodeDbPath: join(root, 'no-zcode.sqlite'),
+      ccsclaudeDbPath: join(root, 'no-cc-switch.db'),
+      dshSessionsRoot: join(root, 'no-dsh-sessions'),
+      today: '2026-09-04'
+    });
+    assert.equal(summary.deletedHourly, 0);
+    const hourly = db.prepare('SELECT * FROM usage_hourly').all();
+    assert.equal(hourly.length, 1);
+    assert.equal(hourly[0].hour, 9); // JS 侧本地小时分桶
+    assert.equal(hourly[0].turn_count, 1);
+    // run 状态 JSON 追加 deletedHourly 键（向后兼容）
+    const run = JSON.parse(db.prepare("SELECT value FROM maintenance_state WHERE kind='run' AND period='last_scan'").get().value);
+    assert.equal(run.deletedHourly, 0);
+    assert.ok(typeof run.deletedDaily === 'number');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

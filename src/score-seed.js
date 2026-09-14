@@ -11,7 +11,8 @@
  *   i3 = 图片③：GLM-5.3-Flash / GLM-5.2 / DeepSeek-V4-Vision-Exp / Claude Opus 4.8 / GPT-5.6 Terra / Gemini 3.7 Flash 的 6 张柱状图
  *   i4 = 图片④：MiniMax M3 的十张柱状图（本次只取 M3 列）
  *   i5 = 图片⑤：MiniMax M3 发布博客的 32 benchmark × 9 模型完整对比大表（2026-09-11 核对）
- * 每格多来源有值且不同时按 官方表 > 图片① > 图片② > 图片③ > 图片④ > 图片⑤ 取值；
+ *   i6 = Hy4 preview 发布对比表：Tencent-Hunyuan/Hy4-preview benchmark-appendix（46 benchmark × 8 模型，2026-09-13 誊入）
+ * 每格多来源有值且不同时按 官方表 > 图片① > 图片② > 图片③ > 图片④ > 图片⑤ > Hy4对比表 取值；
  * 同名但量级明显不同的标准拆成「（官方表）/（对比图）」两条。
  * 逐格对照与冲突清单见 demos/260910-03-model-scorecard/数据来源核对.md。
  */
@@ -26,20 +27,25 @@ const criterionGroups = [
 // 顺序 = 分组顺序 → 组内顺序；unit: pct（百分比）| num（数值）
 const criteria = [
   // ── 推理与知识 ──
-  { id: "c-gpqa", groupId: "g-reason", name: "GPQA Diamond", unit: "pct", order: 1, desc: "研究生水平科学问答（物理 / 化学 / 生物）。" }, // 来源：官方表 + 图片①
-  { id: "c-critpt", groupId: "g-reason", name: "CritPt", unit: "pct", order: 2, desc: "物理推理题集；官方表标注取自 Artificial Analysis（2026-07-23）。" }, // 来源：官方表
+  { id: "c-gpqa", groupId: "g-reason", name: "GPQA Diamond", unit: "pct", order: 1, desc: "研究生水平科学问答（物理 / 化学 / 生物）。" }, // 来源：官方表 + 图片① + Hy4对比表
+  { id: "c-critpt", groupId: "g-reason", name: "CritPt", unit: "pct", order: 2, desc: "物理推理题集；官方表标注取自 Artificial Analysis（2026-07-23）。Hy4 表行名 CritPt (official)。" }, // 来源：官方表 + Hy4对比表
   { id: "c-aalcr", groupId: "g-reason", name: "AA-LCR", unit: "pct", order: 3, desc: "长上下文推理；官方表标注取自 Artificial Analysis（2026-07-23）。" }, // 来源：官方表
   { id: "c-hlefull", groupId: "g-reason", name: "HLE-Full", unit: "pct", order: 4, desc: "Humanity's Last Exam 全量。官方表每格是「无工具 / 带工具」两个值，这里显示无工具值（带工具：Kimi K3 56.0、Claude Fable 5 63.0、GPT-5.6 Sol 58.0、Claude Opus 4.8 57.9、GPT-5.5 52.2）。" }, // 来源：官方表
-  { id: "c-hle", groupId: "g-reason", name: "HLE", unit: "pct", order: 5, desc: "Humanity's Last Exam，对比图口径（原图 DeepSeek 侧带 * 的取带工具值）。" }, // 来源：图片①
-  { id: "c-hle-tools", groupId: "g-reason", name: "HLE (w/tools)", unit: "pct", order: 6, desc: "HLE (w/tools)：允许调用工具后的得分（对比图口径）。名称保留限定词——去掉会与不带工具的 HLE 重名。" }, // 来源：图片① + 图片② + 图片③
-  { id: "c-math-apex", groupId: "g-reason", name: "MathArena Apex", unit: "pct", order: 7, desc: "MathArena 的 Apex 难度档：竞赛级数学难题。" }, // 来源：图片①
+  { id: "c-hle", groupId: "g-reason", name: "HLE", unit: "pct", order: 5, desc: "Humanity's Last Exam（text-only）。原图 DeepSeek 侧带 * 的取带工具值（历史口径记录）；Hy4 表行名 HLE (no tools, text-only)，x/y 两值取第一值。" }, // 来源：图片① + Hy4对比表
+  { id: "c-hle-tools", groupId: "g-reason", name: "HLE (w/tools)", unit: "pct", order: 6, desc: "HLE (w/tools)：允许调用工具后的得分（对比图口径）。名称保留限定词——去掉会与不带工具的 HLE 重名。Hy4 表行名 HLE (with tools, text-only)，x/y 两值取第一值。" }, // 来源：图片① + 图片② + 图片③ + Hy4对比表
+  { id: "c-math-apex", groupId: "g-reason", name: "MathArena Apex", unit: "pct", order: 7, desc: "MathArena 的 Apex 难度档：竞赛级数学难题。Hy4 表行名 MathArena Apex 2025（2025 年赛题档）。" }, // 来源：图片① + Hy4对比表
   { id: "c-imo2025", groupId: "g-reason", name: "IMO 2025", unit: "pct", order: 8, desc: "IMO 2025：数学奥赛证明题（6 题满分 42，双评取低）；原图 M3 记 35/42，此处换算为百分制。目前仅 M3 有值；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-usamo2026", groupId: "g-reason", name: "USAMO 2026", unit: "pct", order: 9, desc: "USAMO 2026：数学奥赛证明题（6 题满分 42）；原图 M3 记 36/42 换算为百分制，其余模型原图即为百分比；来自对比图⑤。" }, // 来源：图片⑤
+  { id: "c-biomystery", groupId: "g-reason", name: "BioMysteryBench", unit: "pct", order: 10, desc: "生物谜题推理（Hy4 表归入 STEM Agent 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-superchem", groupId: "g-reason", name: "SUPERChem", unit: "pct", order: 11, desc: "化学推理评测（Hy4 表 Reasoning 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-arxivmath", groupId: "g-reason", name: "ArXivMath", unit: "pct", order: 12, desc: "arXiv 数学题推理（Hy4 表 Reasoning 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-horizonmath", groupId: "g-reason", name: "HorizonMath", unit: "pct", order: 13, desc: "HorizonMath（pass@4）：数学推理，报 pass@4 通过率（百分制）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-brokenarxiv", groupId: "g-reason", name: "BrokenArXiv", unit: "pct", order: 14, desc: "BrokenArXiv：数学推理评测（Hy4 表 Reasoning 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
   // ── 代码 ──
   { id: "c-swebench-verified", groupId: "g-code", name: "SWE-Bench Verified", unit: "pct", order: 1, desc: "SWE-Bench Verified：真实 GitHub issue 修复率（Verified 集，Claude Code 脚手架跑 4 次取平均）；来自对比图⑤。" }, // 来源：图片⑤
-  { id: "c-swebench-pro", groupId: "g-code", name: "SWE-Bench Pro", unit: "pct", order: 2, desc: "SWE-Bench Pro：真实软件工程任务的修复率（Pro 难度档）；来自对比图④⑤。" }, // 来源：图片④ + 图片⑤
-  { id: "c-sweatlas-qna", groupId: "g-code", name: "SWE Atlas-QnA", unit: "pct", order: 3, desc: "SWE Atlas-Codebase QnA：真实代码库问答任务（MiniMax 博客口径：4C8G 沙箱、3 小时超时）；来自对比图⑤。" }, // 来源：图片⑤
-  { id: "c-sweatlas-tw", groupId: "g-code", name: "SWE Atlas-Test Writing", unit: "pct", order: 4, desc: "SWE Atlas-Test Writing：代码库测试用例编写任务；来自对比图⑤。" }, // 来源：图片⑤
+  { id: "c-swebench-pro", groupId: "g-code", name: "SWE-Bench Pro", unit: "pct", order: 2, desc: "SWE-Bench Pro：真实软件工程任务的修复率（Pro 难度档）；来自对比图④⑤与 Hy4 对比表（Hy4 表注明与 SWE-Bench Multilingual 同用 swe-agent 脚手架）。" }, // 来源：图片④ + 图片⑤ + Hy4对比表
+  { id: "c-sweatlas-qna", groupId: "g-code", name: "SWE Atlas-QnA", unit: "pct", order: 3, desc: "SWE Atlas-Codebase QnA：真实代码库问答任务（MiniMax 博客口径：4C8G 沙箱、3 小时超时；Hy4 表口径：Claude Code、256 轮、修复评分解析并加网络白名单防作弊）；来自对比图⑤与 Hy4 对比表。" }, // 来源：图片⑤ + Hy4对比表
+  { id: "c-sweatlas-tw", groupId: "g-code", name: "SWE Atlas-Test Writing", unit: "pct", order: 4, desc: "SWE Atlas-Test Writing：代码库测试用例编写任务；来自对比图⑤与 Hy4 对比表。" }, // 来源：图片⑤ + Hy4对比表
   { id: "c-swefficiency", groupId: "g-code", name: "SWE-fficiency", unit: "pct", order: 5, desc: "SWE-fficiency：在修复真实 issue 的同时衡量改动效率（开源数据集与流程）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-livesqlbench", groupId: "g-code", name: "LiveSQLBench", unit: "pct", order: 6, desc: "LiveSQLBench-Base-Full：真实 PostgreSQL 库上的 SQL 任务（600 题 / 22 库）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-clbench", groupId: "g-code", name: "CL-bench", unit: "pct", order: 7, desc: "CL-bench：代码任务评测（开源数据集 + 评分细则）；来自对比图⑤。" }, // 来源：图片⑤
@@ -47,41 +53,47 @@ const criteria = [
   { id: "c-paperbench", groupId: "g-code", name: "PaperBench", unit: "pct", order: 9, desc: "PaperBench：自主复现 AI 研究论文（19 篇可复现论文、官方人工评分细则）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-svgbench", groupId: "g-code", name: "SVG-Bench", unit: "pct", order: 10, desc: "SVG-Bench：按指令产出 SVG 图形的能力；来自对比图④⑤。" }, // 来源：图片④ + 图片⑤
   { id: "c-vibev2", groupId: "g-code", name: "VIBE V2", unit: "pct", order: 11, desc: "VIBE V2：纯前端与全栈 Web/Android/iOS 项目从零构建能力（来源大表归入 Coding 类，分组随之从视觉组挪到代码组）；来自对比图④⑤。" }, // 来源：图片④ + 图片⑤
-  { id: "c-deepswe", groupId: "g-code", name: "DeepSWE v1.1", unit: "pct", order: 12, desc: "真实开源仓库上的软件工程任务修复率；官方表脚注说明报的正是 v1.1 任务。" }, // 来源：官方表 + 图片① + 图片② + 图片③
+  { id: "c-deepswe", groupId: "g-code", name: "DeepSWE v1.1", unit: "pct", order: 12, desc: "真实开源仓库上的软件工程任务修复率；官方表脚注说明报的正是 v1.1 任务。Hy4 表口径用 mini-swe-agent（8C16G 沙箱），x/y 两值取第一值。" }, // 来源：官方表 + 图片① + 图片② + 图片③ + Hy4对比表
   { id: "c-progbench-w", groupId: "g-code", name: "ProgramBench（官方表）", unit: "pct", order: 13, desc: "ProgramBench（官方表）：从零写出可运行程序的能力（官方表口径）。名称保留来源标签——与对比图那条去掉标签会重名。" }, // 来源：官方表
-  { id: "c-progbench-i", groupId: "g-code", name: "ProgramBench（对比图）", unit: "pct", order: 14, desc: "ProgramBench（对比图）：从零写出可运行程序的能力（对比图口径）。名称保留来源标签——与官方表那条去掉标签会重名。" }, // 来源：图片①
-  { id: "c-tb21", groupId: "g-code", name: "Terminal-Bench 2.1", unit: "pct", order: 15, desc: "真实终端环境中的命令行任务完成率（2.1 版）。" }, // 来源：官方表 + 图片① + 图片③ + 图片④ + 图片⑤
+  { id: "c-progbench-i", groupId: "g-code", name: "ProgramBench（对比图）", unit: "pct", order: 14, desc: "ProgramBench（对比图）：从零写出可运行程序的能力（对比图口径）。名称保留来源标签——与官方表那条去掉标签会重名。Hy4 表口径：Claude Code、2000 轮（DeepSeek-V4-Pro-0803 思考循环卡死改用 mini-swe-agent）。" }, // 来源：图片① + Hy4对比表
+  { id: "c-tb21", groupId: "g-code", name: "Terminal-Bench 2.1", unit: "pct", order: 15, desc: "真实终端环境中的命令行任务完成率（2.1 版）。Hy4 表口径：Claude Code harness、500 轮 / 12 小时上限（16C32G）。" }, // 来源：官方表 + 图片① + 图片③ + 图片④ + 图片⑤ + Hy4对比表
   { id: "c-tb30", groupId: "g-code", name: "Terminal-Bench 3.0", unit: "pct", order: 16, desc: "终端任务 3.0 版，难度高于 2.1（两个对比图之间有几格数字不一致，取图片①的值）。" }, // 来源：图片① + 图片②
   { id: "c-tb40", groupId: "g-code", name: "Terminal-Bench 4.0", unit: "pct", order: 17, desc: "终端任务 4.0 版，目前最难的终端档位。" }, // 来源：图片①
   { id: "c-frontierswe", groupId: "g-code", name: "FrontierSWE", unit: "pct", order: 18, desc: "前沿难度软件工程任务；官方表报 dominance 分。" }, // 来源：官方表
-  { id: "c-swe-marathon", groupId: "g-code", name: "SWE-Marathon", unit: "pct", order: 19, desc: "长程软件工程任务马拉松。" }, // 来源：官方表
-  { id: "c-posttrainbench", groupId: "g-code", name: "PostTrainBench", unit: "pct", order: 20, desc: "后训练（模型微调）任务能力评测。" }, // 来源：官方表 + 图片⑤
+  { id: "c-swe-marathon", groupId: "g-code", name: "SWE-Marathon", unit: "pct", order: 19, desc: "长程软件工程任务马拉松。Hy4 表口径：官方设置但 agent 超时翻倍，每题重复跑到取得 8 个有效分。" }, // 来源：官方表 + Hy4对比表
+  { id: "c-posttrainbench", groupId: "g-code", name: "PostTrainBench", unit: "pct", order: 20, desc: "后训练（模型微调）任务能力评测。Hy4 表行名 PostTrainBench V1.1（V1.1 口径）。" }, // 来源：官方表 + 图片⑤ + Hy4对比表
   { id: "c-mlsbench", groupId: "g-code", name: "MLS-Bench-Lite", unit: "pct", order: 21, desc: "机器学习系统工程任务（轻量集）。" }, // 来源：官方表
   { id: "c-scicode", groupId: "g-code", name: "SciCode", unit: "pct", order: 22, desc: "科研级编程题；官方表标注取自 Artificial Analysis。" }, // 来源：官方表
   { id: "c-kimicodebench", groupId: "g-code", name: "Kimi Code Bench 2.0", unit: "pct", order: 23, desc: "Kimi 内部代码评测（2.0 版）。" }, // 来源：官方表
-  { id: "c-nl2repo", groupId: "g-code", name: "NL2Repo-Bench", unit: "pct", order: 24, desc: "自然语言需求 → 完整代码仓库的端到端工程能力。图片① 与图片⑤（MiniMax 博客，含沙箱防作弊限制）口径不同，分值差异较大，按优先级取图片①。" }, // 来源：图片① + 图片⑤
-  { id: "c-cybergym", groupId: "g-code", name: "CyberGym", unit: "pct", order: 25, desc: "网络安全攻防靶场综合表现。" }, // 来源：图片①
+  { id: "c-nl2repo", groupId: "g-code", name: "NL2Repo-Bench", unit: "pct", order: 24, desc: "自然语言需求 → 完整代码仓库的端到端工程能力。图片① 与图片⑤（MiniMax 博客，含沙箱防作弊限制）口径不同，分值差异较大，按优先级取图片①。Hy4 表口径：Claude Code、1000 轮 + 防作弊提示与工具调用监控。" }, // 来源：图片① + 图片⑤ + Hy4对比表
+  { id: "c-cybergym", groupId: "g-code", name: "CyberGym", unit: "pct", order: 25, desc: "网络安全攻防靶场综合表现。" }, // 来源：图片① + Hy4对比表
   { id: "c-secbench", groupId: "g-code", name: "SEC-Bench Pro", unit: "pct", order: 26, desc: "安全漏洞修复 / 利用能力，专业难度档。" }, // 来源：图片①
   { id: "c-exploitgym", groupId: "g-code", name: "ExploitGym", unit: "pct", order: 27, desc: "漏洞利用能力评测（Gym 环境）。" }, // 来源：图片①
   { id: "c-codeforces", groupId: "g-code", name: "Codeforces", unit: "num", order: 28, desc: "竞技编程 Elo 评分（数值型，不是百分比）。" }, // 来源：图片①
+  { id: "c-swebench-ml", groupId: "g-code", name: "SWE-Bench Multilingual", unit: "pct", order: 29, desc: "SWE-Bench Multilingual：多语言真实 GitHub issue 修复率（Hy4 表注明与 SWE-Bench Pro 同用 swe-agent 脚手架）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-sweatlas-rf", groupId: "g-code", name: "SWE Atlas-Refactoring", unit: "pct", order: 30, desc: "SWE Atlas-Refactoring：真实代码库重构任务（Hy4 表口径：Claude Code、256 轮、修复评分解析并加网络白名单防作弊）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-harbor", groupId: "g-code", name: "Harbor-Index", unit: "pct", order: 31, desc: "Harbor-Index：智能体综合任务索引评测（Hy4 表 Agentic Coding 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hybackend", groupId: "g-code", name: "Hy-Backend 2.0", unit: "pct", order: 32, desc: "腾讯混元内部后端开发任务评测（2.0 版）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hyswemax", groupId: "g-code", name: "Hy-SWE Max Verified", unit: "pct", order: 33, desc: "腾讯混元内部自建软件工程基准（300 题，Claude Code 脚手架 200 轮，沙箱 16C32G、禁网与禁图片、隐藏验证测试判 pass/fail，3 次取平均）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hycompany", groupId: "g-code", name: "Hy-CompanyBench V2", unit: "pct", order: 34, desc: "腾讯混元内部企业场景任务评测（V2）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
   // ── 智能体 ──
   { id: "c-browsecomp", groupId: "g-agent", name: "BrowseComp", unit: "pct", order: 1, desc: "网页浏览检索类智能体任务。" }, // 来源：官方表 + 图片④ + 图片⑤
-  { id: "c-draco", groupId: "g-agent", name: "DRACO", unit: "pct", order: 2, desc: "DRACO：深度研究任务（官方评分细则逐题打分，评分模型 Claude Opus 4.6）；来自对比图⑤。" }, // 来源：图片⑤
+  { id: "c-draco", groupId: "g-agent", name: "DRACO", unit: "pct", order: 2, desc: "DRACO：深度研究任务（官方评分细则逐题打分，评分模型 Claude Opus 4.6）；来自对比图⑤与 Hy4 对比表。" }, // 来源：图片⑤ + Hy4对比表
   { id: "c-deepsearchqa", groupId: "g-agent", name: "DeepSearchQA", unit: "pct", order: 3, desc: "DeepSearchQA（F1）：深度检索问答，指标为 F1。" }, // 来源：官方表
   { id: "c-researchrubrics", groupId: "g-agent", name: "ResearchRubrics", unit: "pct", order: 4, desc: "深度研究产出的评分细则达成率。" }, // 来源：官方表
-  { id: "c-gdpval", groupId: "g-agent", name: "GDPval-AA v2", unit: "num", order: 5, desc: "GDPval-AA v2（Elo）：Artificial Analysis 的 GDPval v2，Elo 数值口径（单位已标为「数值」）。" }, // 来源：官方表 + 图片② + 图片③
-  { id: "c-toolathlon", groupId: "g-agent", name: "Toolathlon-Verified", unit: "pct", order: 6, desc: "工具调用综合任务（复核版）。" }, // 来源：官方表
+  { id: "c-gdpval", groupId: "g-agent", name: "GDPval-AA v2", unit: "num", order: 5, desc: "GDPval-AA v2（Elo）：Artificial Analysis 的 GDPval v2，Elo 数值口径（单位已标为「数值」）。" }, // 来源：官方表 + 图片② + 图片③ + Hy4对比表
+  { id: "c-toolathlon", groupId: "g-agent", name: "Toolathlon-Verified", unit: "pct", order: 6, desc: "工具调用综合任务（复核版）。Hy4 表口径：内部 scaffold、部分 MCP 工具内部重实现、2C16G、2 小时超时；108 题复核集与 3 次 Pass@1 协议不变。" }, // 来源：官方表 + Hy4对比表
   { id: "c-mcpmark", groupId: "g-agent", name: "MCPMark-Verified", unit: "pct", order: 7, desc: "MCP 工具使用评测（复核版）。" }, // 来源：官方表
-  { id: "c-mcpatlas", groupId: "g-agent", name: "MCP-Atlas", unit: "pct", order: 8, desc: "MCP 工具使用评测（Atlas 集，500 题公开子集）。" }, // 来源：官方表 + 图片④ + 图片⑤
+  { id: "c-mcpatlas", groupId: "g-agent", name: "MCP-Atlas", unit: "pct", order: 8, desc: "MCP 工具使用评测（Atlas 集，500 题公开子集）。Hy4 表口径：Scale 2026-04 方法、保留每题 100 次工具调用预算、judge 升级为 Gemini 3.1 Pro Preview。" }, // 来源：官方表 + 图片④ + 图片⑤ + Hy4对比表
   { id: "c-autobench-w", groupId: "g-agent", name: "AutomationBench（官方表）", unit: "pct", order: 9, desc: "AutomationBench（官方表）：端到端自动化办公任务（官方表口径，600 题公开子集）。名称保留来源标签——与对比图那条去掉标签会重名。" }, // 来源：官方表
-  { id: "c-autobench-i", groupId: "g-agent", name: "AutomationBench（对比图）", unit: "pct", order: 10, desc: "AutomationBench（对比图）：端到端自动化任务（对比图口径；图片③ 标注为 AutomationBench v1.0.6）。名称保留来源标签——与官方表那条去掉标签会重名。" }, // 来源：图片① + 图片② + 图片③
-  { id: "c-jobbench", groupId: "g-agent", name: "JobBench", unit: "pct", order: 11, desc: "职业场景任务评测。" }, // 来源：官方表
+  { id: "c-autobench-i", groupId: "g-agent", name: "AutomationBench（对比图）", unit: "pct", order: 10, desc: "AutomationBench（对比图）：端到端自动化任务（对比图口径；图片③ 标注为 AutomationBench v1.0.6，Hy4 表同标注 v1.0.6）。名称保留来源标签——与官方表那条去掉标签会重名。" }, // 来源：图片① + 图片② + 图片③ + Hy4对比表
+  { id: "c-jobbench", groupId: "g-agent", name: "JobBench", unit: "pct", order: 11, desc: "职业场景任务评测。" }, // 来源：官方表 + Hy4对比表
   { id: "c-aabriefcase", groupId: "g-agent", name: "AA-Briefcase", unit: "num", order: 12, desc: "AA-Briefcase（Elo）：Artificial Analysis 的办公交付物任务，Elo 数值口径（单位已标为「数值」）。" }, // 来源：官方表
-  { id: "c-agents-last", groupId: "g-agent", name: "Agents' Last Exam", unit: "pct", order: 13, desc: "长程智能体任务综合考试（官方表为主，对比图补；两处数字不一致的按官方表取）。" }, // 来源：官方表 + 图片① + 图片② + 图片③
+  { id: "c-agents-last", groupId: "g-agent", name: "Agents' Last Exam", unit: "pct", order: 13, desc: "长程智能体任务综合考试（官方表为主，对比图补；两处数字不一致的按官方表取）。Hy4 表行名 ALE-CLI：105 题、官方评测协议、Claude Code harness（每题最长 12 小时，官方 ALE 评分器打分）。" }, // 来源：官方表 + 图片① + 图片② + 图片③ + Hy4对比表
   { id: "c-gdpval-rubrics", groupId: "g-agent", name: "GDPval rubrics", unit: "pct", order: 14, desc: "GDPval rubrics：GDPval 的评分细则达成率口径（与官方表的 GDPval-AA v2 Elo 口径不同）；来自对比图④⑤。" }, // 来源：图片④ + 图片⑤
-  { id: "c-bankertoolbench", groupId: "g-agent", name: "BankerToolBench", unit: "pct", order: 15, desc: "BankerToolBench：银行场景的工具调用任务；来自对比图④⑤。" }, // 来源：图片④ + 图片⑤
-  { id: "c-apexagents", groupId: "g-agent", name: "APEX-Agents", unit: "pct", order: 16, desc: "APEX 智能体榜。" }, // 来源：官方表 + 图片⑤
-  { id: "c-officeqa", groupId: "g-agent", name: "OfficeQA Pro", unit: "pct", order: 17, desc: "办公文档问答（PDF 全部以图片给出，无机器可读文本）。" }, // 来源：官方表 + 图片⑤
+  { id: "c-bankertoolbench", groupId: "g-agent", name: "BankerToolBench", unit: "pct", order: 15, desc: "BankerToolBench：银行场景的工具调用任务；来自对比图④⑤与 Hy4 对比表（Hy4 表口径：OpenCode 脚手架、Gemini 3 Flash 评审）。" }, // 来源：图片④ + 图片⑤ + Hy4对比表
+  { id: "c-apexagents", groupId: "g-agent", name: "APEX-Agents", unit: "pct", order: 16, desc: "APEX 智能体榜（pass@1）。Hy4 表口径：官方 ReAct Toolbelt harness、每试最多 250 步（4C16G）。" }, // 来源：官方表 + 图片⑤ + Hy4对比表
+  { id: "c-officeqa", groupId: "g-agent", name: "OfficeQA Pro", unit: "pct", order: 17, desc: "办公文档问答（PDF 全部以图片给出，无机器可读文本）。Hy4 表口径：GPT 系用 Codex CLI，其余用 Claude Code。" }, // 来源：官方表 + 图片⑤ + Hy4对比表
   { id: "c-spreadsheet-v1", groupId: "g-agent", name: "SpreadSheetBench-v1", unit: "pct", order: 18, desc: "SpreadSheetBench（v1）：电子表格任务 v1 口径（与官方表的 SpreadsheetBench 2 是不同版本）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-spreadsheet", groupId: "g-agent", name: "SpreadsheetBench 2", unit: "pct", order: 19, desc: "电子表格任务（第 2 版）。" }, // 来源：官方表
   { id: "c-osworld-v", groupId: "g-agent", name: "OSWorld-Verified", unit: "pct", order: 20, desc: "真实操作系统操作任务（复核版）。" }, // 来源：官方表 + 图片④ + 图片⑤
@@ -95,6 +107,16 @@ const criteria = [
   { id: "c-ycbench", groupId: "g-agent", name: "YC-Bench", unit: "num", order: 28, desc: "YC-Bench：创业孵化模拟智能体任务，指标为最终资产（原图记作 2.10M 等，此处按百万美元数值计）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-locabench", groupId: "g-agent", name: "LOCA-Bench", unit: "pct", order: 29, desc: "LOCA-Bench（256k）：长上下文智能体任务（官方 react 模式，环境描述长度 256k）；来自对比图⑤。" }, // 来源：图片⑤
   { id: "c-claweval", groupId: "g-agent", name: "Claw-Eval", unit: "pct", order: 30, desc: "Claw-Eval：通用任务组（161 题）智能体评测，指标为 Pass³；来自对比图⑤。" }, // 来源：图片⑤
+  { id: "c-widesearch", groupId: "g-agent", name: "WideSearch", unit: "pct", order: 31, desc: "WideSearch：宽域搜索任务（Hy4 表 Agentic Search 类，均用其内部 harness）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-onemillion", groupId: "g-agent", name: "OneMillionBench", unit: "pct", order: 32, desc: "OneMillionBench（with tools）：允许调用工具的搜索任务；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hylifesearch", groupId: "g-agent", name: "Hy-LifeSearch", unit: "pct", order: 33, desc: "腾讯混元内部生活信息搜索任务；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hybrowsecomp", groupId: "g-agent", name: "Hy-BrowseComp-Pro2", unit: "pct", order: 34, desc: "腾讯混元内部 BrowseComp-Pro2 搜索任务；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-skillsbench", groupId: "g-agent", name: "SkillsBench", unit: "pct", order: 35, desc: "SkillsBench（79 题 text-only 自包含子集，不含多模态任务）：所有模型经 Claude Code 评测、3 次运行取平均；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-workspacebench", groupId: "g-agent", name: "WorkspaceBench", unit: "pct", order: 36, desc: "工作区智能体任务评测（Hy4 表 Working Agent 类）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-ebench", groupId: "g-agent", name: "E-Bench", unit: "pct", order: 37, desc: "腾讯混元内部企业办公评测（E-Bench）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-ebenchcode", groupId: "g-agent", name: "E-Bench-Code", unit: "pct", order: 38, desc: "腾讯混元内部企业办公评测的代码子集（E-Bench-Code）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hyfinagent", groupId: "g-agent", name: "Hy-FinAgentBench", unit: "pct", order: 39, desc: "腾讯混元内部金融智能体任务评测；来自 Hy4 对比表。" }, // 来源：Hy4对比表
+  { id: "c-hyfinmodel", groupId: "g-agent", name: "Hy-FinmodelBench v2", unit: "pct", order: 40, desc: "腾讯混元内部金融建模任务评测（v2）；来自 Hy4 对比表。" }, // 来源：Hy4对比表
   // ── 视觉 ──
   { id: "c-worldvqa", groupId: "g-vision", name: "WorldVQA ForceAnswer", unit: "pct", order: 1, desc: "世界知识视觉问答。" }, // 来源：官方表
   { id: "c-omnidoc", groupId: "g-vision", name: "OmniDocBench", unit: "pct", order: 2, desc: "文档理解评测。" }, // 来源：官方表 + 图片⑤
@@ -119,7 +141,9 @@ const modelGroups = [
   { id: "mg-deepseek", name: "DeepSeek", order: 5 },
   { id: "mg-google", name: "Google", order: 6 },
   { id: "mg-minimax", name: "MiniMax", order: 7 },
-  { id: "mg-unknown", name: "未标注厂商", order: 8 },
+  { id: "mg-hunyuan", name: "腾讯混元", order: 8 },
+  { id: "mg-qwen", name: "Qwen", order: 9 },
+  { id: "mg-unknown", name: "未标注厂商", order: 10 },
 ];
 
 const models = [
@@ -152,6 +176,11 @@ const models = [
   // ── MiniMax ──
   { id: "m-minimax-m27", groupId: "mg-minimax", name: "MiniMax M2.7", order: 1 },
   { id: "m-minimax-m3", groupId: "mg-minimax", name: "MiniMax M3", order: 2 },
+  // ── 腾讯混元 ──
+  { id: "m-hy4preview", groupId: "mg-hunyuan", name: "Hy4 preview", order: 1 },
+  { id: "m-hy3", groupId: "mg-hunyuan", name: "Hy3", order: 2 },
+  // ── Qwen ──
+  { id: "m-qwen38max", groupId: "mg-qwen", name: "Qwen 3.8 Max", order: 1 },
   // ── 未标注厂商 ──
   { id: "m-table5", groupId: "mg-unknown", name: "Table 5", order: 1 },
 ];
@@ -166,6 +195,14 @@ const scores = {
     "c-hle": 43.5,
     "c-hle-tools": 59.8,
     "c-math-apex": 65.6,
+    "c-biomystery": 61.3,
+    "c-superchem": 66.9,
+    "c-arxivmath": 60.8,
+    "c-horizonmath": 7.08,
+    "c-brokenarxiv": 56.3,
+    "c-swebench-pro": 63.3,
+    "c-sweatlas-qna": 35.2,
+    "c-sweatlas-tw": 35.6,
     "c-deepswe": 67.5,
     "c-progbench-w": 77.8,
     "c-progbench-i": 17.5,
@@ -180,7 +217,13 @@ const scores = {
     "c-kimicodebench": 72.9,
     "c-nl2repo": 58,
     "c-cybergym": 80,
+    "c-swebench-ml": 80.8,
+    "c-sweatlas-rf": 37.4,
+    "c-hybackend": 37.9,
+    "c-hyswemax": 65.6,
+    "c-hycompany": 63.3,
     "c-browsecomp": 91.2,
+    "c-draco": 77.5,
     "c-deepsearchqa": 95,
     "c-researchrubrics": 76.2,
     "c-gdpval": 1686,
@@ -192,6 +235,7 @@ const scores = {
     "c-jobbench": 54.3,
     "c-aabriefcase": 1548,
     "c-agents-last": 28.3,
+    "c-bankertoolbench": 73.5,
     "c-apexagents": 41,
     "c-officeqa": 63.3,
     "c-spreadsheet": 34.8,
@@ -203,6 +247,16 @@ const scores = {
     "c-corpfin": 71.6,
     "c-financeagent": 54.4,
     "c-legalresearch": 44.2,
+    "c-widesearch": 81,
+    "c-onemillion": 63.5,
+    "c-hylifesearch": 45.8,
+    "c-hybrowsecomp": 58.1,
+    "c-skillsbench": 51.9,
+    "c-workspacebench": 65,
+    "c-ebench": 73.8,
+    "c-ebenchcode": 77.6,
+    "c-hyfinagent": 78.5,
+    "c-hyfinmodel": 52.4,
     "c-worldvqa": 51,
     "c-omnidoc": 91.1,
     "c-perception": 58.5,
@@ -354,17 +408,53 @@ const scores = {
   },
   "m-opus50": {
     "c-gpqa": 93.4,
+    "c-critpt": 29.1,
     "c-hle": 56.3,
     "c-hle-tools": 63.6,
+    "c-math-apex": 91.4,
+    "c-biomystery": 72.1,
+    "c-superchem": 76.7,
+    "c-arxivmath": 71.5,
+    "c-horizonmath": 5.3,
+    "c-brokenarxiv": 77.7,
+    "c-swebench-pro": 79.2,
+    "c-sweatlas-qna": 57.5,
+    "c-sweatlas-tw": 68.7,
     "c-deepswe": 74,
     "c-progbench-i": 37,
     "c-tb21": 89.1,
     "c-tb30": 43.3,
     "c-tb40": 51.8,
+    "c-swe-marathon": 50,
+    "c-posttrainbench": 35,
     "c-nl2repo": 75.3,
     "c-exploitgym": 22.1,
+    "c-swebench-ml": 89.5,
+    "c-sweatlas-rf": 60,
+    "c-harbor": 56.9,
+    "c-hybackend": 40.3,
+    "c-hyswemax": 70.1,
+    "c-hycompany": 72.7,
+    "c-draco": 88.6,
+    "c-gdpval": 1831,
+    "c-toolathlon": 76.5,
+    "c-mcpatlas": 85.7,
     "c-autobench-i": 50.3,
+    "c-jobbench": 68,
     "c-agents-last": 28.6,
+    "c-bankertoolbench": 81.9,
+    "c-apexagents": 41.8,
+    "c-officeqa": 66.9,
+    "c-widesearch": 84,
+    "c-onemillion": 68.1,
+    "c-hylifesearch": 56.1,
+    "c-hybrowsecomp": 61.3,
+    "c-skillsbench": 63.7,
+    "c-workspacebench": 75,
+    "c-ebench": 77.8,
+    "c-ebenchcode": 82.7,
+    "c-hyfinagent": 82,
+    "c-hyfinmodel": 66,
     "c-babyvision": 94.1,
     "c-zerobench-main": 52,
     "c-chartography": 84,
@@ -390,6 +480,15 @@ const scores = {
     "c-hlefull": 44.5,
     "c-hle": 44.5,
     "c-hle-tools": 64.5,
+    "c-math-apex": 90,
+    "c-biomystery": 73.1,
+    "c-superchem": 73.6,
+    "c-arxivmath": 79.5,
+    "c-horizonmath": 10.62,
+    "c-brokenarxiv": 64.4,
+    "c-swebench-pro": 64.6,
+    "c-sweatlas-qna": 58.1,
+    "c-sweatlas-tw": 49.6,
     "c-deepswe": 73,
     "c-progbench-w": 77.6,
     "c-progbench-i": 23,
@@ -406,7 +505,14 @@ const scores = {
     "c-cybergym": 84.5,
     "c-secbench": 74.3,
     "c-exploitgym": 33.7,
+    "c-swebench-ml": 74.1,
+    "c-sweatlas-rf": 52.4,
+    "c-harbor": 46.3,
+    "c-hybackend": 49.6,
+    "c-hyswemax": 69.8,
+    "c-hycompany": 70.6,
     "c-browsecomp": 90.4,
+    "c-draco": 77.7,
     "c-researchrubrics": 73.8,
     "c-gdpval": 1736,
     "c-toolathlon": 74.9,
@@ -417,6 +523,7 @@ const scores = {
     "c-jobbench": 45.4,
     "c-aabriefcase": 1495,
     "c-agents-last": 29.6,
+    "c-bankertoolbench": 79,
     "c-apexagents": 39.9,
     "c-officeqa": 63.2,
     "c-spreadsheet": 32.4,
@@ -428,6 +535,16 @@ const scores = {
     "c-corpfin": 64.4,
     "c-financeagent": 53.8,
     "c-legalresearch": 48.1,
+    "c-widesearch": 86.3,
+    "c-onemillion": 67.1,
+    "c-hylifesearch": 63.4,
+    "c-hybrowsecomp": 56.4,
+    "c-skillsbench": 62.5,
+    "c-workspacebench": 65.3,
+    "c-ebench": 80.6,
+    "c-ebenchcode": 83.3,
+    "c-hyfinagent": 83,
+    "c-hyfinmodel": 65.3,
     "c-worldvqa": 41.8,
     "c-omnidoc": 85.8,
     "c-perception": 59.7,
@@ -556,19 +673,50 @@ const scores = {
   },
   "m-glm53": {
     "c-gpqa": 88.1,
+    "c-critpt": 19.1,
     "c-hle": 42,
     "c-hle-tools": 62.5,
+    "c-biomystery": 69,
+    "c-superchem": 58.5,
+    "c-swebench-pro": 64.6,
+    "c-sweatlas-qna": 55.8,
+    "c-sweatlas-tw": 49.6,
     "c-deepswe": 66.9,
     "c-progbench-i": 19,
     "c-tb21": 88.2,
     "c-tb30": 28.3,
     "c-tb40": 37.9,
+    "c-swe-marathon": 42.5,
+    "c-posttrainbench": 33.2,
     "c-nl2repo": 58,
     "c-cybergym": 84.5,
     "c-exploitgym": 15,
+    "c-swebench-ml": 81.3,
+    "c-sweatlas-rf": 51.9,
+    "c-harbor": 42.5,
+    "c-hybackend": 41.9,
+    "c-hyswemax": 67.2,
+    "c-hycompany": 64.5,
+    "c-draco": 78.1,
     "c-gdpval": 1769,
+    "c-toolathlon": 73,
+    "c-mcpatlas": 81.9,
     "c-autobench-i": 48.8,
+    "c-jobbench": 58.2,
     "c-agents-last": 28.5,
+    "c-bankertoolbench": 77.8,
+    "c-apexagents": 38.1,
+    "c-officeqa": 66.2,
+    "c-widesearch": 83.2,
+    "c-onemillion": 64.5,
+    "c-hylifesearch": 49.2,
+    "c-hybrowsecomp": 48.4,
+    "c-skillsbench": 63.3,
+    "c-workspacebench": 68.2,
+    "c-ebench": 71.4,
+    "c-ebenchcode": 66.5,
+    "c-hyfinagent": 80.4,
+    "c-hyfinmodel": 57.8,
   },
   "m-glm53f": {
     "c-hle-tools": 55.3,
@@ -601,27 +749,60 @@ const scores = {
   },
   "m-dspro": {
     "c-gpqa": 92.4,
+    "c-critpt": 18,
     "c-hle": 42.7,
     "c-hle-tools": 60,
     "c-math-apex": 65.3,
+    "c-biomystery": 61.6,
+    "c-superchem": 62,
+    "c-arxivmath": 62.1,
+    "c-horizonmath": 4.42,
+    "c-brokenarxiv": 43.1,
     "c-swebench-verified": 80.6,
     "c-swebench-pro": 55.4,
+    "c-sweatlas-qna": 53.4,
+    "c-sweatlas-tw": 45.6,
     "c-deepswe": 62.7,
     "c-progbench-i": 15.5,
     "c-tb21": 87.9,
     "c-tb30": 11.8,
     "c-tb40": 12.4,
+    "c-swe-marathon": 19,
+    "c-posttrainbench": 24.5,
     "c-nl2repo": 61.5,
     "c-cybergym": 83.3,
     "c-codeforces": 3850,
+    "c-swebench-ml": 77.3,
+    "c-sweatlas-rf": 48.6,
+    "c-harbor": 36.9,
+    "c-hybackend": 33.8,
+    "c-hyswemax": 65.7,
+    "c-hycompany": 64.4,
     "c-browsecomp": 83.4,
+    "c-draco": 77.3,
+    "c-gdpval": 1580,
+    "c-toolathlon": 74.1,
     "c-mcpatlas": 73.6,
     "c-autobench-i": 43.2,
+    "c-jobbench": 54.1,
     "c-agents-last": 25.7,
     "c-gdpval-rubrics": 70.32,
+    "c-bankertoolbench": 73.1,
+    "c-apexagents": 32.4,
+    "c-officeqa": 65.4,
     "c-spreadsheet-v1": 84.9,
     "c-osworld-v": 80.6,
     "c-claweval": 58.4,
+    "c-widesearch": 81.8,
+    "c-onemillion": 62,
+    "c-hylifesearch": 46.9,
+    "c-hybrowsecomp": 46.5,
+    "c-skillsbench": 65,
+    "c-workspacebench": 65.4,
+    "c-ebench": 61.3,
+    "c-ebenchcode": 64.3,
+    "c-hyfinagent": 78.5,
+    "c-hyfinmodel": 51.3,
   },
   "m-ds4f": {
     "c-gpqa": 89.9,
@@ -744,6 +925,149 @@ const scores = {
     "c-videomme": 85.4,
     "c-videommmu": 84.6,
     "c-mmmupro": 78.1,
+  },
+  "m-hy4preview": {
+    "c-gpqa": 92.3,
+    "c-critpt": 16.9,
+    "c-hle": 43.4,
+    "c-hle-tools": 55.4,
+    "c-math-apex": 74.2,
+    "c-biomystery": 71.3,
+    "c-superchem": 66.4,
+    "c-arxivmath": 66.6,
+    "c-horizonmath": 8.8,
+    "c-brokenarxiv": 54.6,
+    "c-swebench-pro": 65.7,
+    "c-sweatlas-qna": 64,
+    "c-sweatlas-tw": 57.8,
+    "c-deepswe": 64.3,
+    "c-progbench-i": 17.5,
+    "c-tb21": 85.4,
+    "c-swe-marathon": 31.9,
+    "c-posttrainbench": 35.6,
+    "c-nl2repo": 58.9,
+    "c-cybergym": 78.4,
+    "c-swebench-ml": 82.9,
+    "c-sweatlas-rf": 53.3,
+    "c-harbor": 39.6,
+    "c-hybackend": 35.2,
+    "c-hyswemax": 64.2,
+    "c-hycompany": 62.4,
+    "c-draco": 77.2,
+    "c-gdpval": 1678,
+    "c-toolathlon": 74.1,
+    "c-mcpatlas": 83.7,
+    "c-autobench-i": 32.1,
+    "c-jobbench": 61.7,
+    "c-agents-last": 22.8,
+    "c-bankertoolbench": 78.6,
+    "c-apexagents": 37.1,
+    "c-officeqa": 66.2,
+    "c-widesearch": 83.9,
+    "c-onemillion": 65.4,
+    "c-hylifesearch": 49.2,
+    "c-hybrowsecomp": 56.1,
+    "c-skillsbench": 62.9,
+    "c-workspacebench": 60.2,
+    "c-ebench": 77.1,
+    "c-ebenchcode": 79,
+    "c-hyfinagent": 79.7,
+    "c-hyfinmodel": 57,
+  },
+  "m-hy3": {
+    "c-gpqa": 90.9,
+    "c-critpt": 4.9,
+    "c-hle": 34.4,
+    "c-hle-tools": 51.9,
+    "c-math-apex": 38.7,
+    "c-biomystery": 54.9,
+    "c-superchem": 52.6,
+    "c-arxivmath": 51.7,
+    "c-horizonmath": 3.5,
+    "c-brokenarxiv": 26.7,
+    "c-swebench-pro": 57.9,
+    "c-sweatlas-qna": 30.8,
+    "c-sweatlas-tw": 35.9,
+    "c-deepswe": 28,
+    "c-progbench-i": 3,
+    "c-tb21": 70.8,
+    "c-swe-marathon": 5,
+    "c-posttrainbench": 14.5,
+    "c-nl2repo": 45.6,
+    "c-cybergym": 51.8,
+    "c-swebench-ml": 75.8,
+    "c-sweatlas-rf": 32.9,
+    "c-harbor": 15.6,
+    "c-hybackend": 26.2,
+    "c-hyswemax": 49,
+    "c-hycompany": 29.8,
+    "c-draco": 65.2,
+    "c-gdpval": 1213,
+    "c-toolathlon": 56.2,
+    "c-mcpatlas": 75,
+    "c-autobench-i": 16.1,
+    "c-jobbench": 34.6,
+    "c-agents-last": 17.1,
+    "c-bankertoolbench": 68.8,
+    "c-apexagents": 24.4,
+    "c-officeqa": 54.1,
+    "c-widesearch": 81.9,
+    "c-onemillion": 51.5,
+    "c-hylifesearch": 38.9,
+    "c-hybrowsecomp": 55,
+    "c-skillsbench": 55.3,
+    "c-workspacebench": 58.2,
+    "c-ebench": 48.5,
+    "c-ebenchcode": 64.4,
+    "c-hyfinagent": 69.5,
+    "c-hyfinmodel": 28.6,
+  },
+  "m-qwen38max": {
+    "c-gpqa": 92.6,
+    "c-critpt": 20,
+    "c-hle": 43.6,
+    "c-hle-tools": 56.2,
+    "c-math-apex": 72.8,
+    "c-biomystery": 58.9,
+    "c-superchem": 61.9,
+    "c-arxivmath": 67.1,
+    "c-horizonmath": 5.31,
+    "c-brokenarxiv": 42.7,
+    "c-swebench-pro": 67.7,
+    "c-sweatlas-qna": 55.4,
+    "c-sweatlas-tw": 52.8,
+    "c-deepswe": 56.6,
+    "c-progbench-i": 17.5,
+    "c-tb21": 86.6,
+    "c-swe-marathon": 31,
+    "c-nl2repo": 55.9,
+    "c-cybergym": 78.5,
+    "c-swebench-ml": 82.6,
+    "c-sweatlas-rf": 51,
+    "c-harbor": 38.8,
+    "c-hybackend": 34.9,
+    "c-hyswemax": 65.2,
+    "c-hycompany": 63.3,
+    "c-draco": 76.4,
+    "c-gdpval": 1717,
+    "c-toolathlon": 72.5,
+    "c-mcpatlas": 81.9,
+    "c-autobench-i": 39.8,
+    "c-jobbench": 53,
+    "c-agents-last": 25.4,
+    "c-bankertoolbench": 74.7,
+    "c-apexagents": 34,
+    "c-officeqa": 65.4,
+    "c-widesearch": 81.9,
+    "c-onemillion": 63.1,
+    "c-hylifesearch": 47.5,
+    "c-hybrowsecomp": 46.7,
+    "c-skillsbench": 66.7,
+    "c-workspacebench": 67.7,
+    "c-ebench": 66.8,
+    "c-ebenchcode": 67.1,
+    "c-hyfinagent": 77.2,
+    "c-hyfinmodel": 52.5,
   },
   "m-table5": {
     "c-hle-tools": 63.9,

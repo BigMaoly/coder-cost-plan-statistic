@@ -13,12 +13,31 @@ const webRoot = fileURLToPath(new URL('../web/', import.meta.url));
 const appJs = readFileSync(join(webRoot, 'app.js'), 'utf8');
 const indexHtml = readFileSync(join(webRoot, 'index.html'), 'utf8');
 
-test('统计工具下拉：「全部平台」为构造首项且为默认选中值', () => {
-  // 默认选中全部平台（spec: 统计工具切换——默认「全部平台」且为下拉第一项）
-  assert.match(appJs, /const state = \{ tool: 'all'/, 'state.tool 默认值应为 all');
-  // options 构造以「全部平台」为首项（unshift/push 改动会回退到末项）
-  assert.match(appJs, /const options = \['<option value="all">全部平台<\/option>'\];/,
-    'loadTools 应以全部平台为第一项构造 options');
+test('统计工具多选：「全部平台」为复选项首项且默认全选态', () => {
+  // 多选筛选（multi-select-filters-and-filtered-drilldown）：state.tools 为 Set 且初始空集 = 全选态（默认全部平台）
+  assert.match(appJs, /const state = \{ tools: new Set\(\)/, 'state.tools 应为 Set 且初始为全选态（空集 = 全部平台）');
+  // 组件以「全部平台」为「全部」复选项首项；tool 参数统一收口
+  assert.ok(appJs.includes("makeMultiSelect($('toolSel'), { allLabel: '全部平台'"),
+    '统计工具应为多选组件且「全部平台」为首项');
+  assert.match(appJs, /function appendToolParams\(/, 'tool 请求参数应统一经 appendToolParams 收口');
+});
+
+test('三维度复选框多选：组件容器 / 全部三态 / 模型级联 / 下钻共存 / 图例占比', () => {
+  // index.html：三个下拉均为 .msel 容器（原生 select 仅剩年份）
+  assert.match(indexHtml, /<div class="msel" id="toolSel"/, '统计工具应为多选容器');
+  assert.match(indexHtml, /<div class="msel" id="providerSel"/, '提供商应为多选容器');
+  assert.match(indexHtml, /<div class="msel" id="modelSel"/, '模型应为多选容器');
+  // 组件：全部复选项三态 + 外点关闭
+  assert.match(appJs, /data-all="1"/, '应有「全部」复选项');
+  assert.match(appJs, /\.indeterminate = !checked && selected\.size > 0/, '「全部」应支持半选态');
+  // 模型级联：提供商全选态禁用模型下拉；同名模型合并括注提供商
+  assert.match(appJs, /function deriveModelOptions\(/, '模型级联应本地派生');
+  assert.match(appJs, /dm \+ '（' \+ labels\.join\('、'\) \+ '）'/, '同名模型应括注提供商显示名');
+  // 下钻共存：无 drillEnabled 门禁，rebuildDrill 请求携带 provider/model 多值
+  assert.ok(!appJs.includes('drillEnabled()'), '下钻不应再有筛选门禁');
+  assert.match(appJs, /function drillFilterQuery\(/, '下钻请求应携带筛选参数');
+  // 图例占比：名称后 (nn.nn%) 两位小数
+  assert.match(appJs, /toFixed\(2\) \+ '%\)'/, '图例应带两位小数占比');
 });
 
 test('三个设置项列表均有条目排序交互（moveIntent 拦截 + 全量重排 API）', () => {
@@ -271,10 +290,12 @@ test('基准比较：标签 data-bmk 与点击分支、弹窗骨架、样式段�
   assert.match(indexHtml, /id="bmkCmpBody"/, '窗口应有动态渲染容器 #bmkCmpBody');
   assert.match(indexHtml, /id="bmkCmpCloseBtn"/, '窗口应有关闭按钮');
   assert.match(indexHtml, /\.bmk-cmp-summary \{/, '应有 .bmk-cmp- 样式段（摘要条）');
-  assert.match(indexHtml, /\.modal-mask\.bmk-cmp-mask \{ z-index: 93; \}/, '比较窗口应盖过记录窗口（recs-mask 92）');
+  assert.match(indexHtml, /\.modal-mask\.bmk-cmp-mask \{ z-index: 93; padding: 3vh 2vw; \}/, '比较窗口应盖过记录窗口（recs-mask 92）；水平内边距放宽保证 min(1200px,96vw) 生效');
+  assert.match(indexHtml, /\.modal-mask\.me-entry-mask \{ z-index: 94; \}/,
+    '手动录入窗口应显式配层 94：盖过额度统计(91)/记录(92)/比较(93)，低于 qp-menu(95) 等浮件（曾漏配层回落基类 90，被已开窗口压住）');
   // [hidden] 兜底 + 窄屏横向滚动（9 列表最小宽度，不裁列）
   assert.match(indexHtml, /\.bmk-cmp-summary\[hidden\], \.bmk-cmp-fx-row\[hidden\]/, 'flex 容器应有 [hidden] 兜底规则');
-  assert.match(indexHtml, /min-width: 1030px/, '9 列比较表应有最小可用宽度（末三列按区间文本校准；窄屏整表横向滚动，不裁列）');
+  assert.match(indexHtml, /min-width: 940px/, '9 列比较表紧凑校准后的最小宽度（≤950 上限；明细同轨道；窄屏整表横向滚动，不裁列）');
   // 区间值（a ~ b）布局适配：区间字号两分支都生效、U 列区间也挂 rng、末三列加宽轨道
   assert.match(indexHtml, /\.bmk-cmp-cell\.rng \{ font-size: 10\.5px; \}/, '区间单元字号应小于单值（主分支 10.5px）');
   assert.match(indexHtml, /\.bmk-cmp-row \.bmk-cmp-cell\.rng \{ font-size: 10px; \}/, '窄屏分支应显式保留区间字号规则（不被通用字号覆盖）');
@@ -287,28 +308,319 @@ test('基准比较：标签 data-bmk 与点击分支、弹窗骨架、样式段�
   assert.ok(iApp > 0 && iBmk > iApp && iCmp > iBmk, 'quota-benchmark-compare.js 应紧随 quota-benchmark.js（app.js 之后）引入');
 });
 
-test('快照备注：详情行内输入框、maxlength/placeholder、样式段与 keydown/focusout 委托', () => {
-  // 详情渲染：备注行插在「折算等价金额」之后、评估区块之前（quota-snapshot-note）
+test('快照备注：展示/编辑双态文本域、maxlength/placeholder、样式段与委托事件', () => {
+  // 详情渲染：备注区插在「折算等价金额」之后、评估区块之前（snapshot-detail-note-textarea）
   const equivIdx = appJs.indexOf("row('折算等价金额'");
-  const noteIdx = appJs.indexOf("row('备注', '<input type=\"text\" class=\"rd-note\"");
+  const noteIdx = appJs.indexOf('<div class="rd-row rd-note-row">');
   const evalIdx = appJs.indexOf('(s.eval ? evalSectionHtml(s)');
-  assert.ok(equivIdx > -1 && noteIdx > -1 && evalIdx > -1, '详情渲染应含折算等价金额 / 备注行 / 评估区块');
-  assert.ok(noteIdx > equivIdx && noteIdx < evalIdx, '备注行应位于折算等价金额之后、评估区块之前');
-  assert.match(appJs, /class="rd-note" maxlength="200" placeholder="添加备注…"/, '备注输入框应限 200 字并带占位提示');
-  assert.match(appJs, /value="' \+ esc\(s\.note \|\| ''\) \+ '"/, '备注输入框预填值应经 esc 转义');
+  assert.ok(equivIdx > -1 && noteIdx > -1 && evalIdx > -1, '详情渲染应含折算等价金额 / 备注区 / 评估区块');
+  assert.ok(noteIdx > equivIdx && noteIdx < evalIdx, '备注区应位于折算等价金额之后、评估区块之前');
+  assert.match(appJs, /<textarea class="rd-note" readonly rows="1" maxlength="200" placeholder="双击输入备注…" title="双击编辑备注">/, '备注框应默认只读展示态、单行起步、限 200 字、带双击提示');
+  assert.match(appJs, /title="双击编辑备注">' \+ esc\(s\.note \|\| ''\) \+ '<\/textarea>/, '备注初始内容应经 esc 转义');
+  assert.match(appJs, /function fitNoteHeight\(ta\)/, '应存在高度自适应助手');
+  assert.match(appJs, /fitNoteHeight\(host\.querySelector\('\.rd-note'\)\)/, '详情渲染后应立即按内容撑高备注框');
 
-  // 事件委托：Enter/Escape 分支 + focusout 保存路径 + 保存函数无变更 no-op
-  assert.match(appJs, /if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;/, '备注事件应以 class 委托过滤');
-  assert.match(appJs, /if \(e\.key === 'Enter'\) \{\s*e\.preventDefault\(\);\s*e\.target\.blur\(\);/, 'Enter 应阻止默认并走失焦保存');
-  assert.match(appJs, /else if \(e\.key === 'Escape'\) \{[\s\S]*?e\.target\.value = s\.note \|\| '';/s, 'Escape 应还原为已存值');
-  assert.match(appJs, /addEventListener\('focusout', \(e\) => \{\s*if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;/s, '失焦保存应委托在 recsModal 上');
+  // 事件委托：dblclick 进编辑 / input 高度重算 / Escape 还原（无 Enter 拦截）/ focusout 保存+折叠
+  const dblStart = appJs.indexOf("$('recsModal').addEventListener('dblclick'");
+  const foEnd = appJs.indexOf("$('recsModal').addEventListener('focusout'");
+  assert.ok(dblStart > -1 && foEnd > dblStart, '备注 dblclick/input/keydown/focusout 应委托在 recsModal 上');
+  const seg = appJs.slice(dblStart, foEnd);
+  assert.match(seg, /e\.target\.readOnly = false;\s*e\.target\.classList\.add\('editing'\);\s*e\.target\.focus\(\);/, 'dblclick 应解除只读进入编辑态并聚焦');
+  assert.match(seg, /setSelectionRange\(end, end\)/, '进入编辑态应把光标定位到文本末尾');
+  assert.match(seg, /addEventListener\('input', \(e\) => \{\s*if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;\s*fitNoteHeight\(e\.target\);/, 'input 应触发高度随内容重算');
+  assert.ok(!seg.includes("'Enter'"), '回车应保留默认换行，keydown 不再拦截 Enter 保存');
+  assert.match(seg, /e\.key === 'Escape'\) \{[\s\S]*?e\.target\.value = s\.note \|\| '';/, 'Escape 应还原为已存值');
+  assert.match(appJs, /addEventListener\('focusout', \(e\) => \{\s*if \(!e\.target\.classList\?\.contains\('rd-note'\)\) return;\s*if \(recs\.detailId !== null\) saveSnapshotNote\(recs\.detailId, e\.target\.value\);\s*e\.target\.readOnly = true;/s, '失焦应保存并折叠回展示态');
   assert.match(appJs, /async function saveSnapshotNote\(id, value\)/, '应存在 saveSnapshotNote 保存函数');
   assert.match(appJs, /if \(\(value \?\? ''\) === \(s\.note \?\? ''\)\) return;/, '无变更应不发请求');
   assert.ok(appJs.includes("quotaApi('PUT', '/api/quota/snapshots/note'"), '保存应调用备注端点');
   assert.match(appJs, /showToast\('备注已保存'\)/, '保存成功应有 toast 反馈');
 
-  // 样式段：输入框视觉契约（右对齐 + 暗色变量 + 聚焦描边）
-  assert.match(indexHtml, /\.rd-note \{[\s\S]*?text-align: right;/s, '.rd-note 应右对齐');
-  assert.match(indexHtml, /\.rd-note \{[\s\S]*?background: var\(--panel-2\);[\s\S]*?border: 1px solid var\(--border\);/s, '.rd-note 应使用暗色主题变量');
-  assert.match(indexHtml, /\.rd-note:focus \{ border-color: var\(--teal\);/, '.rd-note 聚焦应有 teal 描边');
+  // 样式段：双态契约（展示态无边框透明文本观感 + 编辑态输入框观感 + 聚焦描边 + 左对齐不可拖拽）
+  assert.match(indexHtml, /\.rd-note \{[\s\S]*?cursor: text;[\s\S]*?background: transparent;[\s\S]*?border: 1px solid transparent;/s, '展示态备注框应为无边框透明文本观感');
+  assert.match(indexHtml, /\.rd-note\.editing \{ background: var\(--panel-2\); border-color: var\(--border\); \}/, '编辑态应恢复输入框观感');
+  assert.match(indexHtml, /\.rd-note\.editing:focus \{ border-color: var\(--teal\);/, '编辑态聚焦应有 teal 描边');
+  assert.match(indexHtml, /\.rd-note \{[\s\S]*?resize: none;[\s\S]*?text-align: left;/s, '备注框应不可拖拽且左对齐');
+});
+
+
+/* ================= 快照派生比值与记录条目派生三列（quota-snapshot-detail-hit-rate-and-output-share） ================= */
+
+test('快照详情：命中行与输出行在行尾追加派生比值括注', () => {
+  // 纯函数辅助：两位小数全数值显示；分母不可比值（≤ 0 / 非有限）时返回空串
+  assert.ok(appJs.includes('function pctText(num, den) {'), '应存在 pctText 纯函数');
+  assert.ok(appJs.includes("return (num / den * 100).toFixed(2) + '%';"), '百分比应为两位小数');
+  assert.ok(appJs.includes('function pctNote(num, den) {'), '应存在详情行尾括注辅助 pctNote');
+  // 口径：命中率分母 = 总输入（不含输出）；输出占比分母 = 消耗·合计（三项现算相加）
+  assert.ok(appJs.includes('const tokIn = s.tokens.hit + s.tokens.miss;'), '命中率分母应为总输入');
+  assert.ok(appJs.includes('const tokSum = tokIn + s.tokens.output;'), '输出占比分母应为消耗·合计');
+  // 位置：百分比括注挂在左侧标签文字之后（第一实参），数值列只保留 token 数值 + 等值金额括注
+  const lines = appJs.split('\n');
+  const hitRow = lines.find((l) => l.includes("row('消耗·输入(命中)' + pctNote("));
+  const outRow = lines.find((l) => l.includes("row('消耗·输出' + pctNote("));
+  assert.ok(hitRow && outRow, '命中行与输出行应把 pctNote 追加在左侧标签之后');
+  assert.ok(hitRow.includes('pctNote(s.tokens.hit, tokIn)'), '命中行应带命中率括注');
+  assert.ok(outRow.includes('pctNote(s.tokens.output, tokSum)'), '输出行应带输出占比括注');
+  assert.ok(hitRow.includes("fmtFull(s.tokens.hit) + tcNote('hit', s.tokens.hit)"),
+    '命中行数值列应保持 token 数值 + 等值金额括注（不含百分比）');
+  assert.ok(outRow.includes("fmtFull(s.tokens.output) + tcNote('output', s.tokens.output)"),
+    '输出行数值列应保持 token 数值 + 等值金额括注（不含百分比）');
+});
+
+test('快照详情：未命中行与合计行不新增百分比括注', () => {
+  const rows = appJs.split('\n').filter((l) => l.includes("row('消耗·"));
+  const targets = rows.filter((l) => l.includes('未命中') || l.includes('合计'));
+  assert.equal(targets.length, 2, '应定位到未命中行与合计行');
+  targets.forEach((l) => assert.ok(!l.includes('pctNote('), '未命中行与合计行不应带派生括注：' + l.trim().slice(0, 60)));
+});
+
+test('记录条目：派生三列位于既有三列左侧，表头行含「套餐」与六个数据列标签', () => {
+  assert.ok(appJs.includes('function recsHeadHtml()'), '应存在表头行渲染函数');
+  const head = appJs.slice(appJs.indexOf('function recsHeadHtml()'), appJs.indexOf('function renderRecsList()'));
+  for (const label of ['总token', '命中率', '输出占比', '月token/单位货币', '包月费用', '估计月token']) {
+    assert.ok(head.includes("'" + label + "'"), '表头应含数据列标签 ' + label);
+  }
+  assert.ok(head.includes('>套餐</span>'), '表头左侧应有「套餐」标签');
+  // 表头与条目同渲染在一个滚动容器内（共享滚动条几何，逐列对齐才稳）
+  assert.ok(appJs.includes("$('recsList').innerHTML = recsHeadHtml() + ("), '表头行应与条目列表渲染在同一滚动容器');
+  // 两处对齐占位：同结构元素 + visibility:hidden（禁用硬编码宽度）
+  assert.ok(head.includes('class="recs-check recs-head-ghost"'), '左侧应以不可见复选框占位对齐套餐名起始位置');
+  assert.ok(head.includes('class="icon-btn qp-gear recs-head-ghost"'), '右侧应以不可见 ⚙ 占位对齐数据区右缘');
+  assert.ok(indexHtml.includes('.recs-head-ghost { visibility: hidden; pointer-events: none; }'), '占位元素应保留宽度且不可交互');
+  assert.ok(indexHtml.includes('.recs-head-plan'), '应有左侧「套餐」标签样式');
+  // 派生三列出现在既有三列之前（左侧）
+  const list = appJs.slice(appJs.indexOf('function renderRecsList()'), appJs.indexOf('function renderRecsPager()'));
+  const iTotal = list.indexOf('ri-cell-derived ri-cell-total');
+  const iRatio = list.indexOf('ri-cell-ratio');
+  assert.ok(iTotal > -1 && iRatio > -1 && iTotal < iRatio, '派生三列应出现在既有三列之前（左侧）');
+  // 取值与占位：总token 用自适应档位；比例列不可比值时用 – 占位保持列位
+  assert.ok(list.includes('fmtFull(tokSum)'), '总token 应用 K / M / B 自适应格式化');
+  assert.ok(list.includes("(pctText(s.tokens.hit, tokIn) || '–')"), '命中率列不可比值时应显示 – 占位');
+  assert.ok(list.includes("(pctText(s.tokens.output, tokSum) || '–')"), '输出占比列不可比值时应显示 – 占位');
+});
+
+test('记录条目：详情看板打开时派生三列与表头让位隐藏，列模板同步降回三列', () => {
+  assert.ok(appJs.includes("classList.toggle('has-detail', recs.detailId !== null)"), '应按 detailId 切换详情态类');
+  assert.ok(indexHtml.includes('.recs-body.has-detail .ri-cell-derived { display: none; }'), '派生列与其表头标签应整体隐藏');
+  assert.ok(indexHtml.includes('.recs-body.has-detail .ri-cells {'), '隐藏态应有独立列模板（避免 minmax 空列留白错位）');
+  assert.ok(indexHtml.includes('.recs-body.has-detail .ri-cell-ratio { padding-left: 0; }'), '隐藏态数据区首列内边距应归零');
+  // 默认六列模板（派生三列在左）+ 既有三列宽度不变
+  assert.ok(indexHtml.includes('grid-template-columns: minmax(76px, auto) minmax(64px, auto) minmax(72px, auto)'), '默认应为六列模板且派生三列在左');
+  assert.ok(indexHtml.includes('minmax(150px, auto) minmax(92px, auto) minmax(112px, auto)'), '既有三列列宽应保持不变');
+  // 窄屏两套模板
+  const mq = indexHtml.slice(indexHtml.indexOf('@media (max-width: 860px)'));
+  assert.ok(mq.includes('minmax(66px, auto) minmax(56px, auto) minmax(62px, auto)'), '窄屏应有六列模板');
+  assert.ok(mq.includes('.recs-body.has-detail .ri-cells { grid-template-columns: minmax(118px, auto) minmax(80px, auto) minmax(86px, auto); }'),
+    '窄屏详情态应为既有三列模板');
+  // 详情态类挂载点存在
+  assert.ok(indexHtml.includes('class="recs-body" id="recsBody"'), '记录窗口容器应带 recsBody id');
+});
+
+
+/* ===================== 手动录入（manual-quota-snapshot）静态契约 =====================
+ * 本功能前端全部是原生脚本 + DOM 装配，无 DOM 测试环境；本组锚定三类**只在浏览器里才会暴露**
+ * 的集成缺口（均在本变更实施期被无头浏览器实测抓到过）：
+ *   ① index.html 引用的脚本漏登记进 src/server.js 静态白名单 → 404 → 模块整体不挂载；
+ *   ② 委托监听函数只定义不调用（bindEvents）→ 窗口能开但点不动、改不动；
+ *   ③ 前端按错误的 /api/plans 契约取数 → 套餐下拉恒为空 → 模型模式进不去。
+ */
+
+const serverJs = readFileSync(fileURLToPath(new URL('../src/server.js', import.meta.url)), 'utf8');
+const manualJs = readFileSync(join(webRoot, 'manual-entry.js'), 'utf8');
+const linkSolveJs = readFileSync(join(webRoot, 'link-solve.js'), 'utf8');
+const tierAllocJs = readFileSync(join(webRoot, 'tier-alloc.js'), 'utf8');
+
+test('静态服务白名单覆盖 index.html 引用的全部前端脚本（漏登记 → 浏览器 404 → 模块不挂载）', () => {
+  const srcs = [...indexHtml.matchAll(/<script src="\.\/([^"]+)"><\/script>/g)].map((m) => m[1]);
+  assert.ok(srcs.length >= 4, '应至少引用 4 个前端脚本，实际 ' + srcs.length);
+  const at = serverJs.indexOf('const allow = {');
+  const allow = serverJs.slice(at, serverJs.indexOf('const file = allow[path]'));
+  assert.ok(at > -1 && allow.length > 0, '应能定位静态白名单表');
+  for (const f of srcs) {
+    assert.ok(allow.includes("'/" + f + "': '" + f + "'"),
+      '静态白名单应登记 ' + f + '（漏登记时浏览器拿到 404 JSON，模块不会挂载）');
+  }
+});
+
+test('手动录入模块：委托监听必须在脚本载入时绑定（只定义 bindEvents 不调用 = 全部交互失效）', () => {
+  assert.match(manualJs, /function bindEvents\(\)/, '应有委托监听绑定函数');
+  const calls = manualJs.match(/(^|[^\w.])bindEvents\(\);/gm) || [];
+  assert.ok(calls.length >= 1, 'bindEvents() 必须存在初始化调用点（监听全挂在 #meEntryMask 上做委托）');
+  assert.match(manualJs, /if \(document\.readyState === 'loading'\) document\.addEventListener\('DOMContentLoaded', init\);/,
+    '脚本早于 DOM 就绪时应等 DOMContentLoaded 再绑定');
+  assert.match(manualJs, /else init\(\);/, 'DOM 已就绪时应立即初始化');
+  assert.ok(manualJs.includes("$('meEntryMask')"), '委托根应为 #meEntryMask');
+});
+
+test('手动录入：套餐元数据按 /api/plans 真实契约取数（candidates 只有名字，套餐与费用在 configs）', () => {
+  const body = manualJs.slice(manualJs.indexOf('async function loadMeta()'), manualJs.indexOf('async function loadDrafts()'));
+  assert.ok(body.length > 0, '应能定位 loadMeta');
+  assert.ok(body.includes('data.configs'), '套餐与费用取自 configs[]');
+  assert.ok(body.includes('data.candidates'), '提供商候选取自 candidates[]');
+  assert.doesNotMatch(body, /c\.plans/, 'candidates 条目不含 plans（误用会得到恒空的套餐下拉）');
+  assert.doesNotMatch(body, /c\.models/, 'candidates 条目不含 models');
+  assert.match(body, /pl\.quotaMode === 'points' \? '分' : '%'/, '额度单位口径应与套餐设置页（app.js qUnit）一致');
+});
+
+test('手动录入：三前端模块挂载与 app.js 桥接契约', () => {
+  assert.match(linkSolveJs, /window\.LinkSolve = \(function \(\) \{/, 'link-solve.js 应挂载 window.LinkSolve');
+  assert.match(tierAllocJs, /window\.TierAlloc = \(function \(\) \{/, 'tier-alloc.js 应挂载 window.TierAlloc');
+  assert.ok(manualJs.includes('window.LinkSolve') && manualJs.includes('window.TierAlloc'), '窗口应从 window 取两个计算模块');
+  assert.ok(manualJs.includes('document.dispatchEvent(new CustomEvent(' + "'manual-snapshot-created'"),
+    '创建成功后应派发桥接事件');
+  assert.ok(appJs.includes("document.addEventListener('manual-snapshot-created'"), 'app.js 应监听该事件刷新记录列表');
+  assert.ok(appJs.includes('window.ManualEntry.open()'), '记录页入口应打开手动录入窗口');
+  assert.ok(manualJs.includes("if (!window.LinkSolve || !window.TierAlloc)"), '计算模块缺失时应拒绝开窗并提示');
+});
+
+test('手动录入窗口：模态结构、四按钮与关键文案（缺项提示 / 两步确认放弃）', () => {
+  for (const id of ['meEntryMask', 'meEntryBody', 'meBtnAdd', 'meBtnDiscard', 'meBtnKeep', 'meBtnCancel']) {
+    assert.ok(indexHtml.includes('id="' + id + '"'), 'index.html 应含 ' + id);
+  }
+  assert.ok(manualJs.includes('必须填写完整：还缺'), '缺项应提示「必须填写完整：还缺 …」');
+  assert.ok(manualJs.includes('确认放弃？'), '放弃应两步确认（第一次点只改文案不删）');
+  for (const ep of ['/api/quota/snapshots/manual', '/api/quota/manual-drafts']) {
+    assert.ok(manualJs.includes("'" + ep + "'"), '前端应调用 ' + ep);
+  }
+  for (const f of ['meTimeSwitch', 'meProvSel', 'mePlanSel', 'meModelSeg', 'meAllocBar', 'meOptions', 'mePreviewCard', 'meSideList']) {
+    assert.ok(manualJs.includes('id="' + f + '"'), '表单应渲染 ' + f);
+  }
+  // 添加成功后条目自动消失：落库 + 删来源草稿由服务端在**同一事务**内完成（draftId），
+  // 前端不再单独发删除请求 —— 旧的「POST 之后再 DELETE」会留下「记录已建、条目没删」的半成功窗口。
+  const addBody = manualJs.slice(manualJs.indexOf('async function doAdd()'), manualJs.indexOf('async function doDiscard()'));
+  assert.ok(addBody.indexOf('/api/quota/snapshots/manual') > -1, '「添加」应调用手动录入落库接口');
+  assert.ok(addBody.includes('draftId'), '「添加」应把来源草稿行 id 随载荷提交（服务端同事务删除草稿）');
+  assert.ok(!addBody.includes("'DELETE', '/api/quota/manual-drafts'"),
+    '「添加」不应再单独发删除草稿请求（半成功窗口：记录已建但条目残留）');
+  // 草稿身份唯一来源（fix-manual-entry-draft-and-pricing）：行 id 最后写入 + 提交载荷剥离 id
+  const loadBody = manualJs.slice(manualJs.indexOf('async function loadDrafts()'), manualJs.indexOf('function draftPayloadOf'));
+  assert.ok(loadBody.includes('...(it.payload || {}), id: it.id'),
+    'loadDrafts 合并顺序：行 id 必须最后写入（载荷里残留的 id 一律无效，存量污染行读取侧免疫）');
+  assert.ok(manualJs.includes('function draftPayloadOf('), '应有一个剥离保留键 id 的载荷构造函数');
+  assert.ok(manualJs.includes('draft: draftPayloadOf(state.draft)'), '「保持」提交前应剥离载荷里的 id');
+  assert.ok(!manualJs.includes('draft: state.draft'), '不得整包提交草稿对象（会把身份写进载荷）');
+  // 放弃：行 id 删除 + 未保持内容单独文案 + 失败如实报错并保留条目
+  const discBody = manualJs.slice(manualJs.indexOf('async function doDiscard()'), manualJs.indexOf('const doCancel'));
+  assert.ok(discBody.includes('已丢弃未保持的内容'), '从未保持过的条目放弃时应说明丢弃的是未保持内容（不得谎称删除条目）');
+  assert.ok(discBody.includes("toast(err.message || '删除条目失败')"), '删除失败应如实报错');
+  assert.ok(discBody.indexOf('const id = state.draft.id;') < discBody.indexOf("await api('DELETE'"), '删除必须按当前条目的行 id 发出');
+  // 计价：是否显示分配轴由 multi 表达，不得因「窗口内无时段」而放弃计价
+  const allocBody = manualJs.slice(manualJs.indexOf('function currentAlloc()'), manualJs.indexOf('const SEG_COLORS'));
+  assert.ok(!allocBody.includes('if (!segs.length) return null'),
+    'currentAlloc 不得因无计价时段而返回 null（否则模型有价格也显示「未配置价格信息」）');
+  assert.ok(allocBody.includes('multi: segs.length >= 2'), '是否显示分配轴应由 multi 表达');
+  assert.ok(manualJs.includes('T().costOf(alloc.entry, tokens, alloc.segs, alloc.shares, repMs)'),
+    '预览计价应传窗口代表时刻（无时段兜底与服务端同口径）');
+  // 时间输入不得因 input 事件重建表单（否则连续输入会失焦）
+  const patch = manualJs.slice(manualJs.indexOf('function patchTime()'), manualJs.indexOf('function patchTime()') + 600);
+  assert.ok(patch.length > 0 && !patch.includes('renderForm()'), 'patchTime 只刷新派生读数，不重建表单');
+});
+
+test('记录页手动录入改造：工具栏入口 / 来源筛选 / 来源图标一句气泡 / 详情两区块', () => {
+  // 工具栏与入口由 app.js 渲染进记录窗口容器（index.html 只提供容器本身）
+  assert.ok(appJs.includes('id="recsManualBtn"'), '记录窗口工具栏应含手动录入入口');
+  assert.ok(appJs.includes('id="recsSourceSel"'), '记录窗口工具栏应含来源筛选');
+  assert.ok(indexHtml.includes('id="recsModal"') && indexHtml.includes('id="recsList"'), 'index.html 应提供记录窗口容器');
+  assert.ok(appJs.includes("if (t.id === 'recsManualBtn') { openManualEntry(); return; }"), '入口按钮应绑定 openManualEntry');
+  assert.ok(appJs.includes("if (t.id === 'recsSourceSel')"), '来源筛选应触发重载');
+  assert.ok(appJs.includes("q.set('source', recs.source)"), '来源应作为查询参数传给列表接口');
+  assert.ok(appJs.includes('手动录入（'), '来源下拉应带手动录入计数');
+  // 来源图标：仅手动来源渲染；气泡只含一句（无 tip-p 行）
+  assert.ok(appJs.includes("(s.source === 'manual'"), '来源图标应只对手动来源渲染');
+  const at = appJs.indexOf("class=\"ri-src tip-info\"");
+  assert.ok(at > -1, '应渲染 .ri-src 来源图标');
+  const icon = appJs.slice(at, appJs.indexOf('ri-plan', at));  // 只截取来源图标自身（到套餐名标签为止）
+  assert.ok(icon.includes('<span class="tip-t">来源 · 手动录入</span>'), '气泡文字应为「来源 · 手动录入」');
+  assert.ok(!icon.includes('class="tip-p"'), '来源气泡只含一句，不应有正文行（tip-pop 是气泡容器，注意子串陷阱）');
+  // 详情两区块：时段分解读 tokenCosts.byTier；套餐评估仅手动来源且 eval 存在时出现
+  assert.ok(appJs.includes("'<div class=\"rd-tiers\">'"), '详情应渲染时段分解区块');
+  assert.ok(appJs.includes("'<div class=\"rd-eval\">'"), '详情应渲染套餐额度评估区块');
+  assert.ok(appJs.includes('recsTierBlockHtml(tc, tcIcon)'), '时段分解应接在详情看板上');
+  assert.ok(appJs.includes("(s.source === 'manual' && s.eval ? recsEvalBlockHtml(s.eval) : '')"), '评估区块仅手动来源且有 eval 时出现');
+  // 样式与结构锚点
+  for (const sel of ['.me-entry-modal', '.me-entry-body', '.la-bar', '.la-seg', '.lo-row', '.ri-src', '.rd-tiers', '.rd-eval']) {
+    assert.ok(indexHtml.includes(sel), 'index.html 应含样式 ' + sel);
+  }
+});
+
+/* ===== 汇总范围滑动条（summary-range-slider）前端接线契约 ===== */
+
+test('汇总范围滑动条：挂载点、脚本引入顺序与汇总聚合接线', () => {
+  // 挂载点位于柱状图区域之后（滑条在柱状图面板底部）
+  const iBox = indexHtml.indexOf('id="chartBox"');
+  const iSlider = indexHtml.indexOf('id="rangeSlider"');
+  assert.ok(iBox > -1 && iSlider > iBox, '#rangeSlider 应在 #chartBox 之后');
+  // 引擎与组件必须先于 app.js（app.js 启动即装配滑条）
+  for (const f of ['summary-range.js', 'range-slider.js']) {
+    const at = indexHtml.indexOf('<script src="./' + f + '"></script>');
+    assert.ok(at > -1 && at < indexHtml.indexOf('<script src="./app.js">'),
+      f + ' 应在 app.js 之前引入');
+  }
+  assert.match(indexHtml, /<link rel="stylesheet" href="\.\/range-slider\.css">/, '滑条样式应外链引入');
+  // 窗口汇总走 SummaryRange 选区聚合（不再直接用 /api/stats 的 totals）
+  assert.match(appJs, /SummaryRange\.sumRange\(/, '窗口汇总应经 SummaryRange.sumRange 聚合');
+  assert.match(appJs, /SummaryRange\.winLabelText\(/, '窗口汇总标签应经 SummaryRange.winLabelText');
+  assert.match(appJs, /SummaryRange\.buildSlots\(data\.bars, state\.view\)/, '槽位构建应经 SummaryRange.buildSlots（完整日历补零）');
+  assert.doesNotMatch(appJs, /lastTotals/, 'totals 直取应移除（统一为选区聚合口径）');
+});
+
+test('汇总范围滑动条：联动突出 / 复位矩阵 / 零值柱 / 详细跟随选区', () => {
+  // 区间框选插件与图表重排对齐
+  assert.match(appJs, /plugins: \[barHighlight, rangeHighlight\]/, '应注册区间框选插件');
+  assert.match(appJs, /onResize: \(\) => alignSlider\(\)/, '图表重排后滑条应跟随对齐');
+  // 全窗口基色严格沿用现状 .88/.85（未收窄时无样式变化）
+  assert.match(readFileSync(join(webRoot, 'summary-range.js'), 'utf8'),
+    /hitFull: 'rgba\(45, 212, 191, \.88\)'/, '基色应为现状 .88');
+  // 零值柱（补零占位）不响应下钻
+  assert.match(appJs, /bar\.hit \+ bar\.miss \+ bar\.output === 0\) return/, '零值柱应跳过下钻');
+  // 复位矩阵：视图 / 工具 / 年份三个处理器都复位选区
+  const resets = appJs.match(/state\.winRange = \{ a: 0, b: -1 \}/g) || [];
+  assert.ok(resets.length >= 3, '视图/工具/年份切换应复位全窗口，实际 ' + resets.length + ' 处');
+  // 详细跟随选区：7d/30d 直传 from/to，年视图收窄传 month_from/month_to
+  assert.match(appJs, /month_from=' \+ \(a \+ 1\) \+ '&month_to='/, '年视图收窄详细应传月区间');
+  assert.ok(appJs.includes("/api/breakdown?from=' + buckets[a].key + '&to=' + buckets[b].key"),
+    '7d/30d 详细应传选区 from/to');
+  // 首次装配后必须 configure 重建刻度行（create 只画壳；缺失 = 首屏无刻度，实测踩过）
+  assert.match(appJs, /slider\.configure\(\{ slotCount: n, a: state\.winRange\.a, b: state\.winRange\.b \}\)/,
+    '首次装配后应 configure 重建刻度行');
+});
+
+/* ================= 小时时段构成区（hourly-archive-drilldown） ================= */
+
+const hourlyRangeJs = readFileSync(join(webRoot, 'hourly-range.js'), 'utf8');
+
+test('小时时段构成区：两块结构齐备、引擎先于 app.js 引入、图表与时间轴契约', () => {
+  // 两级下钻面板各有一个 .hourly-block，必需元素 id 齐全
+  for (const prefix of ['provider', 'model']) {
+    const short = prefix === 'provider' ? 'ph' : 'mh';
+    assert.match(indexHtml, new RegExp(`id="${prefix}Hourly"`), `${prefix}Hourly 块应存在`);
+    for (const id of [`${prefix}HourlyTitle`, `${prefix}HourlySrc`, `${prefix}HourChart`, `${prefix}HourSlider`, `${short}Tip`]) {
+      assert.ok(indexHtml.includes(`id="${id}"`), `应存在元素 #${id}`);
+    }
+    for (const id of [`${short}SumLabel`, `${short}Hit`, `${short}HitNote`, `${short}Miss`, `${short}Out`, `${short}OutNote`, `${short}Total`, `${short}TotalNote`]) {
+      assert.ok(indexHtml.includes(`id="${id}"`), `应存在汇总元素 #${id}`);
+    }
+  }
+  // 加载顺序：hourly-range.js（纯函数引擎）在 app.js 之前
+  const engineAt = indexHtml.indexOf('<script src="./hourly-range.js"></script>');
+  const appAt = indexHtml.indexOf('<script src="./app.js"></script>');
+  assert.ok(engineAt !== -1 && appAt !== -1 && engineAt < appAt, 'hourly-range.js 应在 app.js 之前引入');
+  // 图表契约：无独立图例 / 无跟随鼠标气泡 / 无 onClick（不可点击）/ 固定 24 槽时间轴
+  assert.match(appJs, /legend: \{ display: false \}/, '小时柱不应有独立图例');
+  assert.match(appJs, /tooltip: \{ enabled: false \}/, '小时柱不应有跟随鼠标的气泡');
+  const hourlySection = appJs.slice(appJs.indexOf('createHourlyBlock'), appJs.indexOf('renderHourlyBlocks'));
+  assert.ok(!/\bonClick/.test(hourlySection), '小时区不得注册 onClick（不可点击契约）');
+  assert.match(appJs, /slotCount: HR\.HOURS/, '时间轴应使用固定 24 槽引擎');
+  assert.match(appJs, /hourDayKey/, '应维护换日复位状态');
+  assert.match(appJs, /renderHourlyBlocks\(/, 'rebuildDrill 应接入小时区渲染');
+  // 数据源徽标两口径文案
+  assert.ok(appJs.includes('数据源：小时归档表（usage_hourly）'), '应标注归档口径');
+  assert.ok(appJs.includes('数据源：明细实时（usage_records）'), '应标注明细口径');
+});
+
+test('小时时段构成区：脚注口径文案（两数据源 / 不可点击 / 不追溯 / 一次性沉淀语义）', () => {
+  assert.ok(indexHtml.includes('<b>按小时构成</b>'), '脚注应有小时区口径段');
+  assert.ok(indexHtml.includes('不追溯'), '脚注应含「不追溯」口径');
+  assert.ok(indexHtml.includes('首次归档后不再变化'), '脚注应表达一次性沉淀语义');
+  assert.ok(indexHtml.includes('恒为 24 槽'), '脚注应说明时间轴固定 24 槽');
 });

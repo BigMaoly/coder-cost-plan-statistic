@@ -50,15 +50,19 @@ const usage = (input = 100, output = 10, cacheRead = 50, reasoning = 5, extra = 
   inputTokens: input, outputTokens: output, cacheReadTokens: cacheRead, reasoningTokens: reasoning, ...extra
 });
 
-function writeSession(root, project, id, buffer, { plain = false, dirName = null } = {}) {
+function writeSession(root, project, id, buffer, { plain = false, dirName = null, v3 = false } = {}) {
   const dir = join(root, project, dirName ?? `session-${id}`);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(join(dir, plain ? 'session.jsonl' : 'session.jsonl.zstd'), buffer);
+  writeFileSync(join(dir, (v3 ? 'session.v3.jsonl' : 'session.jsonl') + (plain ? '' : '.zstd')), buffer);
   return dir;
 }
 
 /** 单帧明文批次（首帧 header + 一批含 2 条用量的消息） */
 const batch1 = () => [sessionHeader(), reqHeader('deepseek-official', 'deepseek-v4-flash', 12, T0), msg(100, T0 + 1000, usage(25630, 303, 0, 232)), msg(101, T0 + 2000, usage())];
+
+/** v3 会话批次（dsh 升级后形态：头 version:3，容器与事件结构与旧格式同构） */
+const v3Header = JSON.stringify({ type: 'session', version: 3, id: 'session-v3', createdAt: T0, cwd: '/p', delegationDepth: 0, agentPreset: 'standard' });
+const v3Batch = () => [v3Header, reqHeader('deepseek-official', 'deepseek-v4-flash', 12, T0), msg(100, T0 + 1000, usage(25630, 303, 0, 232)), msg(101, T0 + 2000, usage())];
 
 function makeDb() {
   const root = makeRoot();
@@ -135,6 +139,35 @@ test('枚举：裸 uuid 子代理会话目录同样收录，无会话日志的�
       assert.equal(isDshAvailable({ dshSessionsRoot: onlySub }), true);
     } finally {
       rmSync(onlySub, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('枚举与可用性：v3 会话日志收录；新旧并存单选 v3 终态（add-dsh-v3-session-support）', () => {
+  const root = makeRoot();
+  try {
+    writeSession(root, '--p--', 'v3z', containerOf([v3Batch()]), { v3: true });
+    writeSession(root, '--p--', 'v3p', Buffer.from(v3Batch().map((l) => l + '\n').join('')), { v3: true, plain: true });
+    writeSession(root, '--p--', 'old', containerOf([batch1()])); // 旧格式行为不变
+    // 升级现场：在途会话整份重写为 v3，新旧并存 → 单选 v3，旧文件不进枚举（防双算）
+    const dir = writeSession(root, '--p--', 'migrated', containerOf([batch1()]));
+    writeFileSync(join(dir, 'session.v3.jsonl.zstd'), containerOf([v3Batch()]));
+    const files = listSessionFiles(root);
+    assert.deepEqual(files.map((f) => f.relPath), [
+      '--p--/session-old/session.jsonl.zstd',
+      '--p--/session-v3p/session.v3.jsonl',
+      '--p--/session-v3z/session.v3.jsonl.zstd',
+      '--p--/session-migrated/session.v3.jsonl.zstd'
+    ].sort());
+    // 纯 v3 zstd 部署：修复前枚举为空被误判不可用，现在可用
+    const onlyV3 = makeRoot();
+    try {
+      writeSession(onlyV3, '--p--', 'a', containerOf([v3Batch()]), { v3: true });
+      assert.equal(isDshAvailable({ dshSessionsRoot: onlyV3 }), true);
+    } finally {
+      rmSync(onlyV3, { recursive: true, force: true });
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -260,6 +293,56 @@ test('扫描：残帧容错——残帧不消费，补写完整后消费到新�
     scanSessions(fx.db, fx.root);
     n = fx.db.prepare('SELECT COUNT(*) AS n FROM usage_records WHERE tool = ?').get(TOOL).n;
     assert.equal(n, 3); // 新内容入账，无重复
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('扫描：v3 会话全量入库、追加新帧增量、重复扫描零新增（add-dsh-v3-session-support）', () => {
+  const fx = makeDb();
+  try {
+    const dir = writeSession(fx.root, '--p--', 'v3', containerOf([v3Batch()]), { v3: true });
+    const s1 = scanSessions(fx.db, fx.root);
+    assert.equal(s1.totalFiles, 1);
+    assert.equal(s1.secondaryUnresolved, 0);
+    const before = fx.db.prepare('SELECT line_no, provider, model, is_subagent FROM usage_records WHERE tool = ? ORDER BY line_no').all(TOOL);
+    assert.equal(before.length, 2);
+    assert.equal(before[0].provider, 'deepseek-official'); // v3 行序归因与旧格式一致
+    // 追加一帧：3 条新用量，行号续接
+    const appendBatch = [msg(200, T0 + 3000, usage()), msg(201, T0 + 4000, usage()), msg(202, T0 + 5000, usage())];
+    appendFileSync(join(dir, 'session.v3.jsonl.zstd'), zstdCompressSync(Buffer.from(appendBatch.join('\n') + '\n', 'utf8')));
+    const s = scanSessions(fx.db, fx.root);
+    assert.equal(s.changedFiles, 1);
+    const after = fx.db.prepare('SELECT line_no FROM usage_records WHERE tool = ? ORDER BY line_no').all(TOOL);
+    assert.equal(after.length, 5);
+    assert.deepEqual(after.slice(-3).map((r) => r.line_no), [5, 6, 7]);
+    // 重复扫描零新增
+    assert.equal(scanSessions(fx.db, fx.root).changedFiles, 0);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('扫描：升级重写迁移不双算——v3 等价重写后旧路径清理，全程恰 N 条（add-dsh-v3-session-support）', () => {
+  const fx = makeDb();
+  try {
+    const dir = writeSession(fx.root, '--p--', 'migrated', containerOf([batch1()]));
+    scanSessions(fx.db, fx.root);
+    let rows = fx.db.prepare('SELECT file_path FROM usage_records WHERE tool = ?').all(TOOL);
+    assert.equal(rows.length, 2);
+    assert.ok(rows.every((r) => r.file_path.endsWith('session.jsonl.zstd')));
+    // dsh 升级把在途会话整份重写为 v3（新旧并存、内容等价、旧文件残留）
+    writeFileSync(join(dir, 'session.v3.jsonl.zstd'), containerOf([batch1()]));
+    const s = scanSessions(fx.db, fx.root);
+    assert.equal(s.changedFiles, 2); // v3 全量入库 + 旧路径消失清理各计一次变化
+    rows = fx.db.prepare('SELECT file_path FROM usage_records WHERE tool = ?').all(TOOL);
+    assert.equal(rows.length, 2); // 迁移后恰 2 条，无叠加
+    assert.ok(rows.every((r) => r.file_path.endsWith('session.v3.jsonl.zstd')));
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM file_index WHERE tool = ?').get(TOOL).n, 1);
+    // 旧文件残留磁盘：后续轮次不再入库
+    appendFileSync(join(dir, 'session.jsonl.zstd'), zstdCompressSync(Buffer.from([msg(900, T0 + 9000, usage())].join('\n') + '\n', 'utf8')));
+    scanSessions(fx.db, fx.root);
+    assert.equal(fx.db.prepare('SELECT COUNT(*) AS n FROM usage_records WHERE tool = ?').get(TOOL).n, 2);
   } finally {
     rmSync(fx.root, { recursive: true, force: true });
   }

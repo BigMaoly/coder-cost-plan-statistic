@@ -9,7 +9,8 @@
  * 窗口内不变式（原型实测踩坑，design D5）：
  *   · 汇率输入框 type=text + inputmode=decimal（number 型会把 "7." 中间态清洗成空串丢小数点）；
  *   · 提交只走原生 change（回车仅 blur）——回车回调里再提交一次会随后的 blur 二次刷新撞节点；
- *   · 刷新只重画表格 / 汇率行文案 / 口径注意，不重建输入框（打断连续输入、丢光标）；
+ *   · 刷新与明细展开/收起只重画表格行 / 汇率行文案 / 口径注意，不重建输入框（打断连续输入、丢光标）；
+ *   · 明细展开 = 点击统计对象行任意位置（无行内按钮，Enter/空格等价）；明细列与主表 9 列轨道对齐；
  *   · 输入框内 Esc 只失焦不关窗；换算只影响展示，不写库、不影响其它视图。
  * 本模块与 app.js 经 window.QuotaBenchmarkCompare?.open 可选调用解耦：模块缺失时点击标签
  * 不报错、不阻塞记录窗口；窗口纯只读，无任何写入口。
@@ -136,9 +137,11 @@
 
   function rowHtml(g, maxRatio) {
     const open = state.expanded.has(g.key);
-    return '<div class="bmk-cmp-row' + (g.isBaseline ? ' is-base' : '') + '" data-key="' + esc(g.key) + '">' +
+    // 点击行任意位置切换展开/收起（无行内按钮）：整行携带 data-key / tabindex / aria-expanded，
+    // 行首仅留非交互箭头指示（.bmk-cmp-caret，展开时旋转向下）
+    return '<div class="bmk-cmp-row' + (open ? ' is-open' : '') + (g.isBaseline ? ' is-base' : '') + '" data-key="' + esc(g.key) + '" tabindex="0" aria-expanded="' + open + '">' +
       '<div class="bmk-cmp-cell bmk-cmp-plan">' +
-        '<button type="button" class="bmk-cmp-toggle" data-toggle="' + esc(g.key) + '" aria-expanded="' + open + '">' + (open ? '▾' : '▸') + '</button>' +
+        '<span class="bmk-cmp-caret" aria-hidden="true">▸</span>' +
         // 套餐名与模型徽标分两行：套餐名常较长，挤一行会被徽标压成省略号
         '<span class="bmk-cmp-plan-body">' +
           '<span class="bmk-cmp-plan-name" title="' + esc(g.planName) + '">' + esc(g.planName) + '</span>' +
@@ -320,7 +323,17 @@
       caveatsHtml(d, d.groups.length, converted);
   }
 
-  /** 提交汇率后局部重画：只动表格 / 汇率行文案 / 口径注意，不重建输入框（design D5） */
+  /** 只重画表格行（展开/收起与汇率提交共用）：不重建汇率输入框等表格外区域（design D5） */
+  function renderRows() {
+    const table = $('bmkCmpBody').querySelector('.bmk-cmp-table');
+    if (!table) { renderBody(); return; }
+    const groups = sortedGroups();
+    const maxRatio = Math.max(...groups.map((g) => g.ratio || 1), 1);
+    table.querySelectorAll('.bmk-cmp-row, .bmk-cmp-detail').forEach((el) => el.remove());
+    table.insertAdjacentHTML('beforeend', groups.map((g) => rowHtml(g, maxRatio)).join(''));
+  }
+
+  /** 提交汇率后局部重画：动表格 / 汇率行文案 / 口径注意，不重建输入框（design D5） */
   let refreshing = false;
   function refresh() {
     if (refreshing || !state.open) return; // 重入保护：一次提交只刷一次
@@ -328,13 +341,8 @@
     try {
       const d = state.data;
       applyRates(d, state.rates);
-      const groups = sortedGroups();
-      const maxRatio = Math.max(...groups.map((g) => g.ratio || 1), 1);
+      renderRows();
       const converted = Object.values(state.rates).some((x) => Number(x) > 0);
-      const table = $('bmkCmpBody').querySelector('.bmk-cmp-table');
-      if (!table) { renderBody(); return; }
-      table.querySelectorAll('.bmk-cmp-row, .bmk-cmp-detail').forEach((el) => el.remove());
-      table.insertAdjacentHTML('beforeend', groups.map((g) => rowHtml(g, maxRatio)).join(''));
       const fxRow = $('bmkCmpBody').querySelector('.bmk-cmp-fx-row');
       // 提交后才重建整行（输入过程中不重建）；父节点已变（并发刷新）则跳过，避免 outerHTML 抛错
       if (fxRow && fxRow.parentNode) fxRow.outerHTML = ratesRow(d);
@@ -380,6 +388,17 @@
     refresh();
   }
 
+  /** 切换某行明细展开/收起：只重画表格行（renderRows），不重建汇率输入框。
+      renderRows 会重建行节点，键盘路径需把焦点还原到同一行的新节点上 */
+  function toggleExpand(key, restoreFocus) {
+    state.expanded.has(key) ? state.expanded.delete(key) : state.expanded.add(key);
+    renderRows();
+    if (restoreFocus) {
+      const row = Array.from($('bmkCmpBody').querySelectorAll('.bmk-cmp-row')).find((r) => r.dataset.key === key);
+      if (row) row.focus();
+    }
+  }
+
   function bind() {
     const modal = $('bmkCmpModal');
     $('bmkCmpCloseBtn').addEventListener('click', close);
@@ -396,23 +415,27 @@
     });
     body.addEventListener('keydown', (e) => {
       const t = e.target;
-      if (!t.dataset || !t.dataset.rate) return;
-      // 回车只负责失焦：提交统一由原生 change 完成（若在这里再提交一次，
-      // 随后的 blur 还会触发一次 change → 两次刷新撞同一节点报错）
-      if (e.key === 'Enter') { e.preventDefault(); t.blur(); return; }
-      if (e.key === 'Escape') { e.stopPropagation(); t.blur(); } // 输入框内 Esc 只失焦，不关窗
+      if (t.dataset && t.dataset.rate) {
+        // 回车只负责失焦：提交统一由原生 change 完成（若在这里再提交一次，
+        // 随后的 blur 还会触发一次 change → 两次刷新撞同一节点报错）
+        if (e.key === 'Enter') { e.preventDefault(); t.blur(); return; }
+        if (e.key === 'Escape') { e.stopPropagation(); t.blur(); } // 输入框内 Esc 只失焦，不关窗
+        return;
+      }
+      // 整行展开/收起的键盘等价操作：Enter / 空格（空格 preventDefault 防页面滚动）
+      if (e.key === 'Enter' || e.key === ' ') {
+        const row = t.closest ? t.closest('.bmk-cmp-row') : null;
+        if (row) { e.preventDefault(); toggleExpand(row.dataset.key, true); }
+      }
     });
 
     body.addEventListener('click', (e) => {
       const sortBtn = e.target.closest('[data-sort]');
       if (sortBtn) { state.sort = sortBtn.dataset.sort; renderBody(); return; } // 本地重排，不重新请求
       if (e.target.id === 'bmkCmpFxClear') { state.rates = {}; renderBody(); return; }
-      const toggle = e.target.closest('[data-toggle]');
-      if (toggle) {
-        const key = toggle.dataset.toggle;
-        state.expanded.has(key) ? state.expanded.delete(key) : state.expanded.add(key);
-        renderBody();
-      }
+      // 点击行任意位置切换该行明细（明细区 .bmk-cmp-detail 是行的兄弟节点，点它不触发切换）
+      const row = e.target.closest('.bmk-cmp-row');
+      if (row) toggleExpand(row.dataset.key, false);
     });
 
     document.addEventListener('keydown', (e) => {

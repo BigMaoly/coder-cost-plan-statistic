@@ -61,8 +61,8 @@ function dumpOtherTables(db) {
 test('schema v15+：全新库建表、user_version 为当前版本、内置数据开箱即有', () => {
   const { db, cleanup } = makeDb();
   try {
-    assert.equal(SCHEMA_VERSION, 17);
-    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 17);
+    assert.equal(SCHEMA_VERSION, 19);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, 19);
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'score_%'")
       .all().map((r) => r.name).sort();
     assert.deepEqual(tables, [
@@ -87,7 +87,7 @@ test('schema v15：重复打开同一库不重复写入内置数据（幂等）'
     a.close();
     const b = openDb(file);
     assert.deepEqual(scoreStats(b), first);
-    assert.equal(b.prepare('PRAGMA user_version').get().user_version, 17);
+    assert.equal(b.prepare('PRAGMA user_version').get().user_version, 19);
     b.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -103,7 +103,7 @@ test('schema v15：v14 存量库升级自动建表并写入内置数据，既有
     db.close();
 
     const up = openDb(file);
-    assert.equal(up.prepare('PRAGMA user_version').get().user_version, 17);
+    assert.equal(up.prepare('PRAGMA user_version').get().user_version, 19);
     assert.deepEqual(scoreStats(up), SEED_STATS);
     assert.equal(dumpOtherTables(up), before, '升级不得改动任何既有表');
     up.close();
@@ -346,7 +346,7 @@ test('内置数据与构建脚本产出一致（SCORE_SEED 规模与抽查值）
   const filled = Object.values(SCORE_SEED.scores).reduce((n, r) => n + Object.keys(r).length, 0);
   assert.deepEqual(
     [SCORE_SEED.criterionGroups.length, SCORE_SEED.criteria.length, SCORE_SEED.modelGroups.length, SCORE_SEED.models.length, filled],
-    [4, 80, 8, 23, 549]   // ← 内置数据规模的硬编码锚点：改数据只需动这一处
+    [4, 101, 10, 26, 838]   // ← 内置数据规模的硬编码锚点：改数据只需动这一处
   );
   assert.equal(SCORE_SEED.scores['m-k3']['c-gpqa'], 93.5);
   assert.equal(SCORE_SEED.criteria.find((c) => c.id === 'c-codeforces').unit, 'num');

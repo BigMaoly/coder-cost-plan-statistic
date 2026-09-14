@@ -20,6 +20,9 @@
  * - 设置交互（stay-open-settings）：设置框保持打开，配置弹窗叠于其上，关闭即回到设置框
  *   可继续切换其他配置项；保存成功不关窗，右上角 toast「保存成功」，刷新左侧列表后
  *   可继续编辑其它条目或「＋ 添加」新建
+ * - 汇总范围滑动条（summary-range-slider）：柱状图面板底部双端滑块只改「窗口汇总」统计范围
+ *   （SummaryRange 纯函数聚合 + RangeSlider 组件）；收窄时柱状图联动突出（虚线框选 + 明暗），
+ *   「详细」跟随选区；切视图 / 换工具 / 换年份复位全窗口
  */
 (function () {
   'use strict';
@@ -28,17 +31,6 @@
 
   const pad = (n) => String(n).padStart(2, '0');
   const WEEK = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
-
-  // 'YYYY-MM-DD' → 'MM-DD' 与 'YYYY-MM-DD 周X'
-  function barLabel(key) {
-    return key.length === 10 ? key.slice(5) : key + '月';
-  }
-  function barTitle(key) {
-    if (key.length !== 10) return '第 ' + key + ' 月';
-    const [y, m, d] = key.split('-').map(Number);
-    const date = new Date(y, m - 1, d);
-    return key + ' ' + WEEK[date.getDay()];
-  }
 
   // 数值格式化：Y 轴刻度一位小数（12.5K / 3.2M），tooltip 与卡片两位小数（45.67K）
   function trimZero(s) { return s.replace(/\.0+$/, ''); }
@@ -57,6 +49,20 @@
     return v.toFixed(2);
   }
   const fmtRate = (x) => (x == null ? '–' : (x * 100).toFixed(1) + '%');
+  const fmtShare = (x) => (x == null ? '–' : (x * 100).toFixed(2) + '%');
+
+  /* ----- 派生比值百分比（quota-snapshot-detail-hit-rate-and-output-share） ----- */
+  // 纯派生：两位小数全数值显示（0.00% 照常显示，不省略整数位）；分母 ≤ 0 或非有限值 = 不可比值，
+  // 返回空串，由调用方决定"省略"（详情看板内联括注）还是"占位"（记录条目固定列位）。
+  function pctText(num, den) {
+    if (!Number.isFinite(num) || !Number.isFinite(den) || !(den > 0)) return '';
+    return (num / den * 100).toFixed(2) + '%';
+  }
+  /** 快照详情行尾百分比括注（muted，与等值金额括注同级）：不可比值时整段省略，不显示占位符 */
+  function pctNote(num, den) {
+    const t = pctText(num, den);
+    return t ? ' <span class="muted">(' + t + ')</span>' : '';
+  }
 
   /* ----- 费用展示（tiered-pricing-cost-quota） ----- */
   // 币种图标：由 /api/stats·/api/breakdown 响应的 currency 字段驱动（缺省 ￥，与套餐设置同源）
@@ -84,26 +90,124 @@
 
   /* ================= 状态 ================= */
 
-  // tool 取值 = 平台 id 或 'all'（全部平台汇总，默认选中）；各口径按工具隔离
-  const state = { tool: 'all', view: '7d', year: null, provider: '', model: '' };
-  let buckets = []; // 当前视图每根柱：{label, title, hit, miss, output}
+  // 多选筛选（multi-select-filters-and-filtered-drilldown）：三个维度均为 Set，
+  // 空集 = 全选态（该维度不筛选，不向 API 传参）；providers 存筛选选项 value
+  // （'map:统一名' / 'tool|provider' / 裸名），models 存展示模型名（dm）。
+  // winRange = 汇总范围滑动条选区（summary-range-slider）：槽位闭区间 [a, b]，b=-1 表示待初始化为全窗口
+  // hour = 单日下钻「小时时段构成区」的时间轴选区（hourly-archive-drilldown）：两级小时区共享
+  const state = { tools: new Set(), view: '7d', year: null, providers: new Set(), models: new Set(), winRange: { a: 0, b: -1 }, hour: { a: 0, b: 23 } };
+  let buckets = []; // 当前视图每个槽位：{key, label, title, hit, miss, output, cost}（7d/30d 完整日历补零，年视图 12 槽）
+  let filterTree = []; // /api/filter-options 的提供商→模型树（当前视图口径，模型级联本地派生用）
+  let toolIds = [];    // 可用平台 id 列表（/api/tools，判定「全部平台」全选态）
 
   const $ = (id) => document.getElementById(id);
   const viewSeg = $('viewSeg'), yearField = $('yearField'), yearSel = $('yearSel');
-  const toolSel = $('toolSel');
-  const providerSel = $('providerSel'), modelSel = $('modelSel');
   const clearBtn = $('clearBtn'), refreshBtn = $('refreshBtn');
   const chartTitle = $('chartTitle'), chartMeta = $('chartMeta'), chartBox = $('chartBox');
   const winLabelEl = $('winLabel'), todayDateEl = $('todayDate'), todayBadge = $('todayBadge');
   const toastHost = $('toastHost');
 
   const toolLabels = {}; // id → 显示名（/api/tools 填充，all 固定）
-  function toolLabel() {
-    return toolLabels[state.tool] || (state.tool === 'all' ? '全部平台' : state.tool);
+  // 平台口径前缀（多选）：全选态 = 全部平台；子集 = 所选平台显示名组合（超 2 个折叠）
+  function platformPrefix() {
+    if (state.tools.size === 0 || toolIds.every((id) => state.tools.has(id))) return '全部平台';
+    const names = [...state.tools].map((id) => toolLabels[id] || id);
+    return joinShort(names);
   }
   // 按 id 取平台显示名（映射配置窗口的绑定候选标注用）
   function toolLabelOf(id) {
     return toolLabels[id] || id;
+  }
+
+  // 通用文案：列表 ≤2 项逐个列出，更多折叠为「A、B 等 N 项」
+  function joinShort(labels) {
+    return labels.length <= 2 ? labels.join('、') : labels.slice(0, 2).join('、') + ' 等 ' + labels.length + ' 项';
+  }
+
+  /* ================= 多选下拉组件（multi-select-filters-and-filtered-drilldown） ================= */
+
+  // 按钮触发 + 弹出复选列表；首项为「全部」复选项（三态：全选 / 半选 indeterminate / 全不选）。
+  // 勾选「全部」= 选中全部子项；取消「全部」= 清空全部。空集与全选集语义等价（该维度不筛选）。
+  function makeMultiSelect(host, { allLabel, onChange }) {
+    let options = [];         // [{value, label}]
+    let selected = new Set(); // 空集 = 全选态（该维度不筛选）
+    let disabled = false;
+    let dirty = false;        // 用户是否操作过复选列表：未操作保持「默认全选态」视觉（主控勾选、子项不勾）
+    host.classList.add('msel');
+    host.innerHTML =
+      '<button type="button" class="msel-trigger"><span class="txt"></span><span class="caret">▾</span></button>' +
+      '<div class="msel-pop"></div>';
+    const txt = host.querySelector('.txt');
+    const pop = host.querySelector('.msel-pop');
+    // 「全部」主控视觉：未操作过 = 默认全选态（勾选）；操作过 = 字面状态（全选勾 / 部分半选 / 全不选不勾）
+    const literalAll = () => options.length > 0 && options.every((o) => selected.has(o.value));
+    const allChecked = () => (dirty ? literalAll() : selected.size === 0 || literalAll());
+
+    function renderTrigger() {
+      host.classList.toggle('disabled', disabled);
+      if (options.length === 0 || selected.size === 0 || literalAll()) { txt.textContent = allLabel; return; }
+      txt.textContent = joinShort(options.filter((o) => selected.has(o.value)).map((o) => o.label));
+    }
+    function renderPop() {
+      const checked = allChecked();
+      const parts = ['<label class="msel-item all"><input type="checkbox" data-all="1"' + (checked ? ' checked' : '') +
+        '><span>' + esc(allLabel) + '</span></label>'];
+      for (const o of options) {
+        parts.push('<label class="msel-item"><input type="checkbox" value="' + esc(o.value) + '"' +
+          (selected.has(o.value) ? ' checked' : '') + '><span>' + esc(o.label) + '</span></label>');
+      }
+      if (options.length === 0) parts.push('<div class="msel-item none">无选项</div>');
+      pop.innerHTML = parts.join('');
+      const allCb = pop.querySelector('input[data-all]');
+      if (allCb) allCb.indeterminate = !checked && selected.size > 0;
+    }
+    host.querySelector('.msel-trigger').addEventListener('click', () => {
+      if (disabled) return;
+      const willOpen = !host.classList.contains('open');
+      document.querySelectorAll('.msel.open').forEach((el) => el.classList.remove('open'));
+      if (willOpen) { renderPop(); host.classList.add('open'); }
+    });
+    pop.addEventListener('change', (e) => {
+      const cb = e.target;
+      if (!cb.matches('input[type="checkbox"]')) return;
+      dirty = true;
+      if (cb.dataset.all) {
+        selected = cb.checked ? new Set(options.map((o) => o.value)) : new Set();
+      } else if (cb.checked) {
+        selected.add(cb.value);
+      } else {
+        selected.delete(cb.value);
+      }
+      renderPop();
+      renderTrigger();
+      if (onChange) onChange(new Set(selected));
+    });
+    return {
+      setOptions(list) {
+        options = (list || []).map((o) => ({ value: String(o.value), label: String(o.label) }));
+        const valid = new Set(options.map((o) => o.value));
+        selected = new Set([...selected].filter((v) => valid.has(v)));
+        renderPop();
+        renderTrigger();
+      },
+      setSelected(values) {
+        const valid = new Set(options.map((o) => o.value));
+        selected = new Set([...(values || [])].filter((v) => valid.has(v)));
+        dirty = selected.size > 0;
+        renderPop();
+        renderTrigger();
+      },
+      setDisabled(v) {
+        disabled = Boolean(v);
+        if (disabled) host.classList.remove('open');
+        renderTrigger();
+      },
+      labelOf(value) {
+        const hit = options.find((o) => o.value === value);
+        return hit ? hit.label : value;
+      },
+      get selected() { return new Set(selected); }
+    };
   }
 
   let chart = null;
@@ -116,19 +220,94 @@
   let modelAggs = [];    // 模型饼图当前数据
   let drillSeq = 0;      // 异步取数序号，过期响应直接丢弃
   let providerOrder = []; // 页面生命周期内稳定的提供商取色顺序
+  // 小时时段构成区（hourly-archive-drilldown）：两个块实例 + 选区当前所属下钻日（换日复位用）
+  let provHourBlock = null, modelHourBlock = null;
+  const hourBlocks = [];
+  let hourDayKey = null;
+
+  // 三个筛选维度的多选实例（onChange 在事件期触发，处理函数为提升的函数声明）
+  const toolMsel = makeMultiSelect($('toolSel'), { allLabel: '全部平台', onChange: (sel) => onToolChange(sel) });
+  const providerMsel = makeMultiSelect($('providerSel'), { allLabel: '全部提供商', onChange: (sel) => onProviderChange(sel) });
+  const modelMsel = makeMultiSelect($('modelSel'), { allLabel: '全部模型', onChange: (sel) => onModelChange(sel) });
+
+  /** tool 维度请求参数：全选态（空集或覆盖全部）→ tool=all；子集 → 重复 tool= */
+  function appendToolParams(params) {
+    if (state.tools.size === 0 || toolIds.every((id) => state.tools.has(id))) {
+      params.set('tool', 'all');
+    } else {
+      for (const id of state.tools) params.append('tool', id);
+    }
+  }
+
+  // 当前模型下拉选项值（deriveModelOptions 维护）：covers-all 判定用
+  let currentModelValues = [];
+  const coversAll = (set, values) => values.length > 0 && set.size >= values.length && values.every((v) => set.has(v));
+
+  /**
+   * provider / model 维度请求参数（重复 key 多值）：
+   * 空集与 covers-all（逐个勾满 = 「全部」态）同语义——SHALL 等效不筛选，不向 API 传参
+   */
+  function appendFilterParams(params) {
+    if (state.providers.size > 0 && !coversAll(state.providers, filterTree.map((p) => p.value))) {
+      for (const v of state.providers) params.append('provider', v);
+    }
+    if (state.models.size > 0 && !coversAll(state.models, currentModelValues)) {
+      for (const m of state.models) params.append('model', m);
+    }
+  }
+
+  /** 下钻请求的筛选参数串：与 loadStats 同一收口（covers-all 同样不传参） */
+  function drillFilterQuery() {
+    const p = new URLSearchParams();
+    appendFilterParams(p);
+    return p.toString();
+  }
+
+  /**
+   * 模型级联派生（本地，不重取树）：提供商子集态 → 模型下拉开放，选项 = 所选提供商
+   * models 并集——同名 dm 合并为一个选项并括注提供商显示名（选中即跨提供商汇总）；
+   * 全选/空选态 → 禁用并清空。已选模型不在并集者剔除。
+   */
+  function deriveModelOptions() {
+    const providerAll = state.providers.size === 0 || filterTree.every((p) => state.providers.has(p.value));
+    if (providerAll || filterTree.length === 0) {
+      state.models = new Set();
+      currentModelValues = [];
+      modelMsel.setOptions([]);
+      modelMsel.setDisabled(true);
+      return;
+    }
+    const byModel = new Map(); // dm → 提供商显示名列表
+    for (const p of filterTree) {
+      if (!state.providers.has(p.value)) continue;
+      for (const dm of p.models) {
+        if (!byModel.has(dm)) byModel.set(dm, []);
+        byModel.get(dm).push(p.label);
+      }
+    }
+    const options = [...byModel.entries()]
+      .map(([dm, labels]) => ({ value: dm, label: labels.length > 1 ? dm + '（' + labels.join('、') + '）' : dm }))
+      .sort((a, b) => a.value.localeCompare(b.value));
+    modelMsel.setOptions(options);
+    modelMsel.setDisabled(options.length === 0);
+    currentModelValues = options.map((o) => o.value);
+    const valid = new Set(options.map((o) => o.value));
+    state.models = new Set([...state.models].filter((m) => valid.has(m)));
+    modelMsel.setSelected(state.models);
+  }
 
   /* ================= 数据加载与聚合 ================= */
 
-  function buildBars(data) {
-    buckets = data.bars.map((b) => ({
-      key: b.key,
-      label: barLabel(b.key),
-      title: barTitle(b.key),
-      hit: b.cacheRead,
-      miss: b.other,
-      output: b.output,
-      cost: b.cost || null // {cost, pricedTokens, unpricedTokens}（无价格配置时服务端给零值）
-    }));
+  /** 槽位构建（summary-range-slider）：完整日历窗口（7d/30d 缺数据日补零 / 年视图固定 12 槽） */
+  function buildSlots(data) {
+    buckets = SummaryRange.buildSlots(data.bars, state.view);
+    const n = buckets.length;
+    // 选区有效性守卫：越界 / 初始态归位全窗口（视图 / 工具 / 年份切换由各自处理器显式复位）
+    if (!(state.winRange.a >= 0 && state.winRange.a <= n - 1 &&
+          state.winRange.b >= state.winRange.a && state.winRange.b <= n - 1)) {
+      state.winRange.a = 0;
+      state.winRange.b = n - 1;
+    }
   }
 
   function setStats(prefix, s) {
@@ -139,36 +318,31 @@
   }
 
   async function renderCards() {
-    // 今日卡片：未固化明细实时聚合（按当前统计工具）
+    // 今日卡片：未固化明细实时聚合（按当前统计工具，与滑条选区无关）
     try {
-      const today = await getJson('/api/today?tool=' + encodeURIComponent(state.tool));
+      const todayParams = new URLSearchParams();
+      appendToolParams(todayParams);
+      const today = await getJson('/api/today?' + todayParams.toString());
       const now = new Date();
-      todayDateEl.textContent = toolLabel() + ' · ' + now.toLocaleDateString('sv-SE') + ' ' + WEEK[now.getDay()];
+      todayDateEl.textContent = platformPrefix() + ' · ' + now.toLocaleDateString('sv-SE') + ' ' + WEEK[now.getDay()];
       todayBadge.textContent = now.toLocaleDateString('sv-SE') + ' ' + WEEK[now.getDay()];
       setStats('today', today);
     } catch (error) {
       console.error('今日卡片加载失败', error);
     }
-    winLabelEl.textContent = toolLabel() + ' · ' +
-      (state.view === 'year'
-        ? state.year + ' 年 1–12 月'
-        : state.view === '7d' ? '最近 7 天（不含今日）' : '最近 30 天（不含今日）');
-    // 窗口汇总直接取 /api/stats 的 totals（已按筛选联动）
-    if (lastTotals) setStats('win', lastTotals);
+    renderSummary();
   }
 
-  let lastTotals = null;
   let lastYears = [];
 
   async function loadStats() {
-    const params = new URLSearchParams({ range: state.view, tool: state.tool });
+    const params = new URLSearchParams({ range: state.view });
+    appendToolParams(params);
     if (state.view === 'year' && state.year) params.set('year', String(state.year));
-    if (state.provider) params.set('provider', state.provider);
-    if (state.model) params.set('model', state.model);
+    appendFilterParams(params);
     const data = await getJson('/api/stats?' + params.toString());
     setBillingCurrency(data.currency);
-    buildBars(data);
-    lastTotals = data.totals;
+    buildSlots(data);
     if (data.years) lastYears = data.years;
     if (data.year && !state.year) state.year = String(data.year);
   }
@@ -178,44 +352,25 @@
       const data = await getJson('/api/tools');
       for (const t of data.tools || []) toolLabels[t.id] = t.label;
       toolLabels.all = '全部平台';
-      // 「全部平台」恒为第一项且为默认选中（spec: 统计工具切换）
-      const options = ['<option value="all">全部平台</option>'];
-      for (const t of data.tools || []) options.push('<option value="' + t.id + '">' + t.label + '</option>');
-      toolSel.innerHTML = options.join('');
-      toolSel.value = state.tool;
-      if (toolSel.selectedIndex === -1) {
-        // 兜底：选项异常时回落全部平台（正常路径 'all' 恒在，必命中）
-        state.tool = 'all';
-        toolSel.value = state.tool;
-      }
+      toolIds = (data.tools || []).map((t) => t.id);
+      toolMsel.setOptions(toolIds.map((id) => ({ value: id, label: toolLabels[id] || id })));
     } catch (error) {
       console.error('平台列表加载失败', error);
       toolLabels.kimi = toolLabels.kimi || 'Kimi Code';
+      if (toolIds.length === 0) toolIds = ['kimi'];
+      toolMsel.setOptions(toolIds.map((id) => ({ value: id, label: toolLabels[id] || id })));
     }
-  }
-
-  // 提供商选项值：服务端在 filter-options 中直接给出（'map:统一名' / 'tool|provider' / 裸名）
-  function providerOptionValue(p) {
-    return p.value;
   }
 
   async function loadFilterOptions() {
-    const params = new URLSearchParams({ range: state.view, tool: state.tool });
+    const params = new URLSearchParams({ range: state.view });
+    appendToolParams(params);
     if (state.view === 'year' && state.year) params.set('year', String(state.year));
     const data = await getJson('/api/filter-options?' + params.toString());
-    const providers = data.providers || [];
-    for (const p of providers) if (!providerOrder.includes(p.label)) providerOrder.push(p.label);
-    const selected = state.provider;
-    providerSel.innerHTML =
-      '<option value="">全部提供商</option>' +
-      providers.map((p) => '<option value="' + providerOptionValue(p) + '">' + p.label + '</option>').join('');
-    providerSel.value = selected; // 筛选切换视图后尽量保持
-    if (providerSel.selectedIndex === -1) {
-      state.provider = '';
-      state.model = '';
-      providerSel.value = '';
-    }
-    rebuildModelOptions(providers);
+    filterTree = data.providers || [];
+    for (const p of filterTree) if (!providerOrder.includes(p.label)) providerOrder.push(p.label);
+    providerMsel.setOptions(filterTree.map((p) => ({ value: p.value, label: p.label })));
+    deriveModelOptions();
     // 年份下拉（年视图）：只列有数据的年份
     yearSel.innerHTML = (data.years || lastYears)
       .map((y) => '<option value="' + y + '">' + y + '</option>').join('');
@@ -224,55 +379,105 @@
     }
   }
 
-  function rebuildModelOptions(providers) {
-    const list = providers || [];
-    const selectedProvider = state.provider;
-    if (!selectedProvider) {
-      modelSel.innerHTML = '<option value="">全部模型</option>';
-      modelSel.disabled = true;
-      return;
-    }
-    const entry = list.find((p) => providerOptionValue(p) === selectedProvider);
-    const models = entry ? entry.models : [];
-    modelSel.innerHTML =
-      '<option value="">全部模型</option>' +
-      models.map((m) => '<option value="' + m + '">' + m + '</option>').join('');
-    modelSel.disabled = models.length === 0;
-    if (state.model && models.includes(state.model)) {
-      modelSel.value = state.model;
-    } else {
-      state.model = '';
-    }
-  }
-
   function renderChart() {
     if (!chart) return;
     chart.data.labels = buckets.map((b) => b.label);
     chart.data.datasets[0].data = buckets.map((b) => b.hit);
     chart.data.datasets[1].data = buckets.map((b) => b.miss + b.output);
+    // 逐柱配色随选区（全窗口 = 现状基色，summary-range-slider）
+    const colors = SummaryRange.barColors(buckets.length, state.winRange.a, state.winRange.b);
+    chart.data.datasets[0].backgroundColor = colors.hit;
+    chart.data.datasets[0].hoverBackgroundColor = colors.hit;
+    chart.data.datasets[1].backgroundColor = colors.miss;
+    chart.data.datasets[1].hoverBackgroundColor = colors.miss;
     chart.options.scales.x.ticks.maxTicksLimit = state.view === '30d' ? 16 : 12;
     chart.update();
-    chartTitle.textContent = toolLabel() + ' · ' +
+    alignSlider();
+    chartTitle.textContent = platformPrefix() + ' · ' +
       (state.view === 'year'
         ? state.year + ' 年逐月 token 用量'
         : state.view === '7d' ? '最近 7 天 token 用量（不含今日）' : '最近 30 天 token 用量（不含今日）');
-    // 提供商显示：'map:统一名' 去前缀；all 视图 'tool|provider' → 'provider(tool)'
-    const providerShown = state.provider
-      ? (state.provider.startsWith('map:') ? state.provider.slice(4)
-        : state.provider.includes('|') ? state.provider.replace('|', '(') + ')' : state.provider)
-      : '全部提供商';
-    chartMeta.textContent = '筛选：' + providerShown + ' · ' + (state.model || '全部模型');
+    chartMeta.textContent = '筛选：' + providerFilterLabel() + ' · ' + modelFilterLabel();
+  }
+
+  // 筛选文案（多选）：全选态显示「全部提供商」；子集列出所选名（超 2 项折叠）
+  function providerFilterLabel() {
+    if (state.providers.size === 0 || coversAll(state.providers, filterTree.map((p) => p.value))) return '全部提供商';
+    return joinShort(filterTree.filter((p) => state.providers.has(p.value)).map((p) => p.label));
+  }
+  function modelFilterLabel() {
+    if (state.models.size === 0 || coversAll(state.models, currentModelValues)) return '全部模型';
+    return joinShort([...state.models].map((m) => modelMsel.labelOf(m)));
   }
 
   async function renderAll() {
     try {
       await loadStats();
+      syncSlider();
       renderChart();
       await renderCards();
     } catch (error) {
       chartTitle.textContent = '数据加载失败';
       chartMeta.textContent = error.message || String(error);
     }
+  }
+
+  /* ================= 汇总范围滑动条（summary-range-slider） ================= */
+
+  let slider = null; // 首槽构建后由 syncSlider 惰性装配（文案闭包读取 buckets）
+
+  /** 窗口汇总卡 = 滑条选区聚合（与服务端 totals 同源等值，拖拽中实时重算） */
+  function renderSummary() {
+    const win = SummaryRange.sumRange(buckets, state.winRange.a, state.winRange.b);
+    setStats('win', { input: win.input, output: win.output, total: win.total, hitRate: win.rate });
+    winLabelEl.textContent = SummaryRange.winLabelText(
+      platformPrefix(), state.view, state.year, buckets, state.winRange.a, state.winRange.b);
+  }
+
+  /** 收窄态柱状图明暗刷新（数据与坐标不动，跳过动画保拖拽跟手） */
+  function updateChartHighlight() {
+    if (!chart) return;
+    const colors = SummaryRange.barColors(buckets.length, state.winRange.a, state.winRange.b);
+    chart.data.datasets[0].backgroundColor = colors.hit;
+    chart.data.datasets[0].hoverBackgroundColor = colors.hit;
+    chart.data.datasets[1].backgroundColor = colors.miss;
+    chart.data.datasets[1].hoverBackgroundColor = colors.miss;
+    chart.update('none');
+  }
+
+  /** 滑块轨道 / 刻度与柱状图绘图区对齐（左右让位 = y 轴标签宽 / 右侧留白） */
+  function alignSlider() {
+    if (!slider || !chart || !chart.chartArea) return;
+    const area = chart.chartArea;
+    slider.setAlign(Math.round(area.left), Math.round(chart.canvas.clientWidth - area.right));
+  }
+
+  /** 数据到位后的滑条同步：首次装配 / 槽位数变化时重建（选区沿用 state.winRange） */
+  function syncSlider() {
+    const n = buckets.length;
+    if (!n) return;
+    if (!slider) {
+      slider = RangeSlider.create($('rangeSlider'), {
+        slotCount: n,
+        a: state.winRange.a,
+        b: state.winRange.b,
+        slotText: (i) => buckets[i].title,
+        rangeText: (a, b) => SummaryRange.rangeText(state.view, state.year, buckets, a, b),
+        tickText: (i) => buckets[i].label,
+        tickVisible: (i) => n <= 12 || i % 5 === 0 || i === n - 1,
+        onChange: (a, b) => {
+          state.winRange.a = a;
+          state.winRange.b = b;
+          renderSummary();
+          updateChartHighlight();
+        }
+      });
+      slider.configure({ slotCount: n, a: state.winRange.a, b: state.winRange.b }); // create 只画壳：刻度行由 configure 重建
+      alignSlider();
+      return;
+    }
+    slider.configure({ slotCount: n, a: state.winRange.a, b: state.winRange.b });
+    alignSlider();
   }
 
   /* ================= 下钻：提供商 / 模型饼图 ================= */
@@ -292,13 +497,9 @@
     return 'rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(2) + ')';
   }
 
-  // 下钻当前是否可用：任何级联筛选激活时禁用（静默，不报错）
-  function drillEnabled() {
-    return !state.provider && !state.model;
-  }
-
   function clearDrill() {
     drill = { kind: null, key: null, provider: null };
+    hourDayKey = null; // 下次打开任意单日 → 小时区时间轴复位为全 24 小时（hourly-archive-drilldown）
     rebuildDrill();
   }
 
@@ -308,9 +509,11 @@
       return '今日（' + new Date().toLocaleDateString('sv-SE') + ' · 实时口径）';
     }
     if (drill.kind === 'window') {
-      if (state.view === 'year') return state.year + ' 年全年（窗口汇总）';
-      const keys = buckets.map((b) => b.key).sort();
-      return '窗口汇总（' + (keys[0] || '') + ' ~ ' + (keys[keys.length - 1] || '') + '）';
+      const { a, b } = state.winRange;
+      if (state.view === 'year') {
+        return (b - a === 11 ? state.year + ' 年全年' : state.year + ' 年 ' + buckets[a].label + '–' + buckets[b].label) + '（窗口汇总）';
+      }
+      return '窗口汇总（' + buckets[a].key + ' ~ ' + buckets[b].key + '）';
     }
     return buckets.find((b) => b.key === drill.key)?.title || '';
   }
@@ -318,29 +521,39 @@
   // 重算并渲染两层饼图；scroll = 出现时平滑滚动到第一层
   async function rebuildDrill(scroll) {
     const seq = ++drillSeq;
-    const active = Boolean(drill.kind) && drillEnabled();
+    // 下钻与筛选共存（multi-select-filters-and-filtered-drilldown）：任何筛选条件下都可下钻，
+    // 饼图数据 = 当前筛选命中后的结果（provider / model 多值随请求下传）
+    const active = Boolean(drill.kind);
     $('providerPanel').hidden = !active;
-    $('modelPanel').hidden = true;
+    // 二级面板切换不塌陷（fix-drilldown-model-pie-flicker）：已展示时换选提供商跨请求保持原位（数据到达后原地更新），
+    // 首次下钻（原本隐藏）仍等数据到达再出现；取消下钻（provider 为 null）恒隐藏
+    $('modelPanel').hidden = !(drill.provider && !$('modelPanel').hidden);
     $('todayDetailBtn').classList.toggle('active', drill.kind === 'today');
     $('winDetailBtn').classList.toggle('active', drill.kind === 'window');
     if (!active) return;
 
+    const toolParams = new URLSearchParams();
+    appendToolParams(toolParams);
+    const fq = drillFilterQuery();
+    const withFilter = (base) => base + '&' + toolParams.toString() + (fq ? '&' + fq : '');
     let data;
     try {
       if (drill.kind === 'today') {
-        data = await getJson('/api/breakdown?date=' + new Date().toLocaleDateString('sv-SE') + '&tool=' + encodeURIComponent(state.tool));
+        data = await getJson(withFilter('/api/breakdown?date=' + new Date().toLocaleDateString('sv-SE')));
       } else if (drill.kind === 'window') {
-        // 窗口汇总详细：7d/30d 视图取窗口首末柱日期区间，年视图取整年
+        // 窗口汇总详细跟随滑条选区（summary-range-slider）：7d/30d 取选区日期区间，
+        // 年视图全窗口取整年、收窄走月区间（usage_monthly 口径，避免归档月日表清理缺数据）
+        const { a, b } = state.winRange;
         if (state.view === 'year') {
-          data = await getJson('/api/breakdown?year=' + encodeURIComponent(state.year) + '&tool=' + encodeURIComponent(state.tool));
+          const months = b - a === 11 ? '' : '&month_from=' + (a + 1) + '&month_to=' + (b + 1);
+          data = await getJson(withFilter('/api/breakdown?year=' + encodeURIComponent(state.year) + months));
         } else {
-          const keys = buckets.map((b) => b.key).sort();
-          data = await getJson('/api/breakdown?from=' + keys[0] + '&to=' + keys[keys.length - 1] + '&tool=' + encodeURIComponent(state.tool));
+          data = await getJson(withFilter('/api/breakdown?from=' + buckets[a].key + '&to=' + buckets[b].key));
         }
       } else if (drill.key.length === 10) {
-        data = await getJson('/api/breakdown?date=' + drill.key + '&tool=' + encodeURIComponent(state.tool));
+        data = await getJson(withFilter('/api/breakdown?date=' + drill.key));
       } else {
-        data = await getJson('/api/breakdown?month=' + state.year + '-' + pad(Number(drill.key)) + '&tool=' + encodeURIComponent(state.tool));
+        data = await getJson(withFilter('/api/breakdown?month=' + state.year + '-' + pad(Number(drill.key))));
       }
     } catch (error) {
       console.error('下钻分布加载失败', error);
@@ -364,7 +577,7 @@
     if (drill.provider && !providerAggs.some((a) => a.key === drill.provider)) drill.provider = null;
 
     const dayLabel = drillDayLabel();
-    $('providerPieTitle').textContent = toolLabel() + ' · ' + dayLabel + ' · 按提供商分布';
+    $('providerPieTitle').textContent = platformPrefix() + ' · ' + dayLabel + ' · 按提供商分布';
     $('providerPieMeta').textContent = '扇区大小 = 总计（输入＋输出）· 点击扇区下钻模型分布';
     updatePie(providerPie, providerAggs, drill.provider, providerAggs.map((a) => providerColor(a.key)));
     // 左下角信息块：当前整个饼图范围（该时段全提供商）的总计 / 命中率 / 费用（顶层合计由服务端给出）
@@ -376,13 +589,19 @@
     if (drill.provider) {
       const entry = providerAggs.find((a) => a.key === drill.provider);
       modelAggs = entry.models.map((m) => ({ key: m.model, ...mapAgg(m) }));
-      $('modelPieTitle').textContent = drill.provider + ' · ' + toolLabel() + ' · ' + dayLabel + ' · 按模型分布';
+      $('modelPieTitle').textContent = drill.provider + ' · ' + platformPrefix() + ' · ' + dayLabel + ' · 按模型分布';
       const base = providerColor(drill.provider);
       updatePie(modelPie, modelAggs, null, modelAggs.map((a, i) => shadeOf(base, i, modelAggs.length)));
       // 左下角信息块：该提供商（模型饼图整体）的总计 / 命中率 / 费用
       setPieStats('modelPieStats', entry.total, entry.rate, entry.cost);
       $('modelPanel').hidden = false;
+    } else {
+      // 切换保持原位期间原提供商被换时段清掉 → 数据到达后补收起（fix-drilldown-model-pie-flicker）
+      $('modelPanel').hidden = true;
     }
+
+    // ★ 小时时段构成区（hourly-archive-drilldown）：仅单日下钻出现（内部自带隐藏判定）
+    await renderHourlyBlocks(seq, withFilter);
   }
 
   // 填充饼图左下角信息块（总计 + 命中率 + 费用，竖排三行）；空数据隐藏整块，无已计价量只隐藏费用行
@@ -427,8 +646,24 @@
           legend: {
             position: 'right',
             labels: {
-              color: '#c7d3e8', usePointStyle: true, pointStyle: 'circle',
-              boxWidth: 8, boxHeight: 8, padding: 12, font: { size: 12 }
+              color: '#e7eef8', usePointStyle: true, pointStyle: 'circle',
+              boxWidth: 8, boxHeight: 8, padding: 12, font: { size: 12 },
+              // 图例占比（multi-select-filters-and-filtered-drilldown）：名称后括注 (nn.nn%)，
+              // 分母 = 当前饼图全部扇区总计（数据全集口径，不随图例隐藏重算）
+              generateLabels: (c) => {
+                const data = c.data.datasets[0].data;
+                const total = data.reduce((sum, v) => sum + (Number(v) || 0), 0);
+                return c.data.labels.map((label, i) => ({
+                  text: label + (total > 0 ? ' (' + ((Number(data[i]) || 0) / total * 100).toFixed(2) + '%)' : ''),
+                  fontColor: '#e7eef8', // 同上：项级 fontColor 才生效
+                  fillStyle: c.data.datasets[0].backgroundColor[i],
+                  strokeStyle: 'transparent',
+                  lineWidth: 0,
+                  pointStyle: 'circle',
+                  hidden: !c.getDataVisibility(i),
+                  index: i
+                }));
+              }
             }
           },
           tooltip: {
@@ -467,6 +702,302 @@
     });
   }
 
+  /* ================= 单日下钻 · 小时时段构成区（hourly-archive-drilldown） ================= */
+
+  const HR = window.HourlyRange; // 小时槽位 / 选区聚合纯函数引擎（web/hourly-range.js）
+
+  /** 选区区间框选插件：只画框与淡罩，不改柱色（柱色必须恒等于对应饼图配色） */
+  function makeHourRangePlugin() {
+    return {
+      id: 'hourRangeHighlight',
+      afterDatasetsDraw(c) {
+        if (c.data.labels.length !== HR.HOURS) return;
+        if (state.hour.a === 0 && state.hour.b === HR.HOURS - 1) return;
+        const area = c.chartArea;
+        if (!area) return;
+        const unit = (area.right - area.left) / HR.HOURS;
+        const left = area.left + state.hour.a * unit;
+        const right = area.left + (state.hour.b + 1) * unit;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.fillStyle = 'rgba(45, 212, 191, .07)';
+        ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+        ctx.strokeStyle = 'rgba(45, 212, 191, .85)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(left + 0.75, area.top + 0.75, right - left - 1.5, area.bottom - area.top - 1.5);
+        ctx.restore();
+      }
+    };
+  }
+
+  /**
+   * 时间轴轨道与柱状图绘图区对齐（左右让位 = y 轴标签宽 / 右侧留白）。
+   * 防御：面板由 display:none 变可见时 Chart.js 响应式布局尚未完成，chartArea 仍是退化值
+   * （left = right = 0）而 canvas 已有宽度 —— 此时对齐会得到宽度为 0 的轨道（无法拖拽，
+   * 二级模型区实测缺陷）。仅布局有效时对齐，布局完成后再由 afterRender / scheduleRealign 补齐。
+   */
+  function alignHourly(block) {
+    if (!block.slider || !block.chart || !block.chart.canvas) return;
+    const area = block.chart.chartArea;
+    const width = block.chart.canvas.clientWidth;
+    if (!area || !(area.right > area.left) || !(width > 0)) return;
+    block.slider.setAlign(Math.round(area.left), Math.round(width - area.right));
+  }
+
+  /** 两帧兜底对齐：面板显隐与 Chart.js 响应式布局都是异步的（rAF + 一次 120ms 保险） */
+  function scheduleRealign() {
+    const run = () => { for (const blk of hourBlocks) alignHourly(blk); };
+    requestAnimationFrame(run);
+    setTimeout(run, 120);
+  }
+
+  /** 任一小时轴选区变化：两级小时区共享选区，实时刷新各自汇总与图上框选 */
+  function onHourRangeChange(a, b, source) {
+    state.hour.a = a;
+    state.hour.b = b;
+    for (const blk of hourBlocks) {
+      if (blk.slider && blk !== source) blk.slider.configure({ slotCount: HR.HOURS, a, b });
+      blk.renderSummary();
+      if (blk.chart && blk.chart.data.labels.length) blk.chart.update('none');
+    }
+  }
+
+  /**
+   * 创建一个「小时时段构成区」实例（两级共用：一级按提供商、二级按所选提供商的模型）。
+   * 堆叠维度与顺序取自对应饼图结果（dims），小时数据只负责填值 —— 颜色逐项一致的前提。
+   */
+  function createHourlyBlock(cfg) {
+    const block = {
+      chart: null, slider: null, slots: [], hours: [], dims: [], matrix: [], totalsByDim: [],
+      hoverIndex: null, redrawPending: false,
+      /**
+       * 渲染/刷新。整块出现条件 =「单日下钻」且「该日确有小时数据」：
+       * 月柱 / 窗口汇总（非单日口径）与无小时数据的日期 → 整块隐藏，不显示空态提示。
+       */
+      render({ visible, rows, dims, keyOf, srcText }) {
+        block.hoverIndex = null;
+        $(cfg.blockId).hidden = !visible;
+        if (!visible) return;
+        $(cfg.srcId).hidden = false;
+        $(cfg.srcId).textContent = srcText;
+
+        // (小时, 维度) 行 → 逐小时明细行（引擎 buildSlots 以 hour 分桶聚合五值）
+        block.slots = HR.buildSlots(rows);
+        block.hours = block.slots.map((s) => s.total);
+        block.dims = dims;
+        const index = new Map(dims.map((d, i) => [d.key, i]));
+        const matrix = dims.map(() => new Array(HR.HOURS).fill(0));
+        for (const r of rows) {
+          const i = index.get(keyOf(r));
+          if (i === undefined) continue;
+          matrix[i][r.hour] += (r.cacheRead || 0) + (r.inputOther || 0) + (r.cacheCreation || 0) + (r.output || 0);
+        }
+        block.matrix = matrix;
+        block.totalsByDim = matrix.map((row) => row.reduce((acc, v) => acc + v, 0));
+
+        block.chart.data.labels = block.slots.map((s) => s.short);
+        block.chart.data.datasets = dims.map((d, i) => ({
+          label: d.key,
+          data: matrix[i],
+          backgroundColor: d.color,
+          hoverBackgroundColor: d.color,
+          stack: 'hour',
+          barPercentage: 0.9,
+          categoryPercentage: 0.92
+        }));
+        block.chart.update();
+
+        if (!block.slider) {
+          block.slider = RangeSlider.create($(cfg.sliderId), {
+            slotCount: HR.HOURS,
+            a: state.hour.a,
+            b: state.hour.b,
+            slotText: (i) => HR.slotTitle(i),
+            rangeText: (a, b) => HR.rangeText(a, b),
+            tickText: (i) => HR.tickText(i),
+            tickVisible: (i, n) => HR.tickVisible(i, n),
+            onChange: (a, b) => onHourRangeChange(a, b, block)
+          });
+        }
+        block.slider.configure({ slotCount: HR.HOURS, a: state.hour.a, b: state.hour.b });
+        block.renderTip();
+        block.renderSummary();
+        alignHourly(block);
+      },
+      /**
+       * 图表主体外部左侧的固定信息浮窗（半透明、不跟随鼠标、不遮挡柱体）：
+       * 默认态 = 本范围各维度构成；悬浮态 = 该小时各维度「名称：用量（占本时段 xx%）」+ 本时段总量。
+       */
+      renderTip() {
+        const tip = $(cfg.tipId);
+        const share = (v, t) => (t > 0 ? (v / t * 100).toFixed(2) + '%' : '–');
+        const row = (name, color, v, t) =>
+          '<div class="ht-row"><span class="ht-sw" style="background:' + color + '"></span>' +
+          '<span class="ht-name">' + esc(name) + '</span>' +
+          '<span class="ht-val">' + fmtFull(v) + '</span>' +
+          '<span class="ht-pct">' + share(v, t) + '</span></div>';
+        if (block.hoverIndex === null || block.hoverIndex === undefined) {
+          const total = block.totalsByDim.reduce((acc, v) => acc + v, 0);
+          const rows = block.dims
+            .map((d, i) => ({ key: d.key, color: d.color, v: block.totalsByDim[i] }))
+            .sort((a, b) => b.v - a.v);
+          tip.innerHTML = '<div class="ht-head">本范围构成</div>' +
+            '<div class="ht-hint">悬浮柱体 → 该时段构成<br>拖时间轴 → 收窄下方汇总</div>' +
+            '<div class="ht-list">' + rows.map((r) => row(r.key, r.color, r.v, total)).join('') + '</div>';
+          return;
+        }
+        const i = block.hoverIndex;
+        const total = block.hours[i] || 0;
+        const rows = block.dims
+          .map((d, k) => ({ key: d.key, color: d.color, v: block.matrix[k][i] }))
+          .filter((r) => r.v > 0)
+          .sort((a, b) => b.v - a.v);
+        tip.innerHTML = '<div class="ht-head"><span class="ht-time">' + HR.slotTitle(i) + '</span></div>' +
+          '<div class="ht-sub">本时段总量 ' + fmtFull(total) + '</div>' +
+          '<div class="ht-list">' + rows.map((r) => row(r.key, r.color, r.v, total)).join('') + '</div>';
+      },
+      /** 悬浮高亮重绘（rAF 合并，避免在 chart 更新过程中重入 draw） */
+      scheduleRedraw() {
+        if (block.redrawPending) return;
+        block.redrawPending = true;
+        requestAnimationFrame(() => {
+          block.redrawPending = false;
+          if (block.chart && !$(cfg.blockId).hidden) block.chart.draw();
+        });
+      },
+      renderSummary() {
+        const t = HR.sumRange(block.slots, state.hour.a, state.hour.b);
+        $(cfg.prefix + 'SumLabel').textContent = HR.sumLabel(state.hour.a, state.hour.b);
+        $(cfg.prefix + 'Hit').textContent = fmtFull(t.hit);
+        $(cfg.prefix + 'HitNote').textContent = '命中率 ' + fmtRate(t.rate);
+        $(cfg.prefix + 'Miss').textContent = fmtFull(t.miss);
+        $(cfg.prefix + 'Out').textContent = fmtFull(t.output);
+        $(cfg.prefix + 'OutNote').textContent = '占总量 ' + fmtShare(t.outputShare);
+        $(cfg.prefix + 'Total').textContent = fmtFull(t.total);
+        $(cfg.prefix + 'TotalNote').textContent = '输入 ＋ 输出';
+      }
+    };
+
+    // 悬浮高亮：柱体之下淡色竖带（beforeDatasetsDraw）+ 柱体之上青色描边（afterDatasetsDraw）；
+    // 不改柱色本身（保持与对应饼图的严格颜色对应），不弹跟随鼠标的气泡
+    const hoverPlugin = {
+      id: 'hourHover',
+      beforeDatasetsDraw(c) {
+        const i = block.hoverIndex, area = c.chartArea, n = c.data.labels.length;
+        if (i === null || i === undefined || !area || !n) return;
+        const unit = (area.right - area.left) / n;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.fillStyle = 'rgba(231, 238, 248, .08)';
+        ctx.fillRect(area.left + i * unit, area.top, unit, area.bottom - area.top);
+        ctx.restore();
+      },
+      afterDatasetsDraw(c) {
+        const i = block.hoverIndex, area = c.chartArea, n = c.data.labels.length;
+        if (i === null || i === undefined || !area || !n) return;
+        const unit = (area.right - area.left) / n;
+        const left = area.left + i * unit;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.strokeStyle = 'rgba(45, 212, 191, .95)';
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(left + 0.75, area.top + 0.75, unit - 1.5, area.bottom - area.top - 1.5);
+        ctx.restore();
+      }
+    };
+
+    // 对齐兜底：响应式布局完成后必然再渲染一次，此时 chartArea 有效 → 补一次对齐
+    const alignPlugin = { id: 'hourAlign', afterRender: () => alignHourly(block) };
+
+    block.chart = new Chart($(cfg.canvasId).getContext('2d'), {
+      type: 'bar',
+      plugins: [makeHourRangePlugin(), hoverPlugin, alignPlugin],
+      data: { labels: [], datasets: [] },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: { duration: 260 },
+        interaction: { mode: 'index', intersect: false },
+        onResize: () => alignHourly(block),
+        // 无 onClick：小时柱不响应点击、不可下钻；悬浮只更新左侧固定浮窗 + 本柱高亮
+        onHover: (evt, elems) => {
+          const idx = elems && elems.length ? elems[0].index : null;
+          if (idx === block.hoverIndex) return;
+          block.hoverIndex = idx;
+          block.renderTip();
+          block.scheduleRedraw();
+        },
+        onLeave: () => {
+          if (block.hoverIndex === null) return;
+          block.hoverIndex = null;
+          block.renderTip();
+          block.scheduleRedraw();
+        },
+        plugins: {
+          legend: { display: false },  // 无独立图例：对应饼图的图例即小时柱颜色标注
+          tooltip: { enabled: false }  // 改用图表主体外部左侧的固定浮窗
+        },
+        scales: {
+          x: { stacked: true, grid: { display: false }, border: { color: 'rgba(148, 163, 184, .25)' }, ticks: { color: '#8ba0bf', font: { size: 10.5 }, maxRotation: 0, autoSkip: false } },
+          y: { stacked: true, beginAtZero: true, grid: { color: 'rgba(148, 163, 184, .1)' }, border: { display: false }, ticks: { color: '#8ba0bf', font: { size: 10.5 }, callback: (v) => fmtTick(v) } }
+        }
+      }
+    });
+    return block;
+  }
+
+  /**
+   * 拉取并渲染两级小时区（rebuildDrill 末尾调用）。
+   * 单日下钻（今日「详细」/ 7d·30d 点日柱）才请求 /api/hourly；月柱、窗口汇总（非单日口径）
+   * 与无小时数据的日期（早于水位 / 重建涉及）整块不出现（available=false → 隐藏，无空态）。
+   */
+  async function renderHourlyBlocks(seq, withFilter) {
+    const singleDay = drill.kind === 'today' || (drill.kind === 'bucket' && typeof drill.key === 'string' && drill.key.length === 10);
+    const dayKey = drill.kind === 'today' ? new Date().toLocaleDateString('sv-SE') : singleDay ? drill.key : null;
+    // 换了一天 → 时间轴复位为全 24 小时（同一天内切换提供商 / 重渲染不复位）
+    if (dayKey !== hourDayKey) {
+      hourDayKey = dayKey;
+      state.hour = { a: 0, b: HR.HOURS - 1 };
+    }
+    let hourly = null;
+    if (singleDay) {
+      try {
+        hourly = await getJson(withFilter('/api/hourly?date=' + dayKey));
+      } catch (error) {
+        console.error('小时构成加载失败', error);
+        hourly = { available: false, rows: [] };
+      }
+    }
+    if (seq !== drillSeq) return; // 已有更新的下钻请求，丢弃过期响应
+    const available = Boolean(hourly?.available);
+    const rows = available ? hourly.rows : [];
+    const srcText = available
+      ? (hourly.source === 'archive' ? '数据源：小时归档表（usage_hourly）' : '数据源：明细实时（usage_records）')
+      : null;
+    // ★ 一级：按提供商分色（与一级饼图同一取色函数、同一扇区顺序 → 逐项同色）
+    $('providerHourlyTitle').textContent = '按小时 · 提供商构成（' + drillDayLabel() + '）';
+    provHourBlock.render({
+      visible: available,
+      srcText,
+      rows,
+      keyOf: (r) => r.label,
+      dims: providerAggs.map((a) => ({ key: a.key, color: providerColor(a.key) }))
+    });
+    if (drill.provider) {
+      // ★ 二级：按所选提供商的模型分色（与二级饼图同色同序，父色深浅阶梯）
+      $('modelHourlyTitle').textContent = '按小时 · ' + drill.provider + ' 的模型构成';
+      modelHourBlock.render({
+        visible: available,
+        srcText,
+        rows: rows.filter((r) => r.label === drill.provider),
+        keyOf: (r) => r.model,
+        dims: modelAggs.map((a, i) => ({ key: a.key, color: shadeOf(providerColor(drill.provider), i, modelAggs.length) }))
+      });
+    }
+    scheduleRealign();
+  }
+
   /* ================= Chart.js ================= */
 
   function createChart() {
@@ -497,9 +1028,32 @@
       }
     };
 
+    // 汇总范围区间框选（summary-range-slider）：收窄选区时给选中槽位区间画虚线框 + 淡色罩
+    // （全窗口不画，spec: 未收窄时柱状图无样式变化）；槽位像素宽与滑条几何同构 → 框边界与手柄对齐
+    const rangeHighlight = {
+      id: 'rangeHighlight',
+      afterDatasetsDraw(c) {
+        const n = buckets.length;
+        if (!n || !c.chartArea || (state.winRange.a === 0 && state.winRange.b === n - 1)) return;
+        const area = c.chartArea;
+        const unit = (area.right - area.left) / n;
+        const left = area.left + state.winRange.a * unit;
+        const right = area.left + (state.winRange.b + 1) * unit;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.fillStyle = 'rgba(45, 212, 191, .06)';
+        ctx.fillRect(left, area.top, right - left, area.bottom - area.top);
+        ctx.strokeStyle = 'rgba(45, 212, 191, .9)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([5, 4]);
+        ctx.strokeRect(left + 0.75, area.top + 0.75, right - left - 1.5, area.bottom - area.top - 1.5);
+        ctx.restore();
+      }
+    };
+
     chart = new Chart($('usageChart').getContext('2d'), {
       type: 'bar',
-      plugins: [barHighlight],
+      plugins: [barHighlight, rangeHighlight],
       data: {
         labels: [],
         datasets: [
@@ -530,21 +1084,34 @@
         maintainAspectRatio: false,
         animation: { duration: 350 },
         interaction: { mode: 'index', intersect: false },
-        // 点击柱子 → 下钻提供商饼图；再点同一根取消。有筛选时静默不响应。
+        onResize: () => alignSlider(), // 图表重排后滑条跟随绘图区（summary-range-slider）
+        // 点击柱子 → 下钻提供商饼图（筛选后口径）；再点同一根取消。零值柱（补零占位）不响应。
         onClick: (evt, elems) => {
-          if (!drillEnabled() || !elems.length) return;
-          const key = buckets[elems[0].index]?.key;
-          if (!key) return;
-          if (drill.kind === 'bucket' && drill.key === key) { clearDrill(); return; }
-          drill = { kind: 'bucket', key, provider: drill.provider };
+          if (!elems.length) return;
+          const bar = buckets[elems[0].index];
+          if (!bar?.key) return;
+          if (bar.hit + bar.miss + bar.output === 0) return;
+          if (drill.kind === 'bucket' && drill.key === bar.key) { clearDrill(); return; }
+          drill = { kind: 'bucket', key: bar.key, provider: drill.provider };
           rebuildDrill(true);
         },
         onHover: (evt, elems) => { evt.native.target.style.cursor = elems.length ? 'pointer' : 'default'; },
         plugins: {
           legend: {
             labels: {
-              color: '#c7d3e8', usePointStyle: true, pointStyle: 'rectRounded',
-              boxWidth: 10, boxHeight: 10, padding: 18, font: { size: 12 }
+              color: '#e7eef8', usePointStyle: true, pointStyle: 'rectRounded',
+              boxWidth: 10, boxHeight: 10, padding: 18, font: { size: 12 },
+              // 图例色块固定用增强色（summary-range-slider D5）：逐柱配色数组会随选区闪烁
+              generateLabels: (c) => c.data.datasets.map((ds, i) => ({
+                text: ds.label,
+                fontColor: '#e7eef8', // Chart.js v4 画字取项级 fontColor（缺省回落 Chart.defaults.color 偏暗）
+                fillStyle: i === 0 ? SummaryRange.COLORS.hitOn : SummaryRange.COLORS.missOn,
+                strokeStyle: 'transparent',
+                lineWidth: 0,
+                pointStyle: 'rectRounded',
+                hidden: !c.isDatasetVisible(i),
+                index: i
+              }))
             }
           },
           tooltip: {
@@ -856,9 +1423,9 @@
   // 映射保存 / 删除 / 开关切换后：筛选可能指向已消失的名称，复位筛选与下钻并按最新映射全量重渲染
   async function applyMappingsAndRefresh(msg) {
     renderMapBadge();
-    state.provider = '';
-    state.model = '';
-    providerSel.value = '';
+    state.providers = new Set();
+    state.models = new Set();
+    providerMsel.setSelected(new Set());
     clearDrill();
     await refreshAll();
     showToast(msg);
@@ -2653,70 +3220,72 @@
   // 模型评分页（score.js）复用同一套提示：暴露到 window，避免第二套 toast 实现与样式漂移
   window.showToast = showToast;
 
-  function bindEvents() {
-    // 统计工具切换：各平台模型画像不同，筛选与下钻复位后按新工具重渲染
-    toolSel.addEventListener('change', () => {
-      state.tool = toolSel.value;
-      state.provider = '';
-      state.model = '';
-      clearDrill();
-      refreshAll();
-    });
+  // 多选组件回调（函数声明提升，供 makeMultiSelect 的 onChange 引用）
+  // 统计工具变化：各平台画像不同，提供商/模型筛选复位、下钻取消后按新口径重渲染（滑条复位全窗口）
+  function onToolChange(sel) {
+    state.tools = sel;
+    state.providers = new Set();
+    state.models = new Set();
+    state.winRange = { a: 0, b: -1 };
+    providerMsel.setSelected(new Set());
+    modelMsel.setOptions([]);
+    clearDrill();
+    refreshAll();
+  }
+  // 提供商子集变化：模型选择清空并本地重派生选项（不重取树），下钻按现状取消收起
+  function onProviderChange(sel) {
+    state.providers = sel;
+    state.models = new Set();
+    clearDrill();
+    deriveModelOptions();
+    renderAll();
+  }
+  function onModelChange(sel) {
+    state.models = sel;
+    clearDrill();
+    renderAll();
+  }
 
-    // 视图三态切换（桶语义变化，下钻取消）
+  function bindEvents() {
+    // 视图三态切换（桶语义变化，下钻取消；滑条选区复位全窗口）
     viewSeg.addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-view]');
       if (!btn) return;
       state.view = btn.dataset.view;
+      state.winRange = { a: 0, b: -1 };
       viewSeg.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
       yearField.classList.toggle('hide', state.view !== 'year');
       clearDrill();
       refreshAll();
     });
 
-    // 年份下拉（同上，取消下钻）
+    // 年份下拉（同上，取消下钻；滑条选区复位全窗口）
     yearSel.addEventListener('change', () => {
       state.year = yearSel.value;
+      state.winRange = { a: 0, b: -1 };
       clearDrill();
       renderAll();
     });
 
-    // 提供商 → 模型 级联（筛选激活时下钻自动取消）
-    providerSel.addEventListener('change', async () => {
-      state.provider = providerSel.value;
-      state.model = '';
-      clearDrill();
-      await loadFilterOptions(); // 重新派生模型选项（保持当前视图口径）
-      renderAll();
-    });
-    modelSel.addEventListener('change', () => {
-      state.model = modelSel.value;
-      clearDrill();
-      renderAll();
-    });
-
-    // 清空筛选（顺带取消下钻）
+    // 清空筛选：提供商/模型回全选态（顺带取消下钻）
     clearBtn.addEventListener('click', () => {
-      state.provider = '';
-      state.model = '';
-      providerSel.value = '';
-      modelSel.innerHTML = '<option value="">全部模型</option>';
-      modelSel.disabled = true;
+      state.providers = new Set();
+      state.models = new Set();
+      providerMsel.setSelected(new Set());
+      deriveModelOptions();
       clearDrill();
       renderAll();
     });
 
-    // 今日「详细」：等效选中今日 → 出现当日提供商饼图；再点取消
+    // 今日「详细」：等效选中今日 → 出现当日筛选后的提供商饼图；再点取消
     $('todayDetailBtn').addEventListener('click', () => {
-      if (!drillEnabled()) return;
       if (drill.kind === 'today') { clearDrill(); return; }
       drill = { kind: 'today', key: null, provider: drill.provider };
       rebuildDrill(true);
     });
 
-    // 窗口汇总「详细」：等效选中当前整个窗口范围 → 出现窗口合并提供商饼图；再点取消
+    // 窗口汇总「详细」：等效选中滑条当前选区 → 出现该范围筛选后的合并提供商饼图；再点取消
     $('winDetailBtn').addEventListener('click', () => {
-      if (!drillEnabled()) return;
       if (drill.kind === 'window') { clearDrill(); return; }
       drill = { kind: 'window', key: null, provider: drill.provider };
       rebuildDrill(true);
@@ -2747,7 +3316,7 @@
         }
         await refreshAll();
         // 若正下钻今日 / 窗口汇总，饼图随最新数据同步刷新
-        if ((drill.kind === 'today' || drill.kind === 'window') && drillEnabled()) rebuildDrill();
+        if (drill.kind === 'today' || drill.kind === 'window') rebuildDrill();
         // 对账待决清单（rebuild-rollup-protection）：有 pending 条目时弹复选确认框
         const pending = summary.reconciliation?.pending || [];
         if (pending.length > 0) showReconcileModal(pending);
@@ -3289,18 +3858,36 @@
 
   // pageSize 不持久化：关闭窗口即复位（spec: 每页数量的修改在窗口关闭后不保留）
   // benchmark 筛选：'' 全部 / '__none__' 未设基准 / 其它值 = 基准名（quota-snapshot-benchmark）
-  const recs = { plan: '', provider: '', benchmark: '', page: 1, pageSize: 10, selected: new Set(), detailId: null, data: null };
+  // source：来源筛选（manual-quota-snapshot）——'' 全部 / 'manual' 手动录入 / 'estimate' 额度统计
+  const recs = { plan: '', provider: '', benchmark: '', source: '', page: 1, pageSize: 10, selected: new Set(), detailId: null, data: null };
 
   async function loadRecs() {
     const q = new URLSearchParams();
     if (recs.plan) q.set('plan', recs.plan);
     if (recs.provider) q.set('provider', recs.provider);
     if (recs.benchmark) q.set('benchmark', recs.benchmark);
+    if (recs.source) q.set('source', recs.source);
     q.set('page', String(recs.page));
     q.set('pageSize', String(recs.pageSize));
     recs.data = await getJson('/api/quota/snapshots?' + q);
     recs.page = recs.data.page; // 页码超界由服务端钳到末页
   }
+
+  /** 打开手动录入窗口（manual-quota-snapshot）：模块独立，创建成功后回抛事件刷新本窗口 */
+  function openManualEntry() {
+    if (!window.ManualEntry) { showToast('手动录入模块未加载，请刷新页面'); return; }
+    window.ManualEntry.open();
+  }
+
+  /** 手动录入创建成功 → 记录窗口开着就刷新（并把新条目排在最前） */
+  document.addEventListener('manual-snapshot-created', async (event) => {
+    if ($('recsModal').hidden) return;
+    recs.page = 1;
+    await loadRecs();
+    renderRecs();
+    const id = event.detail && event.detail.id;
+    showToast(id ? '已生成手动录入记录 #' + id : '已生成手动录入记录');
+  });
 
   async function openRecsModal() {
     try {
@@ -3336,20 +3923,53 @@
       '<button type="button" class="btn primary bmk-mark" id="bmkMarkBtn"' + (recs.selected.size ? '' : ' disabled') +
         ' title="把选中的记录标记为同一个任务基准">◈ 标记为基准 <span class="caret">▾</span></button>' +
       '<button type="button" class="btn danger" id="recsBatchDel"' + (recs.selected.size ? '' : ' disabled') + '>批量删除</button>' +
+      // 手动录入入口（manual-quota-snapshot）：不经过额度统计的启动 / 停止，直接把读数与用量录进来
+      '<button type="button" class="btn manual-entry" id="recsManualBtn" title="不经过额度统计的启动 / 停止，直接把手上的读数与用量录进来">✎ 手动录入</button>' +
       '<span class="spacer"></span>' +
+      '<label class="field"><span>来源</span><select id="recsSourceSel">' +
+        '<option value="">全部来源</option>' +
+        '<option value="manual"' + (recs.source === 'manual' ? ' selected' : '') + '>手动录入（' + ((data.sources && data.sources.manual) || 0) + '）</option>' +
+        '<option value="estimate"' + (recs.source === 'estimate' ? ' selected' : '') + '>额度统计</option>' +
+      '</select></label>' +
       '<label class="field"><span>基准</span><select id="recsBmkSel">' + bmkOpts + '</select></label>' +
       '<label class="field"><span>套餐</span><select id="recsPlanSel">' + opt(recs.plan, '全部套餐', data.plans) + '</select></label>' +
       '<label class="field"><span>提供商</span><select id="recsProviderSel">' + opt(recs.provider, '全部提供商', data.providers) + '</select></label>';
   }
 
+  /** 记录列表表头行（quota-snapshot-detail-hit-rate-and-output-share）：渲染在 #recsList 内作为 sticky 首行，
+   *  与条目共享同一滚动容器几何（容器外的表头会在列表出现滚动条时差一个滚动条宽、逐列对齐失准）。
+   *  左侧「套餐」标签镜像条目左半，右侧六列标签复用数据区同一套 .ri-cells 网格；两处对齐占位
+   *  （复选框 / ⚙ 设置按钮）用同结构元素 + visibility:hidden，禁用硬编码宽度。 */
+  function recsHeadHtml() {
+    const cell = (cls, text) => '<span class="ri-cell ' + cls + '">' + text + '</span>';
+    return '<div class="recs-head">' +
+      '<input type="checkbox" class="recs-check recs-head-ghost" tabindex="-1" aria-hidden="true">' +
+      '<span class="recs-head-plan">套餐</span>' +
+      '<span class="ri-cells">' +
+        cell('ri-cell-derived ri-cell-total', '总token') +
+        cell('ri-cell-derived ri-cell-hit', '命中率') +
+        cell('ri-cell-derived ri-cell-out', '输出占比') +
+        cell('ri-cell-ratio', '月token/单位货币') +
+        cell('ri-cell-price', '包月费用') +
+        cell('ri-cell-tok', '估计月token') +
+      '</span>' +
+      '<button type="button" class="icon-btn qp-gear recs-head-ghost" tabindex="-1" aria-hidden="true">⚙</button>' +
+    '</div>';
+  }
+
   function renderRecsList() {
     hideTipPop(true); // 列表重渲染前强制收起浮层气泡（含基准标签气泡），防止节点搬移与重建竞争
     const items = recs.data.items;
-    $('recsList').innerHTML = items.length ? items.map((s) => {
-      // 右侧三列（recs-item-value-display）：每 1 单位套餐货币每月 token 数（口径同详情
-      // 页 estRatioOf）→ 包月费用（数值快照固化、币符随全局计费币种）→ 估计每月总 token
-      // （不带 ≈ / tokens 字样）。无比值（缺估算总额度 / 包月金额 ≤ 0）时第一列留空占位。
+    $('recsList').innerHTML = recsHeadHtml() + (items.length ? items.map((s) => {
+      // 数据区六列（quota-snapshot-detail-hit-rate-and-output-share + recs-item-value-display）：派生三列
+      // （总token / 命中率 / 输出占比，位于既有三列左侧，详情看板打开时整组隐藏）→ 每 1 单位套餐货币
+      // 每月 token 数（口径同详情页 estRatioOf）→ 包月费用（数值快照固化、币符随全局计费币种）→ 估计每月
+      // 总 token（不带 ≈ / tokens 字样）。无比值（缺估算总额度 / 包月金额 ≤ 0）时该列留空占位。
       const r = estRatioOf(s);
+      // 派生比值只用快照固化的 token 三项：命中率分母 = 总输入（不含输出）、输出占比分母 = 消耗·合计；
+      // 不可比值（分母 ≤ 0）时该格显示「–」占位保持列位（与详情看板"整段省略"的取舍不同）。
+      const tokIn = s.tokens.hit + s.tokens.miss;
+      const tokSum = tokIn + s.tokens.output;
       // 任务基准标签（quota-snapshot-benchmark）：形态恒为「◈ <名字>」——标记即固化，
       // 不区分配置里现在是否还存在该基准（无任何「失效」表达）；悬浮气泡展示标记时
       // 固化的名字与说明（复用 tip-float-layer 机制的 .tip-info/.tip-pop 结构）；
@@ -3357,6 +3977,12 @@
       const b = s.benchmark;
       return '<div class="recs-item' + (recs.detailId === s.id ? ' active' : '') + '" data-id="' + s.id + '">' +
         '<input type="checkbox" class="recs-check" data-check="' + s.id + '"' + (recs.selected.has(s.id) ? ' checked' : '') + '>' +
+        // 来源标注（manual-quota-snapshot）：只有手动录入的记录在套餐名前带小图标，
+        // 悬浮气泡**只含一句**「来源 · 手动录入」；额度统计来源不加任何标注
+        (s.source === 'manual'
+          ? '<span class="ri-src tip-info" tabindex="0" aria-label="来源：手动录入" title="来源：手动录入">✎' +
+            '<span class="tip-pop"><span class="tip-t">来源 · 手动录入</span></span></span>'
+          : '') +
         '<span class="ri-plan">' + esc(s.planName) + '</span>' +
         '<span class="ri-mode">' + (s.mode === 'model' ? esc(s.model) : '总量') + '</span>' +
         (b ? '<span class="ri-bmk tip-info" tabindex="0" role="button" data-bmk="' + esc(b.name) + '" aria-label="基准：' + esc(b.name) + '，悬浮查看说明，点击查看基准比较" title="悬浮查看说明，点击查看基准比较">◈ <span class="ri-bmk-name">' + esc(b.name) + '</span>' +
@@ -3367,6 +3993,9 @@
             '<span class="tip-f">记录 #' + s.id + ' · ' + esc(s.planName) + '</span>' +
           '</span></span>' : '') +
         '<span class="ri-cells">' +
+          '<span class="ri-cell ri-cell-derived ri-cell-total">' + fmtFull(tokSum) + '</span>' +
+          '<span class="ri-cell ri-cell-derived ri-cell-hit">' + (pctText(s.tokens.hit, tokIn) || '–') + '</span>' +
+          '<span class="ri-cell ri-cell-derived ri-cell-out">' + (pctText(s.tokens.output, tokSum) || '–') + '</span>' +
           (r ? '<span class="ri-cell ri-cell-ratio">' + r.ratioText + '/' + r.icon + '</span>'
              : '<span class="ri-cell ri-cell-ratio"></span>') +
           '<span class="ri-cell ri-cell-price">' + quotaMoney(s.price) + '/月</span>' +
@@ -3375,7 +4004,7 @@
         '<button type="button" class="icon-btn qp-gear" data-rgear="' + s.id + '" title="设置" aria-label="设置">⚙</button>' +
       '</div>';
     }).join('')
-      : '<div class="ed-hint" style="padding:18px">没有匹配的快照记录。</div>';
+      : '<div class="ed-hint" style="padding:18px">没有匹配的快照记录。</div>');
   }
 
   function renderRecsPager() {
@@ -3811,6 +4440,76 @@
       '</div>';
   }
 
+  /* ---------- 手动录入（manual-quota-snapshot）：时段分解与套餐额度评估 ---------- */
+
+  const rcSegKey = (t) => (t.startMin ?? '') + '|' + (t.endMin ?? '') + '|' + (t.isRest ? 1 : 0) + '|' + (t.weekdays ?? '');
+  const rcHhmm = (min) => (min == null ? '' : String(Math.floor(min / 60)).padStart(2, '0') + ':' + String(min % 60).padStart(2, '0'));
+
+  /**
+   * 等值价格的时段分解（手动录入记录才有的 tokenCosts.byTier）：
+   * 说明这笔钱是按哪些时段的单价逐段算出来的 —— 因为手动录入没有明细，
+   * 时段占比来自录入时的「时段用量分配轴」。
+   */
+  function recsTierBlockHtml(tc, icon) {
+    const list = Array.isArray(tc.byTier) ? tc.byTier : [];
+    if (!list.length) return '';
+    return '<div class="rd-tiers">' +
+      list.map((t) => '<div class="rd-tier-row">' +
+        '<span class="rd-tier-name">' + esc(t.name || t.cap || (rcHhmm(t.startMin) + '~' + rcHhmm(t.endMin))) +
+          '<em>×' + (t.mult == null ? '1' : t.mult) + ' · ' + ((t.share || 0) * 100).toFixed(1) + '% · ' +
+          fmtFull(t.tokens ? t.tokens.total : 0) + ' tok</em></span>' +
+        '<span class="rd-tier-amt">' + (t.amounts ? icon + money(t.amounts.total) : '未配价') + '</span>' +
+      '</div>').join('') +
+      '<div class="rd-tier-note">本次窗口跨越 ' + list.length + ' 个计价时段，用量占比由录入时在「时段用量分配轴」上指定（各段命中率与输出占比按整体比例摊分）</div>' +
+    '</div>';
+  }
+
+  /**
+   * 套餐额度评估区块（手动录入的模型模式记录）：
+   * 直接读快照固化的评估数据（v2 形态）现算，算式与 web/quota-eval.js 一致 ——
+   * 与统计版唯一的差别是「时段占比 pₜ」来自录入时的分配轴，而不是明细归桶。
+   */
+  function recsEvalBlockHtml(ev) {
+    const m = ev && Array.isArray(ev.models) ? ev.models[0] : null;
+    if (!m || !m.coef) return '';
+    const tk = m.tokens || {};
+    const N = (tk.hit || 0) + (tk.miss || 0) + (tk.output || 0);
+    if (!(N > 0)) return '';
+    const c = m.coef;
+    const W = tk.hit * c.inHit + tk.miss * c.inMiss + tk.output * c.out;
+    const cBar = W / N;
+    const Eout = c.out > 0 ? W / c.out : null;
+    const tiers = Array.isArray(m.tiers) ? m.tiers : [];
+    const multByKey = new Map(tiers.map((t) => [rcSegKey(t), t.multiplier]));
+    const capByKey = new Map(tiers.map((t) => [rcSegKey(t), t.name || (rcHhmm(t.startMin) + '~' + rcHhmm(t.endMin))]));
+    const segs = (Array.isArray(m.segments) ? m.segments : []).map((s) => {
+      const total = (s.hit || 0) + (s.miss || 0) + (s.output || 0);
+      return { key: s.key, name: s.name || capByKey.get(s.key) || '时段', total, mult: multByKey.get(s.key) ?? 1 };
+    });
+    const covered = Math.min(1, segs.reduce((a, s) => a + s.total, 0) / N);
+    const mBar = segs.reduce((a, s) => a + (s.total / N) * s.mult, 0) + (1 - covered);
+    const d = Number(ev.officialDelta);
+    const cObs = (d > 0 && Eout) ? d / (Eout / 1000) : null;
+    const qUnit = ev.quota && ev.quota.quotaMode === 'percent' ? '0.01%' : '分';
+    return '<div class="rd-eval">' +
+      '<div class="rd-eval-head">套餐额度评估 <span class="muted">（模型模式 · 时段占比取自录入时的分配轴）</span></div>' +
+      qeRow('系数加权 c̄', cBar.toFixed(2) + ' <span class="muted">（K₁ ' + c.inHit + ' / K₂ ' + c.inMiss + ' / K₃ ' + c.out + '，按 token 结构加权）</span>') +
+      (Eout != null ? qeRow('输出当量 𝔼', fmtFull(Eout) + ' token') : '') +
+      qeRow('综合倍率 m̄', mBar.toFixed(3) + ' <span class="muted">= Σ pₜ·mₜ</span>' +
+        qeTip('综合倍率口径', [
+          { t: 'pₜ = 各时段用量占比（本记录来自录入时的分配轴）' },
+          { t: 'mₜ = 该时段的系数倍率；未归桶部分按 ×1 计' },
+          { t: 'm̄ = Σ pₜ·mₜ + p₀ × 1', f: true }
+        ])) +
+      (segs.length
+        ? qeRow('时段占比 pₜ', segs.map((s) => '<span class="rd-chip">' + esc(s.name) + ' ×' + s.mult + ' · ' +
+            ((s.total / N) * 100).toFixed(1) + '%</span>').join(' '))
+        : '') +
+      (d > 0 ? qeRow('官方读数差值 ΔB', d + ' ' + qUnit) : '') +
+      (cObs != null ? qeRow('实测单位消耗', '<b>' + cObs.toFixed(2) + '</b> ' + qUnit + ' / K 输出当量') : '') +
+    '</div>';
+  }
+
   function renderRecsDetail() {
     hideTipPop(true); // 详情重渲染前先强制收起浮层气泡，防止搬移节点与 innerHTML 重建竞争
     const host = $('recsDetail');
@@ -3818,6 +4517,10 @@
     if (!s) { host.hidden = true; host.innerHTML = ''; return; }
     host.hidden = false;
     const row = (k, v) => '<div class="rd-row"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>';
+    // 派生比值口径（quota-snapshot-detail-hit-rate-and-output-share）：纯展示计算，只用快照固化的 token 三项，
+    // 不读 token_costs_json（旧记录照常显示）；分母三项现算相加，不依赖 s.tokens.total 的一致性。
+    const tokIn = s.tokens.hit + s.tokens.miss;   // 总输入（命中率分母，不含输出）
+    const tokSum = tokIn + s.tokens.output;       // 消耗·合计（输出占比分母）
     // token 消耗等值价格括注（snapshot-pricing-and-summary-detail）：
     // 币种取快照固化的 currency（不随全局币种设置变化）；消耗为 0 的项省略括注；
     // partial（部分模型缺价）在金额后加感叹号悬浮明细；tokenCosts 为 null = 旧记录。
@@ -3883,9 +4586,11 @@
       row('启动时间', quotaFmtTime(s.startTime)) +
       row('结束时间', quotaFmtTime(s.endTime)) +
       row('统计方式', s.mode === 'model' ? '模型模式 · ' + esc(s.model) : '总量模式') +
-      row('消耗·输入(命中)', fmtFull(s.tokens.hit) + tcNote('hit', s.tokens.hit)) +
+      // 百分比括注显示在左侧标签文字之后（用户口径：贴住行描述，不挤在数值列）：
+      // 命中率 = 命中 ÷ 总输入；输出占比 = 输出 ÷ 消耗·合计；数值列内容与顺序保持不变
+      row('消耗·输入(命中)' + pctNote(s.tokens.hit, tokIn), fmtFull(s.tokens.hit) + tcNote('hit', s.tokens.hit)) +
       row('消耗·输入(未命中)', fmtFull(s.tokens.miss) + tcNote('miss', s.tokens.miss)) +
-      row('消耗·输出', fmtFull(s.tokens.output) + tcNote('output', s.tokens.output)) +
+      row('消耗·输出' + pctNote(s.tokens.output, tokSum), fmtFull(s.tokens.output) + tcNote('output', s.tokens.output)) +
       row('消耗·合计', fmtFull(s.tokens.total) + tcNote('total', s.tokens.total) + tcRatioTip) +
       row('套餐', esc(s.planName)) +
       row('提供商', esc(s.provider)) +
@@ -3897,11 +4602,21 @@
       (s.equivMoney != null
         ? row('折算等价金额', '<b>' + fmtMaybeRange(s.equivMoney, quotaMoney) + '</b>' + equivMoneyTipHtml())
         : '') +
-      // 备注行（quota-snapshot-note）：快照唯一可后补的元数据（与基准标记同族），
-      // 统计数值字段仍写入时固化不可变；失焦 / 回车自动保存见 bindRecsEvents 委托
-      row('备注', '<input type="text" class="rd-note" maxlength="200" placeholder="添加备注…" value="' + esc(s.note || '') + '">') +
+      // 手动录入：等值价格的逐时段分解（说明这笔钱按哪些时段的单价算出）
+      (tc && Array.isArray(tc.byTier) && tc.byTier.length ? recsTierBlockHtml(tc, tcIcon) : '') +
+      // 备注区（snapshot-detail-note-textarea）：快照唯一可后补的元数据（与基准标记同族），
+      // 统计数值字段仍写入时固化不可变。纵向两段：「备注」标签独立一行；下方整行宽备注框为
+      // 展示/编辑双态——默认 readonly 文本形态、高度随内容行数自适应（空态一行占位），
+      // 双击进入编辑态（bindRecsEvents dblclick 委托），失焦保存回展示态
+      '<div class="rd-row rd-note-row"><div class="k">备注</div>' +
+        '<textarea class="rd-note" readonly rows="1" maxlength="200" placeholder="双击输入备注…" title="双击编辑备注">' + esc(s.note || '') + '</textarea>' +
+      '</div>' +
+      // 手动录入：套餐额度评估（模型模式；时段占比取自录入时的分配轴）
       (s.eval ? evalSectionHtml(s) : '') +
+      (s.source === 'manual' && s.eval ? recsEvalBlockHtml(s.eval) : '') +
       '<div class="ed-hint" style="margin-top:10px">快照式记录：写入时固化以上全部字段，后续修改套餐 / 价格 / 映射配置均不影响本条。</div>';
+    // 渲染后按内容行数撑起备注框（展示态高度 = 文本行数占用，空态一行占位）
+    fitNoteHeight(host.querySelector('.rd-note'));
   }
 
   function equivMoneyTipHtml() {
@@ -3919,6 +4634,10 @@
   }
 
   function renderRecs() {
+    // 详情看板打开态（quota-snapshot-detail-hit-rate-and-output-share）：派生三列与其表头标签据此让位隐藏、
+    // 列模板同步降回既有三列；类切换先于列表渲染，避免首帧闪一次六列布局。
+    const recsBody = $('recsBody');
+    if (recsBody) recsBody.classList.toggle('has-detail', recs.detailId !== null);
     renderRecsToolbar();
     renderRecsList();
     renderRecsPager();
@@ -3937,6 +4656,14 @@
     } catch (error) {
       showToast(error.message);
     }
+  }
+
+  /** 备注框高度自适应（snapshot-detail-note-textarea）：高度恒等于内容行数实际占用，
+   *  展示态 / 编辑态共用；渲染后、编辑 input、改值后各调一次，不出现多余空白区域 */
+  function fitNoteHeight(ta) {
+    if (!ta) return;
+    ta.style.height = 'auto';
+    ta.style.height = ta.scrollHeight + 'px';
   }
 
   /** 快照备注保存（quota-snapshot-note）：无变更不发请求（含 Escape 还原后的 no-op）；
@@ -3965,6 +4692,7 @@
 
     $('recsModal').addEventListener('click', async (e) => {
       const t = e.target;
+      if (t.id === 'recsManualBtn') { openManualEntry(); return; }
       if (t.id === 'recsBatchDel' && recs.selected.size) {
         deleteSnapshots([...recs.selected], (n) => '已批量删除 ' + n + ' 条快照记录');
         return;
@@ -4014,6 +4742,7 @@
     $('recsModal').addEventListener('change', async (e) => {
       const t = e.target;
       if (t.id === 'recsBmkSel') { recs.benchmark = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
+      if (t.id === 'recsSourceSel') { recs.source = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsPlanSel') { recs.plan = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsProviderSel') { recs.provider = t.value; recs.page = 1; await loadRecs(); renderRecs(); return; }
       if (t.id === 'recsPageSize') { recs.pageSize = Number(t.value); recs.page = 1; await loadRecs(); renderRecs(); return; }
@@ -4037,17 +4766,28 @@
       if (v !== recs.page) { recs.page = v; await loadRecs(); renderRecs(); }
     });
 
-    // 快照备注（quota-snapshot-note）：keydown 与 focusout 都委托在常驻 recsModal 上
-    // （详情内容随渲染 innerHTML 重建，直接绑定会随节点丢失）；Enter 走失焦同一路径保存，
-    // Escape 还原为已存值（还原后与已存一致，保存函数 no-op 不发请求）。
-    // focusout 在切换详情条目时也会触发：此处捕获当时的 detailId，保存按该 id 落条目，
-    // 异步返回不触碰已切换后的新条目 DOM
+    // 快照备注（snapshot-detail-note-textarea）：dblclick / input / keydown / focusout 全部委托在
+    // 常驻 recsModal 上（详情内容随渲染 innerHTML 重建，直接绑定会随节点丢失）。
+    // 双态交互（design D1/D4）：默认 readonly 展示态；dblclick 进编辑态（解除只读、聚焦、
+    // 光标到末尾覆盖 dblclick 选词副作用）；input 时高度随内容行数重算；回车走浏览器默认换行
+    // 不保存；Escape 还原已存值后 blur（还原后与已存一致，保存 no-op），退出统一收口在 focusout：
+    // 保存（无变更 no-op）+ 折叠回展示态。focusout 在切换详情条目时也会触发：此处捕获当时的
+    // detailId，保存按该 id 落条目，异步返回不触碰已切换后的新条目 DOM
+    $('recsModal').addEventListener('dblclick', (e) => {
+      if (!e.target.classList?.contains('rd-note')) return;
+      e.target.readOnly = false;
+      e.target.classList.add('editing');
+      e.target.focus();
+      const end = e.target.value.length;
+      e.target.setSelectionRange(end, end);
+    });
+    $('recsModal').addEventListener('input', (e) => {
+      if (!e.target.classList?.contains('rd-note')) return;
+      fitNoteHeight(e.target);
+    });
     $('recsModal').addEventListener('keydown', (e) => {
       if (!e.target.classList?.contains('rd-note')) return;
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        e.target.blur();
-      } else if (e.key === 'Escape') {
+      if (e.key === 'Escape') {
         const s = recs.data?.items.find((x) => x.id === recs.detailId);
         if (s) e.target.value = s.note || '';
         e.target.blur();
@@ -4056,6 +4796,9 @@
     $('recsModal').addEventListener('focusout', (e) => {
       if (!e.target.classList?.contains('rd-note')) return;
       if (recs.detailId !== null) saveSnapshotNote(recs.detailId, e.target.value);
+      e.target.readOnly = true;
+      e.target.classList.remove('editing');
+      fitNoteHeight(e.target);
     });
   }
 
@@ -4106,6 +4849,19 @@
         rebuildDrill();
       });
       modelPie = createPie('modelPie', () => modelAggs, () => {});
+
+      // 小时时段构成区（hourly-archive-drilldown）：一级（提供商）/ 二级（模型）两个实例
+      provHourBlock = createHourlyBlock({
+        prefix: 'ph', blockId: 'providerHourly', tipId: 'phTip',
+        canvasId: 'providerHourChart', sliderId: 'providerHourSlider',
+        srcId: 'providerHourlySrc'
+      });
+      modelHourBlock = createHourlyBlock({
+        prefix: 'mh', blockId: 'modelHourly', tipId: 'mhTip',
+        canvasId: 'modelHourChart', sliderId: 'modelHourSlider',
+        srcId: 'modelHourlySrc'
+      });
+      hourBlocks.push(provHourBlock, modelHourBlock);
     }
     await loadTools();
     refreshAll();
