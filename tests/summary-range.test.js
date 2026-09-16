@@ -179,3 +179,61 @@ test('summary-range.js 为纯引擎：无 DOM / 网络依赖（vm 可加载即�
   assert.doesNotMatch(src, /document\.|fetch\(|XMLHttpRequest/, '引擎 SHALL NOT 触碰 DOM / 网络');
   assert.match(src, /window\.SummaryRange = \(function \(\) \{/, '应挂 window.SummaryRange');
 });
+
+/* ================= 「平均每天」括注与主图面板让位（window-pie-perday-hover） ================= */
+
+test('fmtPerDay：K/M/B 阶梯按商值自适应，不足 1K 取整，非有限 / 非正显示 –', () => {
+  assert.equal(SR.fmtPerDay(1.5e9), '1.50B/天');
+  assert.equal(SR.fmtPerDay(4.87e9 / 30), '162.33M/天');   // B 级总量 ÷ 天 → M/天（与总量单位解耦）
+  assert.equal(SR.fmtPerDay(119.77e6 / 3), '39.92M/天');
+  assert.equal(SR.fmtPerDay(999.995e3), '1000.00K/天');  // <1e6 仍为 K 档（阶梯按值判定）
+  assert.equal(SR.fmtPerDay(1e6), '1.00M/天');
+  assert.equal(SR.fmtPerDay(999), '999/天');
+  assert.equal(SR.fmtPerDay(0), '–');
+  assert.equal(SR.fmtPerDay(-5), '–');
+  assert.equal(SR.fmtPerDay(NaN), '–');
+});
+
+test('perDayNote / costPerDayNote：全角括注与守卫（days / 值非正 → 空串）', () => {
+  assert.equal(SR.perDayNote(119.77e6, 3), '（39.92M/天）');
+  assert.equal(SR.perDayNote(4.87e9, 30), '（162.33M/天）');
+  assert.equal(SR.perDayNote(119.77e6, 0), '');
+  assert.equal(SR.perDayNote(0, 7), '');
+  assert.equal(SR.costPerDayNote(919.08, 3), '（￥306.36/天）');
+  assert.equal(SR.costPerDayNote(919.08, 7), '（￥131.30/天）');
+  assert.equal(SR.costPerDayNote(0, 7), '');
+  assert.equal(SR.costPerDayNote(100, -1), '');
+});
+
+test('windowDays：7d/30d 为槽位数，年视图为选中月自然日之和（闰年正确）', () => {
+  assert.equal(SR.windowDays('7d', 2026, 0, 6), 7);
+  assert.equal(SR.windowDays('7d', 2026, 4, 6), 3);
+  assert.equal(SR.windowDays('30d', 2026, 10, 29), 20);
+  assert.equal(SR.windowDays('year', 2026, 0, 11), 365);  // 2026 平年
+  assert.equal(SR.windowDays('year', 2024, 0, 11), 366);  // 2024 闰年
+  assert.equal(SR.windowDays('year', 2026, 0, 1), 59);    // 1月+2月（平年）
+  assert.equal(SR.windowDays('year', 2024, 0, 1), 60);    // 1月+2月（闰年）
+  assert.equal(SR.windowDays('year', 2026, 2, 2), 31);    // 单月（3月）
+});
+
+test('fleeSide：中线初始化贴对侧、让位线翻转、滞回带维持、重复调用幂等', () => {
+  const areaL = 35, areaR = 1062, w = 248, margin = 12, gap = 10;
+  // 首次：按中线初始化，贴鼠标对侧
+  assert.equal(SR.fleeSide(null, 990, areaL, areaR, w, margin, gap), 'left');
+  assert.equal(SR.fleeSide(null, 100, areaL, areaR, w, margin, gap), 'right');
+  assert.equal(SR.fleeSide(undefined, areaL + 100, areaL, areaR, w, margin, gap), 'right');
+  // 面板在右：鼠标逼近其左边框（areaR − margin − w − gap = 792）→ 让到左
+  assert.equal(SR.fleeSide('right', 792, areaL, areaR, w, margin, gap), 'left');
+  assert.equal(SR.fleeSide('right', 990, areaL, areaR, w, margin, gap), 'left');
+  // 未达让位线 → 维持右
+  assert.equal(SR.fleeSide('right', 791, areaL, areaR, w, margin, gap), 'right');
+  assert.equal(SR.fleeSide('right', 100, areaL, areaR, w, margin, gap), 'right');
+  // 面板在左：鼠标逼近其右边框（areaL + margin + w + gap = 305）→ 让到右
+  assert.equal(SR.fleeSide('left', 305, areaL, areaR, w, margin, gap), 'right');
+  assert.equal(SR.fleeSide('left', 40, areaL, areaR, w, margin, gap), 'right');
+  // 滞回带内维持左
+  assert.equal(SR.fleeSide('left', 306, areaL, areaR, w, margin, gap), 'left');
+  assert.equal(SR.fleeSide('left', 990, areaL, areaR, w, margin, gap), 'left');
+  // 幂等：同一坐标重复进入结果一致
+  assert.equal(SR.fleeSide(SR.fleeSide('right', 800, areaL, areaR, w, margin, gap), 800, areaL, areaR, w, margin, gap), 'left');
+});

@@ -47,7 +47,8 @@ import {
   listBenchmarks, saveBenchmark, deleteBenchmark, reorderBenchmarks,
   saveBenchmarkGroup, deleteBenchmarkGroup, reorderBenchmarkGroups,
   bindSnapshotsBenchmark, compareBenchmark, updateSnapshotNote,
-  createManualSnapshot, listManualDrafts, saveManualDraft, deleteManualDraft
+  createManualSnapshot, listManualDrafts, saveManualDraft, deleteManualDraft,
+  readManualTokenSnapTmp, saveManualTokenSnapTmp, clearManualTokenSnapTmp
 } from './quota.js';
 import {
   loadScoreboard, saveCriterionGroup, deleteCriterionGroup, reorderCriterionGroups,
@@ -1396,6 +1397,25 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         }
       }
 
+      // 手动录入「已用 token」临时快照（manual-entry-token-snapshot）：读数是临时值、不进任何数据库表，
+      // 唯一持久化 = 全局配置目录 .tmp/manual-token-snap.json（保持写入 / 放弃添加清理 / 开窗恢复）。
+      // DELETE 幂等（文件不存在也返回成功）；GET 不存在或损坏返回 snapshot: null（损坏顺带清除）。
+      if (path === '/api/quota/manual-token-snap') {
+        if (req.method === 'GET') return sendJson(res, 200, { snapshot: await readManualTokenSnapTmp() });
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          if (req.method === 'PUT') return sendJson(res, 200, { ok: true, ...(await saveManualTokenSnapTmp(body || {})) });
+          if (req.method === 'DELETE') return sendJson(res, 200, { ok: true, ...(await clearManualTokenSnapTmp()) });
+        } catch (error) {
+          return sendJson(res, error.status || 400, { error: error.message, code: error.code });
+        }
+      }
+
       // 快照备注单条更新（quota-snapshot-note）：body {id, note}，note 空串 / 纯空白 = 清除；
       // 备注是单条目操作，与基准的批量 {ids} 路由分列；校验与落库收口 updateSnapshotNote
       if (req.method === 'PUT' && path === '/api/quota/snapshots/note') {
@@ -1563,18 +1583,20 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
 
       // 静态文件（白名单内，防目录穿越）：quota-eval.js 为套餐额度估算引擎（纯函数，app.js 依赖它）；
       // summary-range.js / range-slider.js(+css) 为汇总范围滑动条（summary-range-slider，app.js 依赖它们）；
-      // hourly-range.js 为小时时段构成引擎（hourly-archive-drilldown，app.js 依赖它）
+      // hourly-range.js 为小时时段构成引擎（hourly-archive-drilldown，app.js 依赖它）；
+      // bar-drag-select.js 为小时柱柱体拖拽框选控制器（hourly-bar-drag-select，app.js 依赖它）
       if (req.method === 'GET') {
         const allow = {
           '/': 'index.html', '/index.html': 'index.html',
           '/app.js': 'app.js', '/chart.umd.js': 'chart.umd.js', '/quota-eval.js': 'quota-eval.js',
           '/summary-range.js': 'summary-range.js', '/range-slider.js': 'range-slider.js',
-          '/hourly-range.js': 'hourly-range.js',
+          '/hourly-range.js': 'hourly-range.js', '/bar-drag-select.js': 'bar-drag-select.js',
           '/range-slider.css': 'range-slider.css',
           '/score.js': 'score.js', '/score-filter.js': 'score-filter.js',
           '/score-combobox.js': 'score-combobox.js', '/quota-benchmark.js': 'quota-benchmark.js',
           '/quota-benchmark-compare.js': 'quota-benchmark-compare.js',
           '/link-solve.js': 'link-solve.js', '/tier-alloc.js': 'tier-alloc.js',
+          '/token-snap.js': 'token-snap.js',
           '/manual-entry.js': 'manual-entry.js'
         };
         const file = allow[path];

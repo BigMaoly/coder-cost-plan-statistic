@@ -123,5 +123,75 @@ window.SummaryRange = (function () {
     return { hit, miss };
   }
 
-  return { COLORS, buildSlots, sumRange, winLabelText, rangeText, barColors, todayKey, addDays };
+  /* ===== 「平均每天」括注与主图面板让位（window-pie-perday-hover） ===== */
+
+  /** token 每日值自适应文案：≥1B → n.nnB/天；≥1M → n.nnM/天；≥1K → n.nnK/天；不足 1K → 整数/天；非有限 / ≤0 → '–' */
+  function fmtPerDay(v) {
+    if (!isFinite(v) || v <= 0) return '–';
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B/天';
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M/天';
+    if (v >= 1e3) return (v / 1e3).toFixed(2) + 'K/天';
+    return Math.round(v) + '/天';
+  }
+
+  /** 总计行「平均每天」括注：（n.nn K|M|B/天）；days 非正或总量非正 → ''（不显示） */
+  function perDayNote(totalTokens, days) {
+    if (!(days > 0) || !(totalTokens > 0)) return '';
+    return '（' + fmtPerDay(totalTokens / days) + '）';
+  }
+
+  /** 费用行「平均每天」括注：（￥n.nn/天）；days 非正或费用非正 → '' */
+  function costPerDayNote(cost, days) {
+    if (!(days > 0) || !(cost > 0)) return '';
+    return '（￥' + (cost / days).toFixed(2) + '/天）';
+  }
+
+  const isLeapYear = (y) => (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+  /** 某年某月自然天数（闰年 2 月 29 天） */
+  function daysInMonth(year, month) {
+    return month === 2 && isLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+  }
+
+  /**
+   * 汇总范围选区 [a, b]（含端点槽位下标）覆盖的自然天数——「平均每天」括注的分母：
+   * 7d / 30d 每槽 = 1 天；年视图 = 选中月份的自然日之和。
+   */
+  function windowDays(view, year, a, b) {
+    if (view === 'year') {
+      let d = 0;
+      for (let m = a + 1; m <= b + 1; m++) d += daysInMonth(year, m);
+      return d;
+    }
+    return Math.max(1, b - a + 1);
+  }
+
+  /**
+   * 主图悬浮面板贴边让位判定（面板恒让在鼠标对侧，window-pie-perday-hover）：
+   * - side 缺省（首次进入）按绘图区中线初始化，面板贴鼠标对侧；
+   * - 面板在右侧：鼠标逼近其中心侧（左）边框 gap 距离内 → 让到左侧；面板在左侧对称；
+   * - 两条让位线之间为滞回带：带内维持原贴边（判定基于距离而非事件次序，重复事件幂等）。
+   * @param {'left'|'right'|null|undefined} side 当前贴边
+   * @param {number} relX 鼠标相对 canvas 左缘的横坐标
+   * @param {number} areaL 绘图区左缘（canvas 相对）
+   * @param {number} areaR 绘图区右缘（canvas 相对）
+   * @param {number} w 面板宽（px）
+   * @param {number} margin 面板与绘图区边缘的间距（px）
+   * @param {number} gap 让位预警距离（px）
+   */
+  function fleeSide(side, relX, areaL, areaR, w, margin, gap) {
+    if (side !== 'left' && side !== 'right') {
+      return relX < (areaL + areaR) / 2 ? 'right' : 'left';
+    }
+    if (side === 'right') {
+      return relX >= areaR - margin - w - gap ? 'left' : 'right';
+    }
+    return relX <= areaL + margin + w + gap ? 'right' : 'left';
+  }
+
+  return {
+    COLORS, buildSlots, sumRange, winLabelText, rangeText, barColors, todayKey, addDays,
+    fmtPerDay, perDayNote, costPerDayNote, windowDays, daysInMonth, fleeSide
+  };
 })();

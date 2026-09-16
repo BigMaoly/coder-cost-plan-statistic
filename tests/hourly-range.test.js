@@ -110,6 +110,24 @@ test('tickVisible：24 槽偶数刻度可见、末端刻度恒显', () => {
   assert.equal(HR.tickVisible(23, 24), true);
 });
 
+test('fmtPerHour：平均每小时消耗自适应 token 单位（hourly-bar-drag-select 框选态「平均/h」列）', () => {
+  // 数量级阈值：≥1B / ≥1M / ≥1K 两位小数，不足 1K 取整数
+  assert.equal(HR.fmtPerHour(2.5e9), '2.50B/h');
+  assert.equal(HR.fmtPerHour(1e9), '1.00B/h');
+  assert.equal(HR.fmtPerHour(1.91e6), '1.91M/h');
+  assert.equal(HR.fmtPerHour(440e3), '440.00K/h');
+  assert.equal(HR.fmtPerHour(999.4), '999/h');
+  assert.equal(HR.fmtPerHour(823), '823/h');
+  assert.equal(HR.fmtPerHour(0.49), '0/h');
+  // 0 / 负数 / 非有限数 → 占位符（与展示层占位风格一致）
+  assert.equal(HR.fmtPerHour(0), '–');
+  assert.equal(HR.fmtPerHour(-5), '–');
+  assert.equal(HR.fmtPerHour(NaN), '–');
+  assert.equal(HR.fmtPerHour(Infinity), '–');
+  // 除法在调用侧：1.91M / 7 小时 ≈ 272857.14 → K 档两位小数
+  assert.equal(HR.fmtPerHour(1.91e6 / 7), '272.86K/h');
+});
+
 test('静态契约：纯函数引擎无 DOM / 网络依赖，只挂 window.HourlyRange', () => {
   const src = readFileSync(join(webRoot, 'hourly-range.js'), 'utf8');
   assert.ok(!src.includes('document.'));

@@ -175,15 +175,23 @@
     margin-left: auto; font-size: 11.5px; color: var(--teal);
     border-color: rgba(45, 212, 191, .4); background: var(--teal-soft);
   }
+  /* 框选模式徽标（hourly-bar-drag-select；amber，排在数据源徽标右侧） */
+  .mode-badge {
+    font-size: 11.5px; color: #f59e0b;
+    border-color: rgba(245, 158, 11, .45); background: rgba(245, 158, 11, .12);
+  }
   /* 图 + 左侧固定浮窗；浮窗在图表主体外部左侧，不遮挡任何柱体 */
   .hourly-body { display: flex; align-items: flex-start; gap: 12px; margin-top: 10px; }
   .hourly-main { flex: 1; min-width: 0; }
-  /* 小时柱比主图矮：它是饼图的附属参考，不喧宾夺主 */
+  /* 小时柱比主图矮：它是饼图的附属参考，不喧宾夺主；
+     柱体 = 时间轴的直接操纵面（hourly-bar-drag-select）：ew-resize 提示横向拖拽，touch-action 防触屏滚动打断 */
   .hourly-box { height: 226px; }
-  .hourly-box canvas { cursor: default; } /* 明确：小时柱不可点击 */
-  /* 悬浮信息浮窗（半透明、固定、不跟随鼠标） */
+  .hourly-box canvas { cursor: ew-resize; touch-action: none; }
+  .hourly-box canvas.hour-dragging { cursor: ew-resize; }
+  /* 悬浮信息浮窗（半透明、固定、不跟随鼠标）；
+     360px：框选态每行多一列「平均/h」，加宽后最长提供商名仍不省略 */
   .hour-tip {
-    flex: 0 0 272px;                     /* 容纳最长提供商名不省略 */
+    flex: 0 0 360px;
     height: 226px;                       /* 与柱状图等高，视觉上并排 */
     display: flex; flex-direction: column; gap: 6px;
     padding: 9px 11px;
@@ -205,18 +213,29 @@
   .ht-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #dbe6f5; }
   .ht-val { flex: none; color: #dbe6f5; }
   .ht-pct { flex: none; width: 46px; text-align: right; color: var(--teal); }
+  /* 框选态（hourly-bar-drag-select）：列头行 + 「平均/h」列（位于总 token 之前）；
+     列头与 .ht-row 行共用同一组宽度类（ht-avg / ht-fixed / ht-pct）与 gap，天然对齐 */
+  .ht-cols {
+    display: flex; align-items: center; gap: 6px; flex: none;
+    font-size: 10px; color: var(--muted); font-weight: 500;
+    padding-bottom: 3px; border-bottom: 1px dashed rgba(148, 163, 184, .18);
+  }
+  .ht-cols .ht-avg, .ht-cols .ht-val, .ht-cols .ht-pct { color: var(--muted); font-weight: 500; }
+  .ht-avg { flex: none; width: 58px; text-align: right; color: var(--teal); font-weight: 600; }
+  .ht-fixed { flex: none; width: 52px; text-align: right; }
   .ht-list::-webkit-scrollbar { width: 6px; }
   .ht-list::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, .28); border-radius: 3px; }
   /* 时段汇总（时间轴下方，随选区实时重算） */
   .hour-summary { margin-top: 4px; }
-  .hour-sum-head { margin-bottom: 8px; }
+  .hour-sum-head { margin-bottom: 8px; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
   .hour-sum-head > span:first-child { font-size: 12.5px; font-weight: 600; color: var(--teal); }
+  .hour-sum-head > .muted { flex: 1; min-width: 0; text-align: right; }
   .hour-stats .stat { padding: 8px 10px; }
   .hour-stats .stat .v { font-size: 15px; }
   .stat .note { font-size: 10.5px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
   @media (max-width: 900px) {
     .hourly-body { flex-direction: column; }
-    .hour-tip { flex: none; width: 100%; height: auto; max-height: 148px; }
+    .hour-tip { flex: none; width: 100%; height: auto; max-height: 168px; }
   }
   @media (max-width: 760px) {
     .hour-stats { grid-template-columns: repeat(2, 1fr); }
@@ -231,6 +250,38 @@
     border-radius: 9px; padding: 8px 12px;
   }
   .pie-stats .v { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: .2px; }
+  /* 「平均每天」括注（window-pie-perday-hover）：仅窗口汇总入口显示，teal 小字缀于总计 / 费用值后 */
+  .pie-stats .perday { color: var(--teal); font-size: 11px; font-weight: 550; margin-left: 6px; letter-spacing: .2px; }
+  .pie-stats .perday[hidden] { display: none; }
+  /* ===== 固定悬浮面板（window-pie-perday-hover）：主图 .bar-tip 与饼图 .pie-tip 共用卡片族 =====
+     半透明深底 + 毛玻璃，pointer-events:none 不挡点击；悬浮才出现，移出即隐藏 */
+  .pie-tip {
+    position: absolute; top: 10px; left: 12px; z-index: 2;
+    width: 264px;
+    display: flex; flex-direction: column; gap: 5px;
+    padding: 10px 12px;
+    border: 1px solid rgba(45, 212, 191, .35);
+    border-radius: 10px;
+    background: rgba(13, 21, 38, .72);
+    backdrop-filter: blur(3px);
+    font-size: 12px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    box-shadow: 0 10px 26px rgba(2, 6, 16, .45);
+  }
+  .pie-tip[hidden] { display: none; }
+  .pie-tip .pt-head { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 650; color: var(--text); }
+  .pie-tip .pt-head .pt-sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .pie-tip .pt-head .pt-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pie-tip .pt-head .pt-pct { flex: none; color: var(--teal); font-size: 12px; font-weight: 600; }
+  .pie-tip .pt-row { display: flex; justify-content: space-between; gap: 10px; }
+  .pie-tip .pt-row .pt-val { color: #dbe6f5; }
+  .pie-tip .pt-row.pt-cost .pt-val { color: #fbbf24; }
+  .pie-tip .pt-hint { font-size: 10.5px; line-height: 1.6; border-top: 1px dashed rgba(148, 163, 184, .2); padding-top: 5px; }
+  /* 主图面板：复用 .pie-tip 卡片族，只改定位——让位贴边（首次按中线初始化，逼近让位线 10px 才让） */
+  .bar-tip { top: 10px; width: 248px; }
+  .bar-tip.tip-right { left: auto; right: 12px; }
+  .bar-tip.tip-left { left: 12px; right: auto; }
   .btn-detail { font-size: 12px; padding: 4px 12px; margin-left: auto; }
   .btn-detail.active {
     border-color: rgba(45, 212, 191, .5); color: #d9fff8;
@@ -1526,6 +1577,45 @@
   .rd-eval-head { font-size: 12px; font-weight: 650; color: var(--teal); margin-bottom: 4px; }
   .rd-eval .muted { font-weight: 400; }
   .rd-chip { display: inline-block; font-size: 11px; padding: 1px 7px; margin: 1px 0; border: 1px solid rgba(45, 212, 191, .35); border-radius: 999px; background: var(--teal-soft); }
+
+  /* ===================== 手动录入 ·「已用 token」快照联动（manual-entry-token-snapshot） =====================
+     ③ 官方读数下方的可选联动区：起始/结束 × 总量/命中/未命中/输出 的官方累计读数；
+     行内四值联动 + 跨行差值自动填入 ⑤；视觉沿用时段分配轴同系的浅蓝（区分 ⑤ 六值的 teal）。 */
+  .me-ts-block { margin-top: 10px; padding: 9px 11px 10px; border: 1px solid rgba(56, 189, 248, .35); border-radius: 10px; background: rgba(56, 189, 248, .06); }
+  .me-ts-block.off { opacity: .55; }
+  .me-ts-block.off .me-ts-in input { background: rgba(148, 163, 184, .06); }
+  .me-ts-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .me-ts-head .spacer { flex: 1; }
+  .me-ts-title { font-size: 12.5px; font-weight: 650; color: #7dd3fc; }
+  .me-ts-tag { font-size: 10.5px; border-radius: 999px; padding: 0 8px; line-height: 17px; color: var(--muted); border: 1px solid var(--border); background: rgba(148, 163, 184, .08); }
+  .me-ts-tag.on { color: #7dd3fc; border-color: rgba(56, 189, 248, .5); background: rgba(56, 189, 248, .12); }
+  .me-ts-tmp { font-size: 10.5px; color: #fbbf24; cursor: help; white-space: nowrap; border: 1px dashed rgba(251, 191, 36, .5); border-radius: 999px; padding: 0 8px; line-height: 17px; background: rgba(251, 191, 36, .08); }
+  .me-ts-sub { font-size: 11.5px; color: var(--muted); line-height: 1.7; margin: 6px 0 8px; }
+  .me-ts-sub b { color: var(--text); }
+  .me-ts-grid { display: grid; grid-template-columns: 96px repeat(4, minmax(0, 1fr)); gap: 6px 8px; align-items: center; }
+  .me-ts-head-cell { font-size: 11px; color: var(--muted); text-align: center; }
+  .me-ts-head-cell em { font-style: normal; font-size: 10px; opacity: .75; margin-left: 2px; }
+  .me-ts-row-label { font-size: 12px; color: var(--text); white-space: nowrap; }
+  .me-ts-row-label.delta { color: var(--muted); font-size: 11.5px; }
+  .me-ts-in { position: relative; display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-radius: 8px; padding: 0 7px; background: var(--panel-2); transition: .15s; }
+  .me-ts-in:focus-within { border-color: rgba(56, 189, 248, .6); }
+  .me-ts-in input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; font-family: inherit; font-size: 12.5px; color: var(--text); padding: 6px 0; font-variant-numeric: tabular-nums; }
+  .me-ts-in input:disabled { cursor: not-allowed; }
+  .me-ts-in input::placeholder { color: rgba(148, 163, 184, .5); }
+  .me-ts-in.auto { border-color: rgba(56, 189, 248, .4); background: rgba(56, 189, 248, .1); }
+  .me-ts-in.auto input { color: #7dd3fc; }
+  .me-ts-auto { flex: none; font-size: 10px; color: #7dd3fc; border: 1px solid rgba(56, 189, 248, .5); border-radius: 999px; padding: 0 5px; line-height: 14px; }
+  .me-ts-delta { min-height: 28px; display: flex; align-items: center; justify-content: flex-end; padding: 0 8px; font-size: 12.5px; font-variant-numeric: tabular-nums; color: #7dd3fc; background: rgba(56, 189, 248, .07); border: 1px dashed rgba(56, 189, 248, .3); border-radius: 8px; }
+  .me-ts-delta.neg { color: #fb7185; border-color: rgba(251, 113, 133, .45); background: rgba(251, 113, 133, .08); }
+  .me-ts-status { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+  .me-ts-status .ls-dot { margin-top: 5px; }
+  .me-ts-text { font-size: 12px; color: var(--muted); line-height: 1.7; }
+  .me-ts-text b { color: var(--text); }
+  .mi-snap { color: #7dd3fc; }
+  @media (max-width: 760px) {
+    .me-ts-grid { grid-template-columns: 72px repeat(4, minmax(0, 1fr)); gap: 5px; }
+    .me-ts-row-label { font-size: 11px; }
+  }
 </style>
 </head>
 <body>
@@ -1594,6 +1684,8 @@
     </div>
     <div class="chart-box" id="chartBox">
       <canvas id="usageChart" aria-label="token 用量堆叠柱状图"></canvas>
+      <!-- 固定悬浮面板（window-pie-perday-hover）：替代跟随鼠标的气泡；让位贴对侧，移出即隐藏 -->
+      <aside class="pie-tip bar-tip tip-right" id="mainTip" hidden aria-live="polite"></aside>
     </div>
     <!-- 汇总范围滑动条挂载点（summary-range-slider）：DOM 由 range-slider.js 生成 -->
     <div id="rangeSlider"></div>
@@ -1629,10 +1721,12 @@
     </div>
     <div class="chart-box pie-box">
       <canvas id="providerPie" aria-label="按提供商分布饼图"></canvas>
+      <!-- 左上角固定悬浮面板（window-pie-perday-hover）：悬浮扇区才出现，替代跟随鼠标的气泡 -->
+      <aside class="pie-tip" id="providerPieTip" hidden aria-live="polite"></aside>
       <div class="pie-stats" id="providerPieStats">
-        <div>总计 <span class="v" id="providerPieStats-total">–</span></div>
+        <div>总计 <span class="v" id="providerPieStats-total">–</span><span class="perday" id="providerPieStats-total-note" hidden></span></div>
         <div>命中率 <span class="v" id="providerPieStats-rate">–</span></div>
-        <div>费用 <span class="v" id="providerPieStats-cost">–</span></div>
+        <div>费用 <span class="v" id="providerPieStats-cost">–</span><span class="perday" id="providerPieStats-cost-note" hidden></span></div>
       </div>
     </div>
     <!-- 按小时 · 提供商构成（hourly-archive-drilldown）：仅单日下钻且有小时数据时出现 -->
@@ -1640,6 +1734,7 @@
       <div class="hourly-head">
         <h3 id="providerHourlyTitle">–</h3>
         <span class="badge src-badge" id="providerHourlySrc" hidden>–</span>
+        <span class="badge mode-badge" id="phModeBadge" hidden>框选模式</span>
       </div>
       <div class="hourly-body">
         <aside class="hour-tip" id="phTip" aria-live="polite"></aside>
@@ -1647,7 +1742,7 @@
           <div class="chart-box hourly-box"><canvas id="providerHourChart" aria-label="按小时 · 提供商构成"></canvas></div>
           <div id="providerHourSlider"></div>
           <div class="hour-summary">
-            <div class="hour-sum-head"><span id="phSumLabel">–</span></div>
+            <div class="hour-sum-head"><span id="phSumLabel">–</span><span class="muted" id="phSumHint"></span></div>
             <div class="stats hour-stats">
               <div class="stat"><div class="k">命中</div><div class="v" id="phHit">–</div><div class="note" id="phHitNote">–</div></div>
               <div class="stat"><div class="k">未命中</div><div class="v" id="phMiss">–</div></div>
@@ -1668,10 +1763,12 @@
     </div>
     <div class="chart-box pie-box">
       <canvas id="modelPie" aria-label="按模型分布饼图"></canvas>
+      <!-- 左上角固定悬浮面板（window-pie-perday-hover）：悬浮扇区才出现，替代跟随鼠标的气泡 -->
+      <aside class="pie-tip" id="modelPieTip" hidden aria-live="polite"></aside>
       <div class="pie-stats" id="modelPieStats">
-        <div>总计 <span class="v" id="modelPieStats-total">–</span></div>
+        <div>总计 <span class="v" id="modelPieStats-total">–</span><span class="perday" id="modelPieStats-total-note" hidden></span></div>
         <div>命中率 <span class="v" id="modelPieStats-rate">–</span></div>
-        <div>费用 <span class="v" id="modelPieStats-cost">–</span></div>
+        <div>费用 <span class="v" id="modelPieStats-cost">–</span><span class="perday" id="modelPieStats-cost-note" hidden></span></div>
       </div>
     </div>
     <!-- 按小时 · 模型构成（hourly-archive-drilldown）：仅单日下钻且有小时数据时出现 -->
@@ -1679,6 +1776,7 @@
       <div class="hourly-head">
         <h3 id="modelHourlyTitle">–</h3>
         <span class="badge src-badge" id="modelHourlySrc" hidden>–</span>
+        <span class="badge mode-badge" id="mhModeBadge" hidden>框选模式</span>
       </div>
       <div class="hourly-body">
         <aside class="hour-tip" id="mhTip" aria-live="polite"></aside>
@@ -1686,7 +1784,7 @@
           <div class="chart-box hourly-box"><canvas id="modelHourChart" aria-label="按小时 · 模型构成"></canvas></div>
           <div id="modelHourSlider"></div>
           <div class="hour-summary">
-            <div class="hour-sum-head"><span id="mhSumLabel">–</span></div>
+            <div class="hour-sum-head"><span id="mhSumLabel">–</span><span class="muted" id="mhSumHint"></span></div>
             <div class="stats hour-stats">
               <div class="stat"><div class="k">命中</div><div class="v" id="mhHit">–</div><div class="note" id="mhHitNote">–</div></div>
               <div class="stat"><div class="k">未命中</div><div class="v" id="mhMiss">–</div></div>
@@ -2089,6 +2187,7 @@
      必须在 app.js 之前加载（app.js 启动即装配滑条） -->
 <script src="./summary-range.js"></script>
 <script src="./hourly-range.js"></script>
+<script src="./bar-drag-select.js"></script>
 <script src="./range-slider.js"></script>
 <script src="./app.js"></script>
 <!-- 任务基准模块（quota-snapshot-benchmark）：须在 app.js 之后加载——读取其暴露的
@@ -2125,6 +2224,7 @@
 </div>
 
 <script src="./link-solve.js"></script>
+<script src="./token-snap.js"></script>
 <script src="./tier-alloc.js"></script>
 <script src="./manual-entry.js"></script>
 </body>

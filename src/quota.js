@@ -34,7 +34,9 @@
  */
 
 import { localDateKey } from './parser.js';
-import { runInTransaction } from './store.js';
+import { runInTransaction, dataDir } from './store.js';
+import { mkdir, readFile, rename, rm, writeFile, access } from 'node:fs/promises';
+import { join } from 'node:path';
 import { loadMappings, isMappingEnabled, applyMappings } from './mapping.js';
 import { loadPlanConfigs, estimatePointsRange, getBillingCurrency, loadPlanQuotaCoefs } from './plan.js';
 import { loadPricingContext, calcCost, priceAt, UNIT_DIVISOR } from './cost.js';
@@ -1621,6 +1623,7 @@ function draftPayloadJson(draft) {
   if (!draft || typeof draft !== 'object' || Array.isArray(draft)) return JSON.stringify(draft ?? {});
   const rest = { ...draft };
   delete rest.id;
+  delete rest.tokenSnap;   // 快照读数是临时值，SHALL NOT 随草稿入数据库（manual-entry-token-snapshot）
   return JSON.stringify(rest);
 }
 
@@ -1651,4 +1654,93 @@ export function deleteManualDraft(db, id) {
   if (!Number.isInteger(n) || n <= 0) throw quotaError(400, '草稿条目 id 非法');
   if (deleteDraftRow(db, n) === 0) throw quotaError(404, '草稿条目不存在');
   return { deleted: 1 };
+}
+
+/* ================= 手动录入「已用 token」临时快照（manual-entry-token-snapshot） =================
+ * 快照读数是临时值，SHALL NOT 进任何数据库表：唯一持久化 = 全局配置目录下的
+ * .tmp/manual-token-snap.json（单文件，带 draftId 归属）。生命周期：
+ *   保持（显式）→ 写入；放弃 / 添加成功 / 开关关闭（归属当前条目）→ 清理；
+ *   开窗 → 读取恢复（归属条目已不存在 = 孤儿，删除）；损坏 → 视为不存在并清除。
+ * 与统计库零关联：本节只做文件 I/O，不触碰任何 quota_* / usage_* 表。
+ */
+
+const TOKEN_SNAP_TMP_FILE = () => join(dataDir(), '.tmp', 'manual-token-snap.json');
+const TOKEN_SNAP_COLS = ['total', 'hit', 'miss', 'output'];
+
+/** 快照读数格：数值（≥0）或 null */
+const validSnapValue = (v) => v === null || (typeof v === 'number' && Number.isFinite(v) && v >= 0);
+
+/** 形状校验（保存前置）：非法返回错误文案，合法返回 null */
+function tokenSnapShapeError(snap) {
+  if (!snap || typeof snap !== 'object' || Array.isArray(snap)) return '快照数据形状非法';
+  if (typeof snap.on !== 'boolean') return '快照开关形状非法';
+  for (const row of ['start', 'end']) {
+    const r = snap[row];
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return '快照读数行形状非法';
+    if (!TOKEN_SNAP_COLS.every((c) => validSnapValue(r[c]))) return `快照读数（${row}）含非法数值`;
+  }
+  if (!snap.tAuto || typeof snap.tAuto !== 'object') return '快照自动标记形状非法';
+  for (const row of ['start', 'end']) {
+    const r = snap.tAuto[row];
+    if (!r || typeof r !== 'object' || Array.isArray(r)) return '快照自动标记形状非法';
+    if (!TOKEN_SNAP_COLS.every((c) => typeof r[c] === 'boolean')) return `快照自动标记（${row}）形状非法`;
+  }
+  return null;
+}
+
+/**
+ * 保存快照临时文件（「保持」时调用）：校验 → 原子写（同目录临时文件 + rename）。
+ * 目录不存在自动创建；序列化超过 4KB 拒绝（正常载荷 < 500B，防滥用）。
+ */
+export async function saveManualTokenSnapTmp({ draftId, tokenSnap } = {}) {
+  const id = Number(draftId);
+  if (!Number.isInteger(id) || id <= 0) throw quotaError(400, '快照归属条目 id 非法');
+  const shapeErr = tokenSnapShapeError(tokenSnap);
+  if (shapeErr) throw quotaError(400, shapeErr);
+  const json = JSON.stringify({ version: 1, draftId: id, savedAt: Date.now(), tokenSnap });
+  if (json.length > 4096) throw quotaError(400, '快照数据超过大小上限');
+  const file = TOKEN_SNAP_TMP_FILE();
+  const tmp = file + '.writing';
+  await mkdir(join(file, '..'), { recursive: true });
+  await writeFile(tmp, json, 'utf8');
+  await rename(tmp, file);
+  return { saved: 1 };
+}
+
+/** 读取快照临时文件（开窗恢复用）：不存在 / 损坏 / 形状非法 → null（损坏顺带清除） */
+export async function readManualTokenSnapTmp() {
+  const file = TOKEN_SNAP_TMP_FILE();
+  let raw;
+  try {
+    raw = await readFile(file, 'utf8');
+  } catch {
+    return null;   // 不存在（或不可读）= 无临时快照
+  }
+  const purge = async () => { try { await rm(file, { force: true }); } catch { /* 清理失败不阻断读取 */ } };
+  try {
+    const data = JSON.parse(raw);
+    if (data && typeof data === 'object' && !Array.isArray(data)
+      && Number.isInteger(data.draftId) && data.draftId > 0
+      && !tokenSnapShapeError(data.tokenSnap)) {
+      return { draftId: data.draftId, savedAt: data.savedAt ?? null, tokenSnap: data.tokenSnap };
+    }
+  } catch { /* JSON 损坏 → 走清除 */ }
+  await purge();
+  return null;
+}
+
+/** 清理快照临时文件（放弃 / 添加 / 开关关闭时调用）：不存在视为已清理（计数 0），不报错 */
+export async function clearManualTokenSnapTmp() {
+  const file = TOKEN_SNAP_TMP_FILE();
+  try {
+    await access(file);
+  } catch {
+    return { deleted: 0 };   // 文件本就不存在
+  }
+  try {
+    await rm(file, { force: true });
+    return { deleted: 1 };
+  } catch {
+    return { deleted: 0 };
+  }
 }

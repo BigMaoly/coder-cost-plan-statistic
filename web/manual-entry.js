@@ -44,6 +44,7 @@
 
   const L = () => window.LinkSolve;
   const T = () => window.TierAlloc;
+  const S = () => window.TokenSnap;
 
   const fmtFull = (v) => {
     if (!Number.isFinite(v)) return '–';
@@ -92,7 +93,9 @@
     editTick: 0,
     optionDialog: null,   // 更新方案条：{ field, newValue, oldValue, options, pick }
     optionHover: null,    // 正被悬浮预览的方案下标
-    switchHintTimer: null
+    switchHintTimer: null,
+    tmpSnap: null,        // 开窗时从 .tmp 读到的临时快照 { draftId, savedAt, tokenSnap }（归属校验后使用）
+    tmpHeld: null         // 当前 .tmp 暂存归属的条目 id（「保持」时写入；放弃 / 添加 / 开关关闭时清理）
   };
 
   /* ===================== 一、元数据与草稿（服务端） ===================== */
@@ -125,10 +128,12 @@
     state.drafts = (data.items || []).map((it) => ({ ...(it.payload || {}), id: it.id }));
   }
 
-  /** 草稿提交载荷：剥离保留键 id（身份只走请求外层，服务端行 id 才是唯一身份） */
+  /** 草稿提交载荷：剥离保留键 id（身份只走请求外层，服务端行 id 才是唯一身份）；
+   *  同时剥离 tokenSnap（快照读数是临时值，SHALL NOT 随草稿入数据库——服务端 draftPayloadJson 二次兜底） */
   function draftPayloadOf(draft) {
     const rest = { ...draft };
     delete rest.id;
+    delete rest.tokenSnap;
     return rest;
   }
 
@@ -176,13 +181,15 @@
 
   const newTokens = () => (window.LinkSolve ? window.LinkSolve.emptyFields() : { hit: null, miss: null, rate: null, input: null, output: null, ratio: null });
 
+  const newTokenSnap = () => (window.TokenSnap ? window.TokenSnap.emptySnap() : { on: false, start: {}, end: {}, tAuto: {} });
+
   function newDraft() {
     const t = Date.now();
     return {
       id: null, createdAt: t, firstOpen: true, timeMode: 'fromNow',
       startTime: null, endTime: null, startTouched: false,
       mapName: '', planName: '', remainMode: false, b1: null, b2: null,
-      modelMode: false, model: '', tokens: newTokens(), shares: null, note: ''
+      modelMode: false, model: '', tokens: newTokens(), shares: null, tokenSnap: newTokenSnap(), note: ''
     };
   }
 
@@ -220,6 +227,189 @@
       state.cleared.add(dep);
     }
     syncLink();
+  }
+
+  /* ===================== 三·五、「已用 token」快照联动（manual-entry-token-snapshot） =====================
+   * ③ 官方读数下方的可选联动区：起始 / 结束两行 × 总量/命中/未命中/输出 四列官方累计读数。
+   * 行内四值联动（总量 = 命中 + 未命中 + 输出）+ 跨行同列相减 → 自动填入 ⑤ 六值。
+   * 单向联动（H4）：⑤ 手改不回写这里；这里再改动会覆盖 ⑤（toast 点名）。计算全部在 web/token-snap.js，
+   * 本节只做装配；读数是临时值不进数据库：「保持」写 .tmp、「放弃 / 添加」清理、开窗恢复。 */
+
+  const fmtDeltaText = (d) => (d == null ? '–' : (d < 0 ? '−' : '+') + Math.abs(Math.round(d)).toLocaleString('en-US'));
+
+  /** 快照区是否有任何已填读数（on 且任一格非空）——「保持」时决定是否写 .tmp */
+  const snapHasValue = (snap) => S().COLS.some((c) => Number.isFinite(snap.start[c]) || Number.isFinite(snap.end[c]));
+
+  /** 把快照差值刷进 ⑤ 六值（整表、全部标记「自动」）；返回被覆盖的用户手改字段 */
+  function applySnapToTokens(six) {
+    const t = state.draft.tokens;
+    const overridden = L().FIELDS.filter((f) =>
+      Number.isFinite(t[f]) && Number.isFinite(six[f]) &&
+      Math.abs(t[f] - six[f]) > 1e-9 && state.editSeq.has(f) && !state.auto.has(f));
+    for (const f of L().FIELDS) {
+      t[f] = six[f];
+      state.auto.add(f);
+      state.cleared.delete(f);
+    }
+    return overridden;
+  }
+
+  /** 快照区任何改动后的统一处理：差值齐 → 刷 ⑤ + 既有联动/预览刷新；差值不齐 → ⑤ 冻结原值，只刷快照区本身 */
+  function applySnapshotLink() {
+    const c = S().compute(state.draft.tokenSnap);
+    if (c.ready) {
+      const overridden = applySnapToTokens(c.six);
+      syncLink();
+      patchLink();
+      if (overridden.length) {
+        toast('已按快照差值覆盖 ⑤ 的手动值（' + L().labels(overridden) + '）：快照区是联动来源，⑤ 的改动不会回写这里');
+      }
+    }
+    patchSnap(c);
+  }
+
+  /** 快照输入框（input / change 共用）：更新草稿 → 行内四值联动 → 跨行差值联动 ⑤ */
+  function handleTsInput(el) {
+    const snap = state.draft.tokenSnap;
+    const dot = el.dataset.ts.indexOf('.');
+    const row = el.dataset.ts.slice(0, dot);
+    const col = el.dataset.ts.slice(dot + 1);
+    snap[row][col] = S().parseCell(el.value);
+    snap.tAuto[row][col] = false;              // 手改的格转手填（角标即摘）
+    state.dirty = true;
+    S().recomputeRow(snap, row, col);          // 凑齐三个 → 推出唯一空格；全满 → 唯一自动格跟随
+    applySnapshotLink();
+  }
+
+  /** 快照区状态行（off / empty / partial / ready + ⚠ 警示），可多行 */
+  function tsStatusHtml(c) {
+    const lines = [];
+    if (!c.snap.on) {
+      lines.push('<span class="ls-dot"></span><span class="me-ts-text">已关闭：本区停用并已清空；下方 ⑤ 已生成的用量值<b>保留不变</b>。重新打开后需重新抄读数。</span>');
+      return lines.join('');
+    }
+    if (c.ready) {
+      const s = c.six;
+      lines.push('<span class="ls-dot ok"></span><span class="me-ts-text">已联动 ⑤：命中 <b>' + fmtFull(s.hit) +
+        '</b> · 未命中 <b>' + fmtFull(s.miss) + '</b> · 输出 <b>' + fmtFull(s.output) + '</b>（合计 ' +
+        fmtFull(s.hit + s.miss + s.output) + '）→ 已填入下方 ⑤（带「自动」角标）。</span>');
+    } else if (c.statusKind === 'empty') {
+      lines.push('<span class="ls-dot warn"></span><span class="me-ts-text">已开启：把官方页面上<b>起始 / 结束</b>两个时刻的累计读数抄进来（同列相减 = 本次用量）。</span>');
+    } else {
+      const have = S().COLS.filter((col) => col !== 'total' && c.per[col].delta != null)
+        .map((col) => S().COL_LABEL[col] + ' ' + fmtDeltaText(c.per[col].delta));
+      const lack = ['hit', 'miss', 'output'].filter((col) => c.per[col].delta == null)
+        .map((col) => {
+          const p = c.per[col];
+          const side = p.start == null && p.end == null ? '起止都没填' : (p.start == null ? '缺起始' : '缺结束');
+          return S().COL_LABEL[col] + '（' + side + '）';
+        });
+      lines.push('<span class="ls-dot warn"></span><span class="me-ts-text">' +
+        (have.length ? '已算出 ' + esc(have.join(' · ')) + '；' : '') +
+        (lack.length ? '还差 ' + esc(lack.join('、')) + '。' : '') +
+        '凑齐<b>命中 / 未命中 / 输出</b>三列的差值即可联动 ⑤（每行满足 总量 = 命中 + 未命中 + 输出，缺哪格就按其余三个推出）。</span>');
+    }
+    for (const w of c.warns) {
+      lines.push('<span class="ls-dot warn"></span><span class="me-ts-text">⚠ ' + esc(w) + '</span>');
+    }
+    return lines.join('');
+  }
+
+  /** .tmp 临时快照徽标（「保持」后出现；放弃 / 添加后消失），悬浮说明生命周期 */
+  function tmpBadgeHtml() {
+    if (state.tmpHeld == null) return '';
+    return '<span class="me-ts-tmp" id="meTsTmpBadge" title="点「保持」时已把快照读数写入全局配置目录的 ' +
+      esc('.tmp/manual-token-snap.json') + '。它是临时值、不进数据库，点「放弃 / 添加」时自动清理。">已暂存 .tmp</span>';
+  }
+
+  function tsInputCell(row, col) {
+    const snap = state.draft.tokenSnap;
+    const v = snap[row][col];
+    const isAuto = !!snap.tAuto[row][col];
+    return '<div class="me-ts-in' + (isAuto ? ' auto' : '') + '" data-tsw="' + row + '.' + col + '">' +
+      '<input type="text" inputmode="numeric" autocomplete="off" data-ts="' + row + '.' + col + '"' + (snap.on ? '' : ' disabled') +
+        ' value="' + (Number.isFinite(v) ? esc(String(v)) : '') + '" placeholder="—"' +
+        ' title="' + S().ROW_LABEL[row] + ' · ' + S().COL_LABEL[col] + '（累计值，可带千分位逗号；每行满足 总量 = 命中 + 未命中 + 输出）">' +
+      (isAuto ? '<span class="me-ts-auto">自动</span>' : '') +
+    '</div>';
+  }
+
+  function tokenSnapHtml() {
+    const snap = state.draft.tokenSnap;
+    const c = S().compute(snap);
+    return '<div class="me-ts-block' + (snap.on ? '' : ' off') + '" id="meTsBlock">' +
+      '<div class="me-ts-head">' +
+        '<button type="button" class="switch' + (snap.on ? ' on' : '') + '" id="meTsSwitch" role="switch"' +
+          ' aria-checked="' + snap.on + '" aria-label="已用 token 联动开关"><span class="knob"></span></button>' +
+        '<span class="me-ts-title">已用 token</span>' +
+        '<span class="me-ts-tag' + (snap.on ? ' on' : '') + '">' + (snap.on ? '联动 ⑤' : '已关闭') + '</span>' +
+        '<span class="spacer"></span>' +
+        '<span id="meTsTmpWrap">' + tmpBadgeHtml() + '</span>' +
+      '</div>' +
+      '<div class="me-ts-sub">官方读数是<b>累计值</b>：抄入起始 / 结束两个时刻的 token 读数，这里同列相减出「本次用量」并<b>自动填入下方 ⑤</b>。' +
+        '每行满足 <b>总量 = 命中 + 未命中 + 输出</b>：凑齐任意三个，剩下的空格自动算出（自动角标）；四个全满后改其中一个对不上会在下方提示。' +
+        '本区可填可不填 —— 不填就直接填 ⑤；⑤ 的改动<b>不会</b>回写这里。</div>' +
+      '<div class="me-ts-grid">' +
+        '<span class="me-ts-head-cell"></span>' +
+        S().COLS.map((col) => '<span class="me-ts-head-cell">' + S().COL_LABEL[col] + '<em>token</em></span>').join('') +
+        '<span class="me-ts-row-label">' + S().ROW_LABEL.start + '</span>' + S().COLS.map((col) => tsInputCell('start', col)).join('') +
+        '<span class="me-ts-row-label">' + S().ROW_LABEL.end + '</span>' + S().COLS.map((col) => tsInputCell('end', col)).join('') +
+        '<span class="me-ts-row-label delta">差值 · 本次用量</span>' +
+        S().COLS.map((col) => {
+          const d = c.per[col].delta;
+          return '<span class="me-ts-delta' + (d != null && d < 0 ? ' neg' : '') + '" data-tsd="' + col + '">' + fmtDeltaText(d) + '</span>';
+        }).join('') +
+      '</div>' +
+      '<div class="me-ts-status" id="meTsStatus">' + tsStatusHtml(c) + '</div>' +
+    '</div>';
+  }
+
+  /** 快照区定点刷新（输入过程中调用，不重建表单、不打断焦点）：自动角标 / 差值行 / 状态区 / .tmp 徽标 */
+  function patchSnap(precomputed) {
+    const snap = state.draft.tokenSnap;
+    const c = precomputed || S().compute(snap);
+    for (const row of S().ROWS) {
+      for (const col of S().COLS) {
+        const wrap = document.querySelector('[data-tsw="' + row + '.' + col + '"]');
+        if (!wrap) continue;
+        const isAuto = !!snap.tAuto[row][col] && Number.isFinite(snap[row][col]);
+        wrap.classList.toggle('auto', isAuto);
+        let badge = wrap.querySelector('.me-ts-auto');
+        if (isAuto) {
+          if (!badge) wrap.insertAdjacentHTML('beforeend', '<span class="me-ts-auto">自动</span>');
+          const txt = String(Math.round(snap[row][col]));
+          const input = wrap.querySelector('input');
+          if (input && document.activeElement !== input && input.value !== txt) input.value = txt;
+        } else if (badge) {
+          badge.remove();
+        }
+      }
+    }
+    for (const col of S().COLS) {
+      const cell = document.querySelector('[data-tsd="' + col + '"]');
+      if (cell) {
+        const d = c.per[col].delta;
+        cell.textContent = fmtDeltaText(d);
+        cell.classList.toggle('neg', d != null && d < 0);
+      }
+    }
+    const st = $('meTsStatus');
+    if (st) st.innerHTML = tsStatusHtml(c);
+    const tw = $('meTsTmpWrap');
+    if (tw) tw.innerHTML = tmpBadgeHtml();
+  }
+
+  /** 清理 .tmp 临时快照（放弃 / 添加 / 开关关闭时调用）：只清当前条目归属的暂存，返回是否真的清了 */
+  async function clearTmpFor(draftId) {
+    if (state.tmpHeld == null || draftId == null || Number(state.tmpHeld) !== Number(draftId)) return false;
+    try {
+      await api('DELETE', '/api/quota/manual-token-snap');
+    } catch {
+      return false;   // 清理失败不阻断主流程，文件留待下次开窗的孤儿清理兜底
+    }
+    state.tmpHeld = null;
+    patchSnap();
+    return true;
   }
 
   /* ===================== 四、时段用量分配 ===================== */
@@ -516,7 +706,9 @@
         '<div class="mi-top"><span class="mi-name">' + esc(d.planName || '（未选套餐）') + '</span>' +
           (miss.length ? '<span class="mi-badge">待补全 ' + miss.length + ' 项</span>' : '<span class="mi-badge ok">可添加</span>') +
         '</div>' +
-        '<div class="mi-meta">' + esc(d.mapName || '未选提供商') + ' · ' + (d.modelMode ? esc(d.model || '未选模型') : '总量模式') + '</div>' +
+        '<div class="mi-meta">' + esc(d.mapName || '未选提供商') + ' · ' + (d.modelMode ? esc(d.model || '未选模型') : '总量模式') +
+          (((d.tokenSnap && d.tokenSnap.on) || (state.tmpSnap && Number(d.id) === Number(state.tmpSnap.draftId)))
+            ? ' · <span class="mi-snap">已用 token 联动</span>' : '') + '</div>' +
         '<div class="mi-meta">' + esc(fmtDateTime(d.startTime)) + ' ~ ' + esc(fmtDateTime(d.endTime)) + '</div>' +
         (miss.length ? '<div class="mi-lack">还缺：' + esc(miss.join('、')) + '</div>' : '') +
       '</div>';
@@ -573,6 +765,7 @@
         '</div>' +
         '<div class="ed-hint">读数从官方页面 / 客户端里抄：<b>' + (d.remainMode ? '剩余值' : '已用值') +
           '</b>。ΔB 就是这次要解释掉的额度消耗，是估算的分子来源（与统计版完全同一条公式）。</div>' +
+        tokenSnapHtml() +
       '</div>' +
 
       /* ④ 统计方式 */
@@ -595,7 +788,9 @@
         '<div id="meAllocHost">' + allocBlockHtml() + '</div>' +
         '<div class="link-status" id="meLinkStatus">' + statusHtml() + '</div>' +
         '<div class="ed-hint">关系只有三条：<b>输入 = 命中 + 未命中</b>、<b>命中率 = 命中 ÷ 输入</b>、' +
-          '<b>输出比例 = 输出 ÷ 输入</b>（两个比例都是百分数，写 1 即 1%）。任意两项凑齐就能推出其余。</div>' +
+          '<b>输出比例 = 输出 ÷ 输入</b>（两个比例都是百分数，写 1 即 1%）。任意两项凑齐就能推出其余。<br>' +
+          '<b>快照联动</b>：上方「已用 token」开启且凑齐三分项差值时，这里被整表自动填充（自动角标）；' +
+          '手改任何一项照常可以（角标消失、也不回写快照区），但之后再动快照区，会被快照差值重新覆盖（toast 会明示）。</div>' +
       '</div>' +
 
       /* ⑥ 备注 */
@@ -916,8 +1111,9 @@
       const res = await api('POST', '/api/quota/snapshots/manual', buildPayload());
       const id = res.snapshot.id;
       await loadDrafts();
+      const cleared = await clearTmpFor(state.draft.id);   // 添加成功 → 归属的 .tmp 临时快照一并清理
       state.draft = null;
-      toast('已添加记录 #' + id + '（来源：手动录入）：条目已自动消失');
+      toast('已添加记录 #' + id + '（来源：手动录入）：条目已自动消失' + (cleared ? '；.tmp 临时快照已清理' : ''));
       document.dispatchEvent(new CustomEvent('manual-snapshot-created', { detail: { id } }));
       nextDraftOrNew();
     } catch (err) {
@@ -940,7 +1136,22 @@
       state.dirty = false;
       await loadDrafts();
       renderSidebar();
-      toast('已保持为条目：' + (state.draft.planName || '（未选套餐）') + '（可关窗后再回来补）');
+      // 「保持」→ 快照读数随条目暂存 .tmp（临时值不进数据库，放弃 / 添加时清理）；
+      // 快照区已清空的保持会同步清掉归属暂存（暂存内容 = 保持时刻的快照区）
+      const snap = state.draft.tokenSnap;
+      if (snap.on && snapHasValue(snap)) {
+        try {
+          await api('PUT', '/api/quota/manual-token-snap', { draftId: state.draft.id, tokenSnap: snap });
+          state.tmpHeld = Number(state.draft.id);
+          patchSnap();
+          toast('已保持为条目：' + (state.draft.planName || '（未选套餐）') + '（快照读数已暂存 .tmp，放弃 / 添加时清理）');
+        } catch (err2) {
+          toast('已保持为条目，但快照读数暂存失败：' + (err2.message || err2));
+        }
+      } else {
+        const cleared = await clearTmpFor(state.draft.id);
+        toast('已保持为条目：' + (state.draft.planName || '（未选套餐）') + (cleared ? '（.tmp 临时快照已清理）' : '（可关窗后再回来补）'));
+      }
     } catch (err) {
       toast(err.message || '保持失败');
     } finally {
@@ -975,6 +1186,7 @@
       toast(err.message || '删除条目失败');
       return;
     }
+    await clearTmpFor(id);   // 放弃条目 → 归属的 .tmp 临时快照一并清理（失败不阻断）
     state.draft = null;
     toast('已放弃该条目（未添加记录）');
     nextDraftOrNew();
@@ -1012,12 +1224,22 @@
     if (!draft.timeMode) draft.timeMode = 'fromNow';
     if (!Number.isFinite(draft.createdAt)) draft.createdAt = Date.now();
     applyTimeDefaults(draft, { firstOpen: false });
+    draft.tokenSnap = S().normalize(draft.tokenSnap);
+    // 开窗恢复的 .tmp 暂存归属本条目 → 把读数装回快照区
+    if (state.tmpSnap && Number(draft.id) === Number(state.tmpSnap.draftId)) {
+      draft.tokenSnap = S().normalize(state.tmpSnap.tokenSnap);
+      state.tmpHeld = Number(state.tmpSnap.draftId);   // 暂存徽标随之点亮
+    }
     state.draft = draft;
     state.dirty = false;                       // 切换条目后「未保持」标记归零（不带走上一条的待保存状态）
     state.auto = new Set();
     state.cleared = new Set();
     state.editSeq = new Map();
     state.optionDialog = null;
+    syncLink();
+    // 快照开着且三分项差值齐 → 静默把 ⑤ 刷成快照结果（与快照区保持一致，不打扰）
+    const snapC = S().compute(state.draft.tokenSnap);
+    if (snapC.ready) applySnapToTokens(snapC.six);
     syncLink();
     renderSidebar();
     renderForm();
@@ -1097,6 +1319,26 @@
         toast(state.draft.remainMode ? '读数模式：官方剩余值（起止都要填剩余量）' : '读数模式：官方已用值（起止都要填已用量）');
         return;
       }
+      // 「已用 token」联动开关：关闭 = 本区禁用 + 清空（.tmp 暂存若归属当前条目则一并清理）；⑤ 已生成的值保留不变
+      if (t.closest('#meTsSwitch')) {
+        state.dirty = true;
+        const snap = state.draft.tokenSnap;
+        snap.on = !snap.on;
+        if (!snap.on) {
+          state.draft.tokenSnap = S().normalize({ on: false });
+          const held = state.tmpHeld;
+          state.tmpHeld = null;            // 乐观摘徽标；清理失败不阻断（下次开窗孤儿清理兜底）
+          renderForm();
+          toast('已关闭「已用 token」：本区已清空停用；下方 ⑤ 已生成的用量值保留不变');
+          if (held != null && state.draft.id != null && Number(held) === Number(state.draft.id)) {
+            api('DELETE', '/api/quota/manual-token-snap').catch(() => {});
+          }
+        } else {
+          renderForm();
+          toast('已开启「已用 token」：抄入起始 / 结束两个时刻的累计读数即可自动联动 ⑤');
+        }
+        return;
+      }
       const mm = t.closest('[data-mm]');
       if (mm) {
         const on = mm.dataset.mm === '1';
@@ -1142,6 +1384,8 @@
     mask.addEventListener('change', (e) => {
       const t = e.target;
       state.dirty = true;
+      // 「已用 token」快照输入：change（失焦）再结算一次（input 已实时处理，这里幂等）
+      if (t.dataset && t.dataset.ts) { handleTsInput(t); return; }
       if (t.id === 'meProvSel') {
         state.draft.mapName = t.value;
         const pv = providerOf(t.value);
@@ -1195,6 +1439,8 @@
 
     mask.addEventListener('input', (e) => {
       const t = e.target;
+      // 「已用 token」快照输入：实时（每敲一位都重算；差值凑齐即联动 ⑤）
+      if (t.dataset && t.dataset.ts) { handleTsInput(t); return; }
       if (t.id === 'meNote') { state.draft.note = t.value; state.dirty = true; return; }
       // 时间输入：只更新派生读数，**不重建表单**（保住原生「输满两位自动进入下一段」）
       if (t.id === 'meStart' || t.id === 'meEnd') {
@@ -1310,7 +1556,7 @@
   }
 
   async function open() {
-    if (!window.LinkSolve || !window.TierAlloc) { toast('手动录入模块未加载完整，请刷新页面'); return; }
+    if (!window.LinkSolve || !window.TierAlloc || !window.TokenSnap) { toast('手动录入模块未加载完整，请刷新页面'); return; }
     state.open = true;
     $('meEntryMask').hidden = false;
     $('meEntryBody').innerHTML = '<div class="ed-hint" style="padding:20px">加载套餐配置…</div>';
@@ -1320,6 +1566,16 @@
       $('meEntryBody').innerHTML = '<div class="ed-hint" style="padding:20px">加载失败：' + esc(err.message || err) + '</div>';
       return;
     }
+    // 「已用 token」临时快照：开窗恢复到归属条目；归属条目已不存在 = 孤儿，删除（读不到不阻断开窗）
+    state.tmpSnap = null;
+    state.tmpHeld = null;
+    try {
+      const res = await api('GET', '/api/quota/manual-token-snap');
+      if (res && res.snapshot) {
+        if (state.drafts.some((d) => Number(d.id) === Number(res.snapshot.draftId))) state.tmpSnap = res.snapshot;
+        else api('DELETE', '/api/quota/manual-token-snap').catch(() => {});
+      }
+    } catch { /* .tmp 读不到不阻断开窗 */ }
     renderShell();
     if (state.drafts.length) await selectDraft(state.drafts[0].id);
     else startNewDraft();

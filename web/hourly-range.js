@@ -102,5 +102,18 @@ window.HourlyRange = (function () {
     return '时段汇总（' + pad2(a) + ':00–' + endOf(b) + ' · ' + (b - a + 1) + ' 小时）';
   }
 
-  return { HOURS, totals, agg, buildSlots, sumRange, slotTitle, rangeText, tickText, tickVisible, sumLabel };
+  /**
+   * 平均每小时消耗的自适应 token 单位文案（框选模式信息面板「平均/h」列，hourly-bar-drag-select）。
+   * 自适应规则：≥1B → 'n.nnB/h'；≥1M → 'n.nnM/h'；≥1K → 'n.nnK/h'；不足 1K → 整数 + '/h'；
+   * 0 / 非有限数 → '–'（与既有占位符风格一致）。除法（总量 ÷ 小时数）由调用侧完成。
+   */
+  function fmtPerHour(v) {
+    if (!isFinite(v) || v <= 0) return '–';
+    if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B/h';
+    if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M/h';
+    if (v >= 1e3) return (v / 1e3).toFixed(2) + 'K/h';
+    return Math.round(v) + '/h';
+  }
+
+  return { HOURS, totals, agg, buildSlots, sumRange, slotTitle, rangeText, tickText, tickVisible, sumLabel, fmtPerHour };
 })();

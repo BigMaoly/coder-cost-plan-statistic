@@ -2536,3 +2536,126 @@ test('守门人回归（I4 不污染）：usage_hourly 有无数据，既有一�
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ==================== 手动 token 快照临时文件路由（manual-entry-token-snapshot） ====================
+ * 快照读数是临时值、不进数据库：唯一持久化 = HOME/.config/my-kimicode-statistic/.tmp/manual-token-snap.json。
+ * 测试把 HOME 注入临时沙箱（函数在调用时才解析 dataDir()），绝不触碰真实全局配置目录。 */
+
+/** 快照区合法载荷样例 */
+function tokenSnapSample() {
+  return {
+    on: true,
+    start: { total: null, hit: 100, miss: 50, output: 25 },
+    end: { total: 300, hit: 180, miss: 80, output: 40 },
+    tAuto: {
+      start: { total: true, hit: false, miss: false, output: false },
+      end: { total: false, hit: false, miss: false, output: false }
+    }
+  };
+}
+
+/** HOME 注入沙箱的临时目录（用完还原，绝不触碰真实 ~/.config） */
+async function withHomeSandbox(run) {
+  const sandbox = mkdtempSync(join(tmpdir(), 'mks-tsnap-'));
+  const prevHome = process.env.HOME;
+  process.env.HOME = sandbox;
+  try {
+    await run(sandbox);
+  } finally {
+    process.env.HOME = prevHome;
+    rmSync(sandbox, { recursive: true, force: true });
+  }
+}
+
+test('token-snap tmp：PUT 写入 → GET 读取一致，落盘在 HOME 沙箱 .tmp 下且目录自动创建', async () => {
+  await withHomeSandbox(async (sandbox) => {
+    const { handle } = makeApp();
+    const put = await callBody(handle, 'PUT', '/api/quota/manual-token-snap', { draftId: 7, tokenSnap: tokenSnapSample() });
+    assert.equal(put.status, 200);
+    assert.equal(put.body.ok, true);
+    const { existsSync } = await import('node:fs');
+    const file = join(sandbox, '.config', 'my-kimicode-statistic', '.tmp', 'manual-token-snap.json');
+    assert.equal(existsSync(file), true, '.tmp 目录应随写入自动创建');
+    const get = await call(handle, '/api/quota/manual-token-snap');
+    assert.equal(get.status, 200);
+    assert.equal(get.body.snapshot.draftId, 7);
+    assert.equal(get.body.snapshot.tokenSnap.start.hit, 100);
+    assert.equal(get.body.snapshot.tokenSnap.tAuto.start.total, true);
+    assert.ok(get.body.snapshot.savedAt > 0);
+  });
+});
+
+test('token-snap tmp：DELETE 清理；不存在时幂等成功且计数为 0', async () => {
+  await withHomeSandbox(async () => {
+    const { handle } = makeApp();
+    const empty = await call(handle, '/api/quota/manual-token-snap');
+    assert.equal(empty.body.snapshot, null);
+    const del0 = await callBody(handle, 'DELETE', '/api/quota/manual-token-snap');
+    assert.equal(del0.status, 200);
+    assert.equal(del0.body.deleted, 0, '文件不存在时删除计数为 0，不报错');
+    await callBody(handle, 'PUT', '/api/quota/manual-token-snap', { draftId: 3, tokenSnap: tokenSnapSample() });
+    const del = await callBody(handle, 'DELETE', '/api/quota/manual-token-snap');
+    assert.equal(del.body.deleted, 1);
+    const get = await call(handle, '/api/quota/manual-token-snap');
+    assert.equal(get.body.snapshot, null);
+  });
+});
+
+test('token-snap tmp：非法载荷被拒（400）且文件保持原状', async () => {
+  await withHomeSandbox(async () => {
+    const { handle } = makeApp();
+    await callBody(handle, 'PUT', '/api/quota/manual-token-snap', { draftId: 5, tokenSnap: tokenSnapSample() });
+    const cases = [
+      { draftId: 0, tokenSnap: tokenSnapSample() },                                  // draftId 非法
+      { draftId: 5, tokenSnap: { ...tokenSnapSample(), on: 'yes' } },                // on 非布尔
+      { draftId: 5, tokenSnap: { ...tokenSnapSample(), end: { ...tokenSnapSample().end, hit: -1 } } }, // 负读数
+      { draftId: 5, tokenSnap: { ...tokenSnapSample(), tAuto: { start: { total: 1 }, end: {} } } },    // 角标非布尔
+      { tokenSnap: tokenSnapSample() },                                              // 缺 draftId
+    ];
+    for (const payload of cases) {
+      const bad = await callBody(handle, 'PUT', '/api/quota/manual-token-snap', payload);
+      assert.equal(bad.status, 400, JSON.stringify(payload));
+      assert.ok(bad.body.error, '应带错误信息');
+    }
+    const get = await call(handle, '/api/quota/manual-token-snap');
+    assert.equal(get.body.snapshot.draftId, 5, '非法请求不破坏既有文件');
+    assert.equal(get.body.snapshot.tokenSnap.end.hit, 180);
+  });
+});
+
+test('token-snap tmp：损坏 JSON 视为不存在并顺带清除', async () => {
+  await withHomeSandbox(async (sandbox) => {
+    const { handle } = makeApp();
+    const { writeFileSync, mkdirSync } = await import('node:fs');
+    const dir = join(sandbox, '.config', 'my-kimicode-statistic', '.tmp');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'manual-token-snap.json'), '{ 半截 JSON', 'utf8');
+    const get = await call(handle, '/api/quota/manual-token-snap');
+    assert.equal(get.status, 200);
+    assert.equal(get.body.snapshot, null, '损坏文件按不存在处理');
+    const { existsSync } = await import('node:fs');
+    assert.equal(existsSync(join(dir, 'manual-token-snap.json')), false, '损坏文件顺带清除');
+  });
+});
+
+test('token-snap tmp：草稿载荷携带 tokenSnap 被服务端剥离，既有草稿读写不变', async () => {
+  await withHomeSandbox(async () => {
+    const { handle, db } = makeApp();
+    const draft = {
+      planName: '压测套餐', provider: 'P', b1: 10, b2: 12,
+      tokens: { hit: 1, miss: 2, rate: null, input: null, output: 3, ratio: null },
+      tokenSnap: tokenSnapSample()   // 异常客户端塞进来的临时值
+    };
+    const put = await callBody(handle, 'PUT', '/api/quota/manual-drafts', { draft });
+    assert.equal(put.status, 200);
+    const list = await call(handle, '/api/quota/manual-drafts');
+    assert.equal(list.body.items.length, 1);
+    const payload = list.body.items[0].payload;
+    assert.equal('tokenSnap' in payload, false, 'tokenSnap 应被服务端剥离，不入库');
+    assert.equal(payload.planName, '压测套餐');
+    assert.equal(payload.tokens.hit, 1);
+    // 直查库列再兜底确认
+    const row = db.prepare('SELECT payload_json FROM quota_manual_drafts').get();
+    assert.equal(row.payload_json.includes('tokenSnap'), false);
+  });
+});

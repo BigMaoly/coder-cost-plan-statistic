@@ -224,6 +224,9 @@
   let provHourBlock = null, modelHourBlock = null;
   const hourBlocks = [];
   let hourDayKey = null;
+  // 框选模式（hourly-bar-drag-select）：按下柱体拖拽即进入 —— 悬浮停用、浮窗固定「本范围构成」；
+  // 选区回到全 24 小时（恢复全窗口 / 换日）自动退出。两级小时区共享同一模式与选区。
+  let hourSelectMode = false;
 
   // 三个筛选维度的多选实例（onChange 在事件期触发，处理函数为提升的函数声明）
   const toolMsel = makeMultiSelect($('toolSel'), { allLabel: '全部平台', onChange: (sel) => onToolChange(sel) });
@@ -381,11 +384,15 @@
 
   function renderChart() {
     if (!chart) return;
+    // 换视图 / 换年份后旧悬浮下标失效（bucket 集已重建）
+    mainHover.idx = null;
+    mainHover.side = null;
+    renderBarTip();
     chart.data.labels = buckets.map((b) => b.label);
     chart.data.datasets[0].data = buckets.map((b) => b.hit);
     chart.data.datasets[1].data = buckets.map((b) => b.miss + b.output);
-    // 逐柱配色随选区（全窗口 = 现状基色，summary-range-slider）
-    const colors = SummaryRange.barColors(buckets.length, state.winRange.a, state.winRange.b);
+    // 逐柱配色随选区（全窗口 = 现状基色，summary-range-slider）+ 悬浮热色叠加（window-pie-perday-hover）
+    const colors = mainColors();
     chart.data.datasets[0].backgroundColor = colors.hit;
     chart.data.datasets[0].hoverBackgroundColor = colors.hit;
     chart.data.datasets[1].backgroundColor = colors.miss;
@@ -426,6 +433,10 @@
 
   let slider = null; // 首槽构建后由 syncSlider 惰性装配（文案闭包读取 buckets）
 
+  // 窗口详细打开时滑动条实时跟随（window-pie-perday-hover）：拖动中防抖后再刷新下钻
+  // （rebuildDrill 的 drillSeq 会丢弃过期响应；此处防抖只减少请求次数）
+  let winFollowTimer = null;
+
   /** 窗口汇总卡 = 滑条选区聚合（与服务端 totals 同源等值，拖拽中实时重算） */
   function renderSummary() {
     const win = SummaryRange.sumRange(buckets, state.winRange.a, state.winRange.b);
@@ -434,10 +445,10 @@
       platformPrefix(), state.view, state.year, buckets, state.winRange.a, state.winRange.b);
   }
 
-  /** 收窄态柱状图明暗刷新（数据与坐标不动，跳过动画保拖拽跟手） */
+  /** 收窄态柱状图明暗刷新（数据与坐标不动，跳过动画保拖拽跟手）；叠加悬浮热色（window-pie-perday-hover） */
   function updateChartHighlight() {
     if (!chart) return;
-    const colors = SummaryRange.barColors(buckets.length, state.winRange.a, state.winRange.b);
+    const colors = mainColors();
     chart.data.datasets[0].backgroundColor = colors.hit;
     chart.data.datasets[0].hoverBackgroundColor = colors.hit;
     chart.data.datasets[1].backgroundColor = colors.miss;
@@ -470,6 +481,13 @@
           state.winRange.b = b;
           renderSummary();
           updateChartHighlight();
+          // 窗口汇总详细打开中 → 选区变化实时刷新下钻（数据 / 标题 / 括注，window-pie-perday-hover）
+          if (drill.kind === 'window') {
+            clearTimeout(winFollowTimer);
+            winFollowTimer = setTimeout(() => {
+              if (drill.kind === 'window') rebuildDrill();
+            }, 150);
+          }
         }
       });
       slider.configure({ slotCount: n, a: state.winRange.a, b: state.winRange.b }); // create 只画壳：刻度行由 configure 重建
@@ -510,10 +528,11 @@
     }
     if (drill.kind === 'window') {
       const { a, b } = state.winRange;
+      const days = SummaryRange.windowDays(state.view, state.year, a, b); // 括注同源分母（window-pie-perday-hover）
       if (state.view === 'year') {
-        return (b - a === 11 ? state.year + ' 年全年' : state.year + ' 年 ' + buckets[a].label + '–' + buckets[b].label) + '（窗口汇总）';
+        return (b - a === 11 ? state.year + ' 年全年' : state.year + ' 年 ' + buckets[a].label + '–' + buckets[b].label) + '（窗口汇总 · ' + days + ' 天）';
       }
-      return '窗口汇总（' + buckets[a].key + ' ~ ' + buckets[b].key + '）';
+      return '窗口汇总（' + buckets[a].key + ' ~ ' + buckets[b].key + ' · ' + days + ' 天）';
     }
     return buckets.find((b) => b.key === drill.key)?.title || '';
   }
@@ -583,7 +602,11 @@
     // 左下角信息块：当前整个饼图范围（该时段全提供商）的总计 / 命中率 / 费用（顶层合计由服务端给出）
     const dayHit = providerAggs.reduce((s, a) => s + a.hit, 0);
     const dayInput = providerAggs.reduce((s, a) => s + a.hit + a.miss, 0);
-    setPieStats('providerPieStats', providerAggs.reduce((s, a) => s + a.total, 0), dayInput > 0 ? dayHit / dayInput : null, data.cost);
+    // 「平均每天」括注分母（window-pie-perday-hover）：仅窗口汇总入口传框选天数，其他入口 null
+    const perDayDivisor = drill.kind === 'window'
+      ? SummaryRange.windowDays(state.view, state.year, state.winRange.a, state.winRange.b)
+      : null;
+    setPieStats('providerPieStats', providerAggs.reduce((s, a) => s + a.total, 0), dayInput > 0 ? dayHit / dayInput : null, data.cost, perDayDivisor);
     if (scroll) $('providerPanel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 
     if (drill.provider) {
@@ -592,8 +615,8 @@
       $('modelPieTitle').textContent = drill.provider + ' · ' + platformPrefix() + ' · ' + dayLabel + ' · 按模型分布';
       const base = providerColor(drill.provider);
       updatePie(modelPie, modelAggs, null, modelAggs.map((a, i) => shadeOf(base, i, modelAggs.length)));
-      // 左下角信息块：该提供商（模型饼图整体）的总计 / 命中率 / 费用
-      setPieStats('modelPieStats', entry.total, entry.rate, entry.cost);
+      // 左下角信息块：该提供商（模型饼图整体）的总计 / 命中率 / 费用（与一级共用同一天数）
+      setPieStats('modelPieStats', entry.total, entry.rate, entry.cost, perDayDivisor);
       $('modelPanel').hidden = false;
     } else {
       // 切换保持原位期间原提供商被换时段清掉 → 数据到达后补收起（fix-drilldown-model-pie-flicker）
@@ -604,37 +627,129 @@
     await renderHourlyBlocks(seq, withFilter);
   }
 
-  // 填充饼图左下角信息块（总计 + 命中率 + 费用，竖排三行）；空数据隐藏整块，无已计价量只隐藏费用行
-  function setPieStats(id, total, rate, cost) {
+  // 填充饼图左下角信息块（总计 + 命中率 + 费用，竖排三行）；空数据隐藏整块，无已计价量只隐藏费用行。
+  // days = 「平均每天」括注的分母（window-pie-perday-hover）：仅窗口汇总入口传框选天数，
+  // 总计行追加（n.nn K|M|B/天）、费用行追加（￥n.nn/天）；其他入口传 null → 括注不显示
+  function setPieStats(id, total, rate, cost, days) {
     const box = $(id);
     box.style.display = total > 0 ? '' : 'none';
     $(id + '-total').textContent = fmtFull(total);
+    const tNote = SummaryRange.perDayNote(total, days);
+    const tNoteEl = $(id + '-total-note');
+    tNoteEl.textContent = tNote;
+    tNoteEl.hidden = !tNote;
     $(id + '-rate').textContent = fmtRate(rate);
     const costEl = $(id + '-cost');
     const costLine = fmtCostWithPct(cost, total);
     costEl.textContent = costLine || '–';
     costEl.parentElement.style.display = costLine ? '' : 'none';
+    const cNote = SummaryRange.costPerDayNote(cost && cost.cost, days);
+    const cNoteEl = $(id + '-cost-note');
+    cNoteEl.textContent = cNote;
+    cNoteEl.hidden = !cNote;
   }
 
-  // 更新一个饼图实例的数据 / 配色 / 选中态（选中扇区外移＋描边，不依赖悬浮态）
+  // 更新一个饼图实例的数据 / 配色 / 选中态（选中扇区外移＋描边，不依赖悬浮态）。
+  // hoverBackgroundColor 同步原色（window-pie-perday-hover）：悬浮突出交给自绘提亮 + 描环，不改扇区色
   function updatePie(chart, aggs, selectedKey, bgColors) {
     chart.data.labels = aggs.map((a) => a.key);
     const ds = chart.data.datasets[0];
     ds.data = aggs.map((a) => a.total);
     ds.backgroundColor = bgColors;
+    ds.hoverBackgroundColor = bgColors;
     ds.offset = aggs.map((a) => (a.key === selectedKey ? 16 : 0));
     ds.borderWidth = aggs.map((a) => (a.key === selectedKey ? 2 : 1));
     ds.borderColor = aggs.map((a) => (a.key === selectedKey ? '#e7eef8' : 'rgba(10, 17, 32, .9)'));
     chart.update();
   }
 
-  // 创建饼图实例：右侧圆点图例、跟随鼠标悬浮、五行口径（与每日柱状图 tooltip 同维度）
+  // 创建饼图实例：右侧圆点图例 + 左上角固定悬浮面板（window-pie-perday-hover，替代跟随气泡）+
+  // 扇区悬浮突出（白色提亮 + 外圈彩色描环，区别于点击选中的外移 + 白边）
   function createPie(canvasId, getAggs, onClickSlice) {
-    return new Chart($(canvasId).getContext('2d'), {
+    const tip = $(canvasId + 'Tip');
+    let hoverIdx = null;         // 当前悬浮扇区下标（null = 无悬浮）
+    let redrawPending = false;
+
+    // 悬浮高亮重绘（rAF 合并，避免 mousemove 高频重入 draw）
+    const scheduleRedraw = () => {
+      if (redrawPending) return;
+      redrawPending = true;
+      requestAnimationFrame(() => {
+        redrawPending = false;
+        if (chart) chart.draw();
+      });
+    };
+
+    // 扇区悬浮突出：白色提亮楔形（叠加在原扇区之上）+ 外圈彩色描环（带辉光，颜色取该扇区配色）
+    const hoverPlugin = {
+      id: 'pieHoverGlow',
+      afterDraw(c) {
+        const i = hoverIdx;
+        if (i === null || i === undefined) return;
+        const el = c.getDatasetMeta(0).data[i];
+        if (!el) return;
+        const colors = c.data.datasets[0].backgroundColor;
+        const color = Array.isArray(colors) ? (colors[i] || '#2dd4bf') : (colors || '#2dd4bf');
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(el.x, el.y);
+        ctx.arc(el.x, el.y, el.outerRadius, el.startAngle, el.endAngle);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(255, 255, 255, .16)';
+        ctx.fill();
+        ctx.beginPath();
+        ctx.arc(el.x, el.y, el.outerRadius + 5, el.startAngle, el.endAngle);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2.5;
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 10;
+        ctx.stroke();
+        ctx.restore();
+      }
+    };
+
+    // 左上角固定面板：内容与原气泡同源（五行 + 汇总费用行），头部色样 + 名称 + 占比
+    const renderTip = () => {
+      const list = getAggs();
+      const s = hoverIdx === null || hoverIdx === undefined ? null : list[hoverIdx];
+      if (!s || !(s.total > 0)) { tip.hidden = true; return; }
+      const colors = chart ? chart.data.datasets[0].backgroundColor : [];
+      const color = Array.isArray(colors) ? (colors[hoverIdx] || '#2dd4bf') : '#2dd4bf';
+      const total = list.reduce((sum, x) => sum + (Number(x.total) || 0), 0);
+      const share = total > 0 ? (s.total / total * 100).toFixed(2) + '%' : '–';
+      const row = (k, v, cls) => '<div class="pt-row' + (cls ? ' ' + cls : '') + '"><span>' + k + '</span><span class="pt-val">' + v + '</span></div>';
+      const costLine = fmtCostWithPct(s.cost, s.total);
+      tip.innerHTML =
+        '<div class="pt-head"><span class="pt-sw" style="background:' + color + '"></span>' +
+        '<span class="pt-name" title="' + esc(s.key) + '">' + esc(s.key) + '</span>' +
+        '<span class="pt-pct">' + share + '</span></div>' +
+        row('输出', fmtFull(s.output)) +
+        row('输入（缓存命中）', fmtFull(s.hit)) +
+        row('输入（未命中）', fmtFull(s.miss)) +
+        row('总计', fmtFull(s.total)) +
+        row('命中率', fmtRate(s.rate)) +
+        (costLine ? row('汇总费用', costLine, 'pt-cost') : '') +
+        '<div class="pt-hint">' + (canvasId === 'providerPie'
+          ? '点击扇区下钻该提供商的模型分布'
+          : '本层为最后一层 · 悬浮仅查看，无下钻') + '</div>';
+      tip.hidden = false;
+    };
+
+    // 移出复位：面板隐藏、扇区高亮取消（多重兜底见文件尾注册）
+    const hideTip = () => {
+      if (hoverIdx === null) return;
+      hoverIdx = null;
+      renderTip();
+      scheduleRedraw();
+    };
+
+    const chart = new Chart($(canvasId).getContext('2d'), {
       type: 'pie',
+      plugins: [hoverPlugin],
       data: {
         labels: [],
-        datasets: [{ data: [], backgroundColor: [], borderColor: 'rgba(10, 17, 32, .9)', borderWidth: 1, hoverOffset: 10 }]
+        datasets: [{ data: [], backgroundColor: [], hoverBackgroundColor: [], borderColor: 'rgba(10, 17, 32, .9)', borderWidth: 1, hoverOffset: 0 }]
       },
       options: {
         responsive: true,
@@ -642,6 +757,14 @@
         animation: { duration: 300 },
         layout: { padding: 10 },
         onClick: onClickSlice,
+        onHover: (evt, elems) => {
+          const idx = elems && elems.length ? elems[0].index : null;
+          if (idx === hoverIdx) return;
+          hoverIdx = idx;
+          renderTip();
+          scheduleRedraw();
+        },
+        onLeave: () => hideTip(),
         plugins: {
           legend: {
             position: 'right',
@@ -666,45 +789,32 @@
               }
             }
           },
-          tooltip: {
-            position: 'cursor', // 跟随鼠标
-            displayColors: false,
-            backgroundColor: 'rgba(8, 15, 30, .95)',
-            borderColor: 'rgba(45, 212, 191, .35)',
-            borderWidth: 1,
-            titleColor: '#e7eef8',
-            titleFont: { size: 13, weight: '600' },
-            bodyColor: '#dbe6f5',
-            bodyFont: { size: 12 },
-            padding: 10,
-            caretPadding: 8,
-            callbacks: {
-              title: (items) => items[0].label,
-              label: (item) => {
-                const s = getAggs()[item.dataIndex];
-                if (!s) return '';
-                const lines = [
-                  '输出：' + fmtFull(s.output),
-                  '输入(缓存命中)：' + fmtFull(s.hit),
-                  '输入(未命中)：' + fmtFull(s.miss),
-                  '总计：' + fmtFull(s.total),
-                  '命中率：' + fmtRate(s.rate)
-                ];
-                // v5：扇区费用行（括注 = 该扇区已计价 token 占比），无已计价量整行不显示
-                const costLine = fmtCostWithPct(s.cost, s.total);
-                if (costLine) lines.push('汇总费用：' + costLine);
-                return lines;
-              }
-            }
-          }
+          tooltip: { enabled: false } // 悬浮信息改用左上角固定面板（window-pie-perday-hover）
         }
       }
     });
+
+    // 移出复位多重兜底（同主图）：Chart.js 的 onLeave 仅在 active 变化时触发，快速移出不可靠——
+    // canvas mouseleave + document 双事件保证任意方向、任意速度移出必隐藏
+    $(canvasId).addEventListener('mouseleave', hideTip);
+    const hideWhenOutside = (e) => {
+      if (hoverIdx !== null && e.target !== $(canvasId)) hideTip();
+    };
+    document.addEventListener('mousemove', hideWhenOutside);
+    document.addEventListener('pointermove', hideWhenOutside);
+
+    return chart;
   }
 
   /* ================= 单日下钻 · 小时时段构成区（hourly-archive-drilldown） ================= */
 
   const HR = window.HourlyRange; // 小时槽位 / 选区聚合纯函数引擎（web/hourly-range.js）
+
+  /** 框选态浮窗标题的区间文案（hourly-bar-drag-select）：23 → '24:00'，与 slotTitle 同风格 */
+  function hourRangeHead(a, b) {
+    const end = (h) => (h + 1 === HR.HOURS ? '24:00' : String(h + 1).padStart(2, '0') + ':00');
+    return String(a).padStart(2, '0') + ':00–' + end(b);
+  }
 
   /** 选区区间框选插件：只画框与淡罩，不改柱色（柱色必须恒等于对应饼图配色） */
   function makeHourRangePlugin() {
@@ -752,12 +862,29 @@
     setTimeout(run, 120);
   }
 
+  /** 进入 / 退出框选模式（两级共享）：悬浮停用 ↔ 恢复；浮窗固定「本范围构成」↔ 默认 / 悬浮态 */
+  function setHourSelectMode(v) {
+    if (hourSelectMode === v) return;
+    hourSelectMode = v;
+    for (const blk of hourBlocks) {
+      blk.hoverIndex = null;   // 悬浮高亮与浮窗一并复位，不残留描边
+      blk.renderTip();
+      blk.renderSummary();
+      blk.scheduleRedraw();
+    }
+  }
+
   /** 任一小时轴选区变化：两级小时区共享选区，实时刷新各自汇总与图上框选 */
   function onHourRangeChange(a, b, source) {
     state.hour.a = a;
     state.hour.b = b;
+    // 选区回到全 24 小时 → 自动退出框选模式（拖拽进行中除外，松手后由 onDragEnd 复算一次）
+    if (a === 0 && b === HR.HOURS - 1 && hourSelectMode && !hourBlocks.some((blk) => blk.dragging)) {
+      setHourSelectMode(false);
+    }
     for (const blk of hourBlocks) {
       if (blk.slider && blk !== source) blk.slider.configure({ slotCount: HR.HOURS, a, b });
+      blk.renderTip();
       blk.renderSummary();
       if (blk.chart && blk.chart.data.labels.length) blk.chart.update('none');
     }
@@ -770,7 +897,7 @@
   function createHourlyBlock(cfg) {
     const block = {
       chart: null, slider: null, slots: [], hours: [], dims: [], matrix: [], totalsByDim: [],
-      hoverIndex: null, redrawPending: false,
+      hoverIndex: null, redrawPending: false, dragging: false,
       /**
        * 渲染/刷新。整块出现条件 =「单日下钻」且「该日确有小时数据」：
        * 月柱 / 窗口汇总（非单日口径）与无小时数据的日期 → 整块隐藏，不显示空态提示。
@@ -837,6 +964,33 @@
           '<span class="ht-name">' + esc(name) + '</span>' +
           '<span class="ht-val">' + fmtFull(v) + '</span>' +
           '<span class="ht-pct">' + share(v, t) + '</span></div>';
+        // 框选态行（hourly-bar-drag-select）：名称 | 平均/h | 总 token | 占比 —— 平均列在总 token 之前
+        const rangeRow = (name, color, v, t, hours) =>
+          '<div class="ht-row"><span class="ht-sw" style="background:' + color + '"></span>' +
+          '<span class="ht-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
+          '<span class="ht-avg">' + HR.fmtPerHour(hours > 0 ? v / hours : 0) + '</span>' +
+          '<span class="ht-val ht-fixed">' + fmtFull(v) + '</span>' +
+          '<span class="ht-pct">' + share(v, t) + '</span></div>';
+        // 框选模式（拖拽中或已锁定）：浮窗固定展示选中范围的整体构成，悬浮已停用
+        if (hourSelectMode || block.dragging) {
+          const a = state.hour.a, b = state.hour.b, hours = b - a + 1;
+          let vSum = 0;
+          const rows = block.dims
+            .map((d, i) => {
+              let v = 0;
+              for (let h = a; h <= b; h++) v += block.matrix[i][h] || 0;
+              vSum += v;
+              return { key: d.key, color: d.color, v };
+            })
+            .filter((r) => r.v > 0)
+            .sort((x, y) => y.v - x.v);
+          tip.innerHTML =
+            '<div class="ht-head">本范围构成 <span class="ht-time">' + hourRangeHead(a, b) + '</span> · ' + hours + ' 小时</div>' +
+            '<div class="ht-hint">框选模式：悬浮已停用 · 「平均/h」= 该颜色在本选区的平均每小时消耗<br>点时间轴「恢复全窗口」退出（选区复位全 24 小时）</div>' +
+            '<div class="ht-cols"><span class="ht-name">构成项</span><span class="ht-avg">平均/h</span><span class="ht-val ht-fixed">总 token</span><span class="ht-pct">占比</span></div>' +
+            '<div class="ht-list">' + rows.map((r) => rangeRow(r.key, r.color, r.v, vSum, hours)).join('') + '</div>';
+          return;
+        }
         if (block.hoverIndex === null || block.hoverIndex === undefined) {
           const total = block.totalsByDim.reduce((acc, v) => acc + v, 0);
           const rows = block.dims
@@ -876,6 +1030,11 @@
         $(cfg.prefix + 'OutNote').textContent = '占总量 ' + fmtShare(t.outputShare);
         $(cfg.prefix + 'Total').textContent = fmtFull(t.total);
         $(cfg.prefix + 'TotalNote').textContent = '输入 ＋ 输出';
+        // 框选模式提示只在框选态出现（默认态保持原有无提示版式）；恢复入口唯一 = 时间轴「恢复全窗口」
+        $(cfg.prefix + 'SumHint').textContent = hourSelectMode
+          ? '框选模式 · 按住柱体横向拖拽可调整选区 · 点「恢复全窗口」退出'
+          : '';
+        $(cfg.prefix + 'ModeBadge').hidden = !hourSelectMode;
       }
     };
 
@@ -921,7 +1080,16 @@
         interaction: { mode: 'index', intersect: false },
         onResize: () => alignHourly(block),
         // 无 onClick：小时柱不响应点击、不可下钻；悬浮只更新左侧固定浮窗 + 本柱高亮
+        // 框选模式下悬浮停用（hourly-bar-drag-select）：面板固定「本范围构成」，不随指针刷新
         onHover: (evt, elems) => {
+          if (hourSelectMode || block.dragging) {
+            if (block.hoverIndex !== null) {
+              block.hoverIndex = null;
+              block.renderTip();
+              block.scheduleRedraw();
+            }
+            return;
+          }
           const idx = elems && elems.length ? elems[0].index : null;
           if (idx === block.hoverIndex) return;
           block.hoverIndex = idx;
@@ -929,6 +1097,7 @@
           block.scheduleRedraw();
         },
         onLeave: () => {
+          if (hourSelectMode || block.dragging) return;
           if (block.hoverIndex === null) return;
           block.hoverIndex = null;
           block.renderTip();
@@ -944,6 +1113,48 @@
         }
       }
     });
+
+    // ★ 柱体拖拽框选（hourly-bar-drag-select）：按下柱体 = 抓住时间轴的一端，横向拖拽双向粘附；
+    // 选区与时间轴共用同一 onHourRangeChange（source 传 null → 两个滑块都被 configure 跟随）
+    window.BarDragSelect.attach({
+      canvas: $(cfg.canvasId),
+      getChart: () => block.chart,
+      slotCount: () => (block.chart.data.labels.length || HR.HOURS),
+      onDragStart: () => {
+        block.dragging = true;
+        setHourSelectMode(true);   // 按下即进入框选模式：浮窗固定「本范围构成」、悬浮停用（两级同步）
+      },
+      onDragMove: (a, b) => { onHourRangeChange(a, b, null); },
+      onDragEnd: () => {
+        block.dragging = false;
+        // 复算一次：选区恰为全 24 小时 → 自动退出框选模式；否则保持框选态
+        onHourRangeChange(state.hour.a, state.hour.b, null);
+      }
+    });
+
+    // 移出即取消悬浮选中（window-pie-perday-hover）：整列高亮清除、浮窗回默认统计态
+    // （非框选 = 全 24 小时构成；框选模式 = 选中范围构成，不受悬浮影响）。
+    // 原生 mouseleave 兜底：Chart.js 的 onLeave 仅在 active 变化时触发，快速移出不可靠，
+    // 浮窗 SHALL NOT 残留最后悬浮的时段状态
+    $(cfg.canvasId).addEventListener('mouseleave', () => {
+      if (hourSelectMode || block.dragging) return;
+      if (block.hoverIndex === null) return;
+      block.hoverIndex = null;
+      block.renderTip();
+      block.scheduleRedraw();
+    });
+    // document 双事件兜底（同主图 / 饼图）：指针落在本块 canvas 之外即复位悬浮（框选态除外）
+    const hideHoverWhenOutside = (e) => {
+      if (block.hoverIndex === null) return;
+      if (hourSelectMode || block.dragging) return;
+      if (e.target !== $(cfg.canvasId)) {
+        block.hoverIndex = null;
+        block.renderTip();
+        block.scheduleRedraw();
+      }
+    };
+    document.addEventListener('mousemove', hideHoverWhenOutside);
+    document.addEventListener('pointermove', hideHoverWhenOutside);
     return block;
   }
 
@@ -955,10 +1166,11 @@
   async function renderHourlyBlocks(seq, withFilter) {
     const singleDay = drill.kind === 'today' || (drill.kind === 'bucket' && typeof drill.key === 'string' && drill.key.length === 10);
     const dayKey = drill.kind === 'today' ? new Date().toLocaleDateString('sv-SE') : singleDay ? drill.key : null;
-    // 换了一天 → 时间轴复位为全 24 小时（同一天内切换提供商 / 重渲染不复位）
+    // 换了一天 → 时间轴复位为全 24 小时 + 退出框选模式（同一天内切换提供商 / 重渲染不复位）
     if (dayKey !== hourDayKey) {
       hourDayKey = dayKey;
       state.hour = { a: 0, b: HR.HOURS - 1 };
+      setHourSelectMode(false);
     }
     let hourly = null;
     if (singleDay) {
@@ -1000,14 +1212,85 @@
 
   /* ================= Chart.js ================= */
 
+  /* ----- 主图固定悬浮面板（window-pie-perday-hover）：替代跟随鼠标的 tooltip 气泡 ----- */
+  const BAR_TIP_W = 248;      // 与 .bar-tip width 保持一致
+  const BAR_TIP_MARGIN = 12;  // 面板与绘图区边缘的间距
+  const BAR_TIP_GAP = 10;     // 让位预警距离：鼠标距面板中心侧边框 10px（几乎快接触）即让位
+  const MAIN_HOT = { hit: '#3ae6d0', miss: '#c9d4e6' }; // 悬浮柱体温色（任意框选明暗下可辨）
+  const mainHover = { idx: null, side: null };           // idx = 悬浮柱下标；side = 面板贴边（null = 待初始化）
+
+  /** 主图逐柱配色 = 框选明暗（barColors）+ 悬浮柱热色覆写（突出指向，不改配色语义） */
+  function mainColors() {
+    const colors = SummaryRange.barColors(buckets.length, state.winRange.a, state.winRange.b);
+    if (mainHover.idx !== null && colors.hit[mainHover.idx] !== undefined) {
+      colors.hit[mainHover.idx] = MAIN_HOT.hit;
+      colors.miss[mainHover.idx] = MAIN_HOT.miss;
+    }
+    return colors;
+  }
+
+  /** 悬浮柱重上色（跳过动画保跟手） */
+  function refreshMainColors() {
+    const colors = mainColors();
+    chart.data.datasets[0].backgroundColor = colors.hit;
+    chart.data.datasets[0].hoverBackgroundColor = colors.hit;
+    chart.data.datasets[1].backgroundColor = colors.miss;
+    chart.data.datasets[1].hoverBackgroundColor = colors.miss;
+    chart.update('none');
+  }
+
+  /** 主图面板内容：与原 tooltip 同源（五行 + 当日 / 当月费用行 + 下钻提示），渲染进 #mainTip */
+  function renderBarTip() {
+    const tip = $('mainTip');
+    const b = mainHover.idx === null || mainHover.idx === undefined ? null : buckets[mainHover.idx];
+    if (!b || !(b.hit + b.miss + b.output > 0)) { tip.hidden = true; return; }
+    const side = mainHover.side || 'right';
+    tip.classList.toggle('tip-left', side === 'left');
+    tip.classList.toggle('tip-right', side !== 'left');
+    const total = b.hit + b.miss + b.output;
+    const input = b.hit + b.miss;
+    const row = (k, v, cls) => '<div class="pt-row' + (cls ? ' ' + cls : '') + '"><span>' + k + '</span><span class="pt-val">' + v + '</span></div>';
+    const costLine = fmtCostWithPct(b.cost, total);
+    tip.innerHTML =
+      '<div class="pt-head"><span class="pt-sw" style="background:#2dd4bf"></span>' +
+      '<span class="pt-name" title="' + esc(b.title) + '">' + esc(b.title) + '</span></div>' +
+      row('输出', fmtFull(b.output)) +
+      row('输入（缓存命中）', fmtFull(b.hit)) +
+      row('输入（未命中）', fmtFull(b.miss)) +
+      row('总计', fmtFull(total)) +
+      row('命中率', fmtRate(input > 0 ? b.hit / input : null)) +
+      (costLine ? row(state.view === 'year' ? '当月费用' : '当日费用', costLine, 'pt-cost') : '') +
+      '<div class="pt-hint">点击柱子下钻该' + (state.view === 'year' ? '月' : '日') + '</div>';
+    tip.hidden = false;
+  }
+
+  /** 贴边判定：用真实 clientX 换算画布相对坐标后走纯函数 fleeSide（side 变化才重渲染） */
+  function updateMainHoverSide(clientX) {
+    if (!chart || !chart.canvas) return;
+    const area = chart.chartArea;
+    if (!area || mainHover.idx === null) return;
+    const relX = clientX - chart.canvas.getBoundingClientRect().left;
+    const side = SummaryRange.fleeSide(mainHover.side, relX, area.left, area.right, BAR_TIP_W, BAR_TIP_MARGIN, BAR_TIP_GAP);
+    if (side !== mainHover.side) {
+      mainHover.side = side;
+      renderBarTip();
+    }
+  }
+
+  /** 移出复位：面板隐藏 + 热色取消（贴边一并复位，下次进入重新按中线初始化） */
+  function hideMainHover() {
+    if (mainHover.idx === null && $('mainTip').hidden) return;
+    mainHover.idx = null;
+    mainHover.side = null;
+    refreshMainColors();
+    renderBarTip();
+  }
+
   function createChart() {
     Chart.defaults.font.family = 'PingFang SC, Microsoft YaHei, Noto Sans CJK SC, system-ui, sans-serif';
     Chart.defaults.color = '#8ba0bf';
-
-    // 自定义 positioner：tooltip 跟随鼠标
-    Chart.Tooltip.positioners.cursor = function (items, pos) {
-      return pos ? { x: pos.x, y: pos.y } : { x: 0, y: 0 };
-    };
+    // 主图 / 下钻饼图的悬浮信息已改为固定面板（window-pie-perday-hover），
+    // 原跟随鼠标的 tooltip 与 cursor positioner 一并停用，无消费者。
 
     // 选中柱高亮：对当前下钻选中的柱子画一圈虚线描边（不改变柱子数据）
     const barHighlight = {
@@ -1024,6 +1307,54 @@
         ctx.lineWidth = 2;
         ctx.setLineDash([4, 3]);
         ctx.strokeRect(top.x - w / 2 - 3, Math.min(top.y, bottom.y) - 5, w + 6, c.scales.y.getPixelForValue(0) - Math.min(top.y, bottom.y) + 5);
+        ctx.restore();
+      }
+    };
+
+    // 悬浮柱突出（window-pie-perday-hover）：贴柱渐变光晕（柱体之后、基线向上淡出）+ 轴线下划线。
+    // 不画整列竖带 / 描边框——高亮贴着柱体本身；热色提亮在 mainColors() 里完成，此处只画附加层
+    const mainHoverPlugin = {
+      id: 'mainHover',
+      beforeDatasetsDraw(c) {
+        const i = mainHover.idx, area = c.chartArea, n = c.data.labels.length;
+        if (i === null || i === undefined || i < 0 || i >= n || !area || !n) return;
+        const m0 = c.getDatasetMeta(0).data[i], m1 = c.getDatasetMeta(1).data[i];
+        if (!m0 || !m1) return;
+        const base = m0.base !== undefined ? m0.base : area.bottom;
+        const top = Math.max(Math.min(m0.y, m1.y) - 16, area.top);
+        if (!(base > top + 2)) return;
+        const w = (m0.width || 14) + 8;
+        const x = m0.x - w / 2;
+        const ctx = c.ctx;
+        const grad = ctx.createLinearGradient(0, base, 0, top);
+        grad.addColorStop(0, 'rgba(45, 212, 191, .15)');
+        grad.addColorStop(1, 'rgba(45, 212, 191, 0)');
+        const r = Math.min(7, w / 2);
+        ctx.save();
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.moveTo(x, base);
+        ctx.lineTo(x, top + r);
+        ctx.quadraticCurveTo(x, top, x + r, top);
+        ctx.lineTo(x + w - r, top);
+        ctx.quadraticCurveTo(x + w, top, x + w, top + r);
+        ctx.lineTo(x + w, base);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      },
+      afterDatasetsDraw(c) {
+        const i = mainHover.idx, area = c.chartArea, n = c.data.labels.length;
+        if (i === null || i === undefined || i < 0 || i >= n || !area || !n) return;
+        const unit = (area.right - area.left) / n;
+        const ctx = c.ctx;
+        ctx.save();
+        ctx.fillStyle = 'rgba(45, 212, 191, .9)';
+        ctx.beginPath();
+        const x = area.left + i * unit + 4, w = unit - 8;
+        if (ctx.roundRect) ctx.roundRect(x, area.bottom + 2, w, 3, 1.5);
+        else ctx.rect(x, area.bottom + 2, w, 3);
+        ctx.fill();
         ctx.restore();
       }
     };
@@ -1053,7 +1384,7 @@
 
     chart = new Chart($('usageChart').getContext('2d'), {
       type: 'bar',
-      plugins: [barHighlight, rangeHighlight],
+      plugins: [barHighlight, rangeHighlight, mainHoverPlugin],
       data: {
         labels: [],
         datasets: [
@@ -1095,7 +1426,21 @@
           drill = { kind: 'bucket', key: bar.key, provider: drill.provider };
           rebuildDrill(true);
         },
-        onHover: (evt, elems) => { evt.native.target.style.cursor = elems.length ? 'pointer' : 'default'; },
+        onHover: (evt, elems) => {
+          const src = evt.native || evt; // 包装事件或原生事件，clientX 恒可靠
+          src.target.style.cursor = elems.length ? 'pointer' : 'default';
+          const idx = elems.length ? elems[0].index : null;
+          const changed = idx !== mainHover.idx;
+          mainHover.idx = idx; // 先落 idx（让位判定与热色以「悬浮中」为前提）
+          if (changed) refreshMainColors();
+          updateMainHoverSide(src.clientX);
+          renderBarTip();
+        },
+        onLeave: (evt) => {
+          const src = evt.native || evt;
+          src.target.style.cursor = 'default';
+          hideMainHover();
+        },
         plugins: {
           legend: {
             labels: {
@@ -1114,42 +1459,7 @@
               }))
             }
           },
-          tooltip: {
-            position: 'cursor', // 跟随鼠标
-            displayColors: false,
-            backgroundColor: 'rgba(8, 15, 30, .95)',
-            borderColor: 'rgba(45, 212, 191, .35)',
-            borderWidth: 1,
-            titleColor: '#e7eef8',
-            titleFont: { size: 13, weight: '600' },
-            bodyColor: '#dbe6f5',
-            bodyFont: { size: 12 },
-            padding: 10,
-            caretPadding: 8,
-            callbacks: {
-              // 标题：日期 / 月份
-              title: (items) => buckets[items[0].dataIndex]?.title || '',
-              // 内容五行：输出 / 输入(缓存命中) / 输入(未命中) / 总计 / 命中率，四位数值两位小数＋自适应单位，命中率小数点后 1 位；五行由第一段统一输出避免重复
-              // v5：存在已计价用量时追加费用行（括注 = 已计价 token 占比），无已计价量整行不显示
-              label: (item) => {
-                const b = buckets[item.dataIndex];
-                if (!b) return '';
-                if (item.datasetIndex !== 0) return '';
-                const total = b.hit + b.miss + b.output; // 总计 = 命中 + 未命中输入 + 输出（按需求口径）
-                const input = b.hit + b.miss; // 总输入（未命中输入含缓存写入），命中率分母，不含输出
-                const lines = [
-                  '输出：' + fmtFull(b.output),
-                  '输入(缓存命中)：' + fmtFull(b.hit),
-                  '输入(未命中)：' + fmtFull(b.miss),
-                  '总计：' + fmtFull(total),
-                  '命中率：' + fmtRate(input > 0 ? b.hit / input : null)
-                ];
-                const costLine = fmtCostWithPct(b.cost, total);
-                if (costLine) lines.push((state.view === 'year' ? '当月费用：' : '当日费用：') + costLine);
-                return lines;
-              }
-            }
-          }
+          tooltip: { enabled: false } // 悬浮信息改用固定卡片面板（#mainTip，window-pie-perday-hover）
         },
         scales: {
           x: {
@@ -1168,6 +1478,16 @@
         }
       }
     });
+
+    // 移出复位多重兜底（window-pie-perday-hover）：Chart.js 的 onLeave 仅在 active 变化时触发，
+    // 快速 / 垂直方向移出时不可靠——canvas mouseleave + document 双事件保证任意方向移出必隐藏
+    // （document 监听在面板可见时才做实际工作，稳态零开销）
+    $('usageChart').addEventListener('mouseleave', hideMainHover);
+    const hideWhenOutside = (e) => {
+      if (!$('mainTip').hidden && e.target !== $('usageChart')) hideMainHover();
+    };
+    document.addEventListener('mousemove', hideWhenOutside);
+    document.addEventListener('pointermove', hideWhenOutside);
   }
 
   /* ================= 提供商统计映射（provider-model-mapping） ================= */

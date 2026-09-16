@@ -429,6 +429,7 @@ const serverJs = readFileSync(fileURLToPath(new URL('../src/server.js', import.m
 const manualJs = readFileSync(join(webRoot, 'manual-entry.js'), 'utf8');
 const linkSolveJs = readFileSync(join(webRoot, 'link-solve.js'), 'utf8');
 const tierAllocJs = readFileSync(join(webRoot, 'tier-alloc.js'), 'utf8');
+const tokenSnapJs = readFileSync(join(webRoot, 'token-snap.js'), 'utf8');
 
 test('静态服务白名单覆盖 index.html 引用的全部前端脚本（漏登记 → 浏览器 404 → 模块不挂载）', () => {
   const srcs = [...indexHtml.matchAll(/<script src="\.\/([^"]+)"><\/script>/g)].map((m) => m[1]);
@@ -462,15 +463,16 @@ test('手动录入：套餐元数据按 /api/plans 真实契约取数（candidat
   assert.match(body, /pl\.quotaMode === 'points' \? '分' : '%'/, '额度单位口径应与套餐设置页（app.js qUnit）一致');
 });
 
-test('手动录入：三前端模块挂载与 app.js 桥接契约', () => {
+test('手动录入：四前端模块挂载与 app.js 桥接契约', () => {
   assert.match(linkSolveJs, /window\.LinkSolve = \(function \(\) \{/, 'link-solve.js 应挂载 window.LinkSolve');
   assert.match(tierAllocJs, /window\.TierAlloc = \(function \(\) \{/, 'tier-alloc.js 应挂载 window.TierAlloc');
-  assert.ok(manualJs.includes('window.LinkSolve') && manualJs.includes('window.TierAlloc'), '窗口应从 window 取两个计算模块');
+  assert.match(tokenSnapJs, /window\.TokenSnap = \(function \(\) \{/, 'token-snap.js 应挂载 window.TokenSnap');
+  assert.ok(manualJs.includes('window.LinkSolve') && manualJs.includes('window.TierAlloc') && manualJs.includes('window.TokenSnap'), '窗口应从 window 取三个计算模块');
   assert.ok(manualJs.includes('document.dispatchEvent(new CustomEvent(' + "'manual-snapshot-created'"),
     '创建成功后应派发桥接事件');
   assert.ok(appJs.includes("document.addEventListener('manual-snapshot-created'"), 'app.js 应监听该事件刷新记录列表');
   assert.ok(appJs.includes('window.ManualEntry.open()'), '记录页入口应打开手动录入窗口');
-  assert.ok(manualJs.includes("if (!window.LinkSolve || !window.TierAlloc)"), '计算模块缺失时应拒绝开窗并提示');
+  assert.ok(manualJs.includes('if (!window.LinkSolve || !window.TierAlloc || !window.TokenSnap)'), '计算模块缺失时应拒绝开窗并提示');
 });
 
 test('手动录入窗口：模态结构、四按钮与关键文案（缺项提示 / 两步确认放弃）', () => {
@@ -566,7 +568,7 @@ test('汇总范围滑动条：挂载点、脚本引入顺序与汇总聚合接�
 
 test('汇总范围滑动条：联动突出 / 复位矩阵 / 零值柱 / 详细跟随选区', () => {
   // 区间框选插件与图表重排对齐
-  assert.match(appJs, /plugins: \[barHighlight, rangeHighlight\]/, '应注册区间框选插件');
+  assert.match(appJs, /plugins: \[barHighlight, rangeHighlight, mainHoverPlugin\]/, "应注册区间框选插件与悬浮突出插件（window-pie-perday-hover）");
   assert.match(appJs, /onResize: \(\) => alignSlider\(\)/, '图表重排后滑条应跟随对齐');
   // 全窗口基色严格沿用现状 .88/.85（未收窄时无样式变化）
   assert.match(readFileSync(join(webRoot, 'summary-range.js'), 'utf8'),
@@ -623,4 +625,43 @@ test('小时时段构成区：脚注口径文案（两数据源 / 不可点击 /
   assert.ok(indexHtml.includes('不追溯'), '脚注应含「不追溯」口径');
   assert.ok(indexHtml.includes('首次归档后不再变化'), '脚注应表达一次性沉淀语义');
   assert.ok(indexHtml.includes('恒为 24 槽'), '脚注应说明时间轴固定 24 槽');
+});
+
+test('小时柱柱体拖拽框选：控制器引入 / 框选模式状态 / 两级徽标 / 恢复入口唯一（hourly-bar-drag-select）', () => {
+  // 控制器以经典脚本在 app.js 之前引入
+  const ctrlAt = indexHtml.indexOf('<script src="./bar-drag-select.js"></script>');
+  const appAt = indexHtml.indexOf('<script src="./app.js"></script>');
+  assert.ok(ctrlAt !== -1 && appAt !== -1 && ctrlAt < appAt, 'bar-drag-select.js 应在 app.js 之前引入');
+  // app.js：框选模式状态 + 进入/退出函数 + 控制器接入（两级小时区共用 createHourlyBlock → 一处挂载即两级）
+  assert.match(appJs, /let hourSelectMode = false/, '应有模块级框选模式状态');
+  assert.match(appJs, /function setHourSelectMode\(/, '应有框选模式进入/退出函数');
+  assert.match(appJs, /window\.BarDragSelect\.attach\(/, '小时区应挂载柱体拖拽控制器');
+  assert.match(appJs, /onHourRangeChange\(a, b, null\)/, '拖拽选区应与时间轴共用同一选区源（source=null）');
+  // 框选态浮窗：本范围构成 + 平均/h 列（列头行 + fmtPerHour），平均列在总 token 之前
+  assert.ok(appJs.includes('本范围构成'), '框选态浮窗标题应为「本范围构成」');
+  assert.match(appJs, /ht-cols/, '框选态浮窗应有列头行');
+  assert.match(appJs, /ht-avg/, '框选态浮窗应有平均/h 列');
+  assert.match(appJs, /HR\.fmtPerHour\(/, '平均/h 应走 HourlyRange.fmtPerHour 纯函数');
+  assert.ok(appJs.indexOf('ht-avg') < appJs.indexOf('ht-fixed'), '平均/h 列应在总 token 列之前');
+  // 恢复入口唯一：只允许时间轴自带 rs-reset「恢复全窗口」，不得新增「恢复悬浮」等按钮
+  assert.ok(!appJs.includes('恢复悬浮'), '不得出现「恢复悬浮」按钮文案（唯一恢复入口 = 恢复全窗口）');
+  assert.ok(!indexHtml.includes('恢复悬浮'), '页面不得存在「恢复悬浮」按钮（R3 回归锚）');
+  assert.match(appJs, /恢复全窗口/, '框选态提示应指向「恢复全窗口」');
+  // 换日复位路径应同步退出框选模式
+  const dayReset = appJs.slice(appJs.indexOf('hourDayKey = dayKey'), appJs.indexOf('hourDayKey = dayKey') + 200);
+  assert.match(dayReset, /setHourSelectMode\(false\)/, '换日复位时应退出框选模式');
+});
+
+test('小时柱柱体拖拽框选：两级 mode-badge 与框选态列元素齐备', () => {
+  for (const id of ['phModeBadge', 'mhModeBadge']) {
+    assert.ok(indexHtml.includes(`id="${id}"`), `应存在框选模式徽标 #${id}`);
+  }
+  for (const id of ['phSumHint', 'mhSumHint']) {
+    assert.ok(indexHtml.includes(`id="${id}"`), `应存在框选态提示元素 #${id}`);
+  }
+  // 控制器静态契约：不生成自有 DOM / 无网络依赖
+  const ctrlSrc = readFileSync(join(webRoot, 'bar-drag-select.js'), 'utf8');
+  assert.match(ctrlSrc, /window\.BarDragSelect/, '控制器应挂 window.BarDragSelect');
+  assert.ok(!ctrlSrc.includes('fetch(') && !ctrlSrc.includes('XMLHttpRequest'), '控制器不应有网络依赖');
+  assert.ok(!ctrlSrc.includes('innerHTML'), '控制器不应生成自有 DOM');
 });
