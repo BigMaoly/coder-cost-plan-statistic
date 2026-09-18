@@ -223,6 +223,12 @@
   .ht-cols .ht-avg, .ht-cols .ht-val, .ht-cols .ht-pct { color: var(--muted); font-weight: 500; }
   .ht-avg { flex: none; width: 58px; text-align: right; color: var(--teal); font-weight: 600; }
   .ht-fixed { flex: none; width: 52px; text-align: right; }
+  /* 默认态行（hourly-avg-active-hours）：名称右侧「出现小时数」缀 —— 该行「平均/h」的分母，各行不同。
+     仅默认态行走 .ht-name-hours 结构（内部 .t 省略号 + .h 小时缀，flex:1 宽度行为与 .ht-name
+     完全一致，列头行 .ht-cols 不受影响、四列天然对齐）；悬浮 / 框选行不受影响 */
+  .ht-name.ht-name-hours { display: flex; align-items: center; gap: 5px; }
+  .ht-name.ht-name-hours .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ht-name.ht-name-hours .h { flex: none; font-size: 10px; font-weight: 500; color: var(--muted); }
   .ht-list::-webkit-scrollbar { width: 6px; }
   .ht-list::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, .28); border-radius: 3px; }
   /* 时段汇总（时间轴下方，随选区实时重算） */
@@ -339,6 +345,46 @@
     background: var(--muted); transition: .18s;
   }
   .switch.on { border-color: rgba(45, 212, 191, .55); background: rgba(45, 212, 191, .22); }
+
+  /* ===== 自定义扫描目录（custom-scan-roots）：sr- 前缀构件 ===== */
+  .sr-list { border-right: 1px solid var(--border); padding: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .sr-group-head { display: flex; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); padding: 4px 2px 0; }
+  .sr-group-head .sr-count { margin-left: auto; font-size: 11.5px; }
+  .sr-item { border: 1px solid var(--border); border-radius: 11px; padding: 10px 12px; background: var(--panel-2); transition: .15s; }
+  .sr-item.clickable { cursor: pointer; }
+  .sr-item.clickable:hover { border-color: #2c3f66; }
+  .sr-item.active { border-color: rgba(45, 212, 191, .55); background: var(--teal-soft); }
+  .sr-item .sr-top { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
+  .sr-item .sr-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sr-item .sr-badge { flex: none; font-size: 11px; font-weight: 500; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
+  .sr-item .sr-sub { font-size: 11.5px; color: var(--muted); margin-top: 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sr-status { flex: none; margin-left: auto; font-size: 11.5px; font-weight: 500; }
+  .sr-status.ok { color: #2dd4bf; }
+  .sr-status.bad { color: #f87171; }
+  .sr-status.off { color: var(--muted); }
+  .sr-editor { padding: 18px 20px; overflow-y: auto; }
+  .sr-editor h3 { font-size: 16px; font-weight: 600; margin: 0; }
+  .sr-ed-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .sr-ed-note { font-size: 12px; color: var(--muted); line-height: 1.7; border: 1px dashed var(--border); border-radius: 10px; padding: 10px 12px; margin: 10px 0; }
+  .sr-f { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
+  .sr-f label { font-size: 12.5px; font-weight: 600; }
+  .sr-f input, .sr-f select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 9px; padding: 8px 10px; color: var(--text); font-size: 13px; }
+  .sr-f input:focus, .sr-f select:focus { outline: none; border-color: rgba(45, 212, 191, .55); }
+  .sr-f input.bad { border-color: rgba(248, 113, 113, .65); }
+  .sr-f input.good { border-color: rgba(45, 212, 191, .55); }
+  .sr-hint { font-size: 11.5px; color: var(--muted); line-height: 1.6; }
+  .sr-hint.bad { color: #f87171; }
+  .sr-row { display: flex; gap: 8px; align-items: center; }
+  .sr-row input { flex: 1; }
+  .sr-chip { display: inline-block; font-size: 11px; border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--muted); margin-top: 4px; }
+  .sr-probe { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; font-size: 12px; line-height: 1.7; color: var(--muted); margin: 12px 0; }
+  .sr-probe.ok { border-color: rgba(45, 212, 191, .5); background: rgba(45, 212, 191, .08); color: var(--text); }
+  .sr-probe.bad { border-color: rgba(248, 113, 113, .5); background: rgba(248, 113, 113, .08); color: var(--text); }
+  .sr-probe .sr-pb-title { font-weight: 600; margin-bottom: 4px; }
+  .sr-probe.ok .sr-pb-title { color: #2dd4bf; }
+  .sr-probe.bad .sr-pb-title { color: #f87171; }
+  .sr-act { display: flex; gap: 10px; align-items: center; margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--border); }
+  .sr-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .switch.on .knob { left: 19px; background: var(--teal); box-shadow: 0 0 8px rgba(45, 212, 191, .7); }
 
   /* ===== 映射配置弹窗（近全屏） ===== */
@@ -2004,7 +2050,32 @@
         <span class="si-meta" id="settingsBmkMeta">–</span>
         <span class="si-arrow">›</span>
       </div>
+      <div class="settings-item" id="settingsItemRoots" role="button" tabindex="0">
+        <div class="si-ico">📁</div>
+        <div class="si-text">
+          <div class="si-name">自定义扫描目录</div>
+          <div class="si-desc">把本机默认扫描位置之外的软件数据目录（如 WSL 里的 C 盘用户目录 / 自定义安装目录）挂成独立统计工具，与默认位置互不干扰</div>
+        </div>
+        <span class="si-meta" id="settingsRootsMeta">–</span>
+        <span class="si-arrow">›</span>
+      </div>
       <div class="ed-hint" style="padding:10px 2px 0">更多设置项后续加入，统一由此进入。</div>
+    </div>
+  </div>
+</div>
+
+<!-- 自定义扫描目录弹窗（custom-scan-roots，近全屏：左侧列表 + 右侧编辑器） -->
+<div class="modal-mask" id="scanRootsModal" hidden>
+  <div class="modal" role="dialog" aria-label="自定义扫描目录">
+    <div class="modal-head">
+      <h2>自定义扫描目录</h2>
+      <span class="muted">每个条目 = 一个软件根目录 + 一个适配器，落库为独立统计工具（tool）</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn ghost" id="scanRootsCloseBtn">关闭 ✕</button>
+    </div>
+    <div class="modal-body">
+      <aside class="sr-list" id="srList"></aside>
+      <section class="sr-editor" id="srEditor"></section>
     </div>
   </div>
 </div>
@@ -2201,6 +2272,8 @@
 <!-- 可搜索下拉组件（变更 score-picker-and-backup）：评分维度的候选控件，无业务依赖，必须在 score.js 之前 -->
 <script src="./score-combobox.js"></script>
 <script src="./score.js"></script>
+<!-- 自定义扫描目录（custom-scan-roots）：设置弹窗入口 + 配置弹窗装配；复用 app.js 暴露的 window.showToast -->
+<script src="./scan-roots.js"></script>
 
 <!-- 手动录入窗口（manual-quota-snapshot）：三段式对齐额度估计配置窗口 -->
 <div class="modal-mask me-entry-mask" id="meEntryMask" hidden>

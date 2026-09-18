@@ -44,6 +44,22 @@ export function dshSessionsRoot(env = process.env) {
   return join(env.HOME || homedir(), '.dsh', 'sessions');
 }
 
+/** 默认软件根（custom-scan-roots）：重复检测的基准，也是默认层实例化的根 */
+export function defaultRoot(options = {}) {
+  const env = options?.env || process.env;
+  return join(env.HOME || homedir(), '.dsh');
+}
+
+/** 软件根 → 扫描参数 + 探测主路径（纯推导，不做存在性判断；falsy 根返回 null） */
+export function resolveRoot(root) {
+  if (!root) return null;
+  return {
+    paths: { dshSessionsRoot: join(root, 'sessions') },
+    primaryPath: join(root, 'sessions'),
+    kind: 'dir'
+  };
+}
+
 /* ---------------------------------- 解码能力 ---------------------------------- */
 
 let cliZstdProbe; // undefined = 未探测
@@ -258,6 +274,8 @@ export function isDshAvailable(options = {}) {
 export const adapter = {
   id: TOOL,
   label: 'DeepSeek Harness (dsh)',
+  defaultRoot,
+  resolveRoot,
   isAvailable(options) {
     return isDshAvailable(options || {});
   },
@@ -274,10 +292,12 @@ export const adapter = {
  * @returns {{totalFiles, changedFiles, skippedFiles, failures: string[], secondaryUnresolved: number}}
  */
 export function scanSessions(db, sessionsRoot, options = {}) {
+  // tool 维度值 = 注入的工具标识（虚拟工具实例化），未注入回落自身标识（custom-scan-roots）
+  const tool = options.toolId ?? TOOL;
   const files = listSessionFiles(sessionsRoot);
   const previous = new Map(
     db.prepare('SELECT path, size, mtime_ms, content_hash, scanned_offset, scanned_lines, failed FROM file_index WHERE tool = ?')
-      .all(TOOL)
+      .all(tool)
       .map((row) => [row.path, row])
   );
 
@@ -318,7 +338,7 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         stat = { size: Number(st.size), mtimeMs: Number(st.mtimeMs) };
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
@@ -332,13 +352,13 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         hash = sha256File(entry.absPath);
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
       // hash 等值短路：size/mtime 变化但内容相同 → 仅刷新索引，明细零变化
       if (prev && !prev.failed && prev.content_hash === hash) {
-        upsertIndex.run(TOOL, entry.relPath, stat.size, stat.mtimeMs, hash, prev.scanned_offset, prev.scanned_lines, 0);
+        upsertIndex.run(tool, entry.relPath, stat.size, stat.mtimeMs, hash, prev.scanned_offset, prev.scanned_lines, 0);
         continue;
       }
 
@@ -361,25 +381,25 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         const { delegationDepth, records, lineCount } = parseSessionText(text);
         const keepFrom = isAppend ? Number(prev.scanned_lines) : 0;
         // 文件级替换语义：非追加（重建）先删该文件全部明细，杜绝叠加
-        if (!isAppend) deleteRecords.run(TOOL, entry.relPath);
+        if (!isAppend) deleteRecords.run(tool, entry.relPath);
         let unresolved = 0;
         for (const record of records) {
           if (record.lineNo <= keepFrom) continue;
           if (record.unresolved) unresolved += 1;
           insertRecord.run(
-            TOOL, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
+            tool, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
             record.inputOther, record.cacheRead, record.cacheCreation, record.output, delegationDepth > 0 ? 1 : 0
           );
         }
         summary.secondaryUnresolved += unresolved;
         // zstd 水位 = 最后完整帧边界（残帧不消费，下轮经非追加路径重建）；
         // 明文水位 = 最后完整行字节偏移
-        upsertIndex.run(TOOL, entry.relPath, stat.size, stat.mtimeMs, hash, completeEnd, lineCount, 0);
+        upsertIndex.run(tool, entry.relPath, stat.size, stat.mtimeMs, hash, completeEnd, lineCount, 0);
         summary.changedFiles += 1;
       } catch (error) {
         // 解码/读取中途失败：保留旧索引并打 failed，下次不再被短路
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
       }
     }
 
@@ -387,8 +407,8 @@ export function scanSessions(db, sessionsRoot, options = {}) {
     const present = new Set(files.map((f) => f.relPath));
     for (const path of previous.keys()) {
       if (!present.has(path)) {
-        deleteRecords.run(TOOL, path);
-        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(TOOL, path);
+        deleteRecords.run(tool, path);
+        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(tool, path);
         summary.changedFiles += 1;
       }
     }

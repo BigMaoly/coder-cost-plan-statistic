@@ -70,6 +70,11 @@
  * 汇总层新成员：核心层独占写入、write-once、不参与任何既有聚合）+ 索引 idx_hourly_tool_date；
  * app_settings 新增 hourly_since 小时沉淀水位（安装 / 升级当日，写一次永不改写）。
  * 纯增量迁移，存量数据与既有表零改动。
+ * schema v20（custom-scan-roots）：新增虚拟工具配置表 virtual_tools
+ * （tool_id 主键 / adapter_id / root / enabled / created_at_ms / last_scan_ms / last_scan_note）。
+ * 纯用户配置表：由 src/virtual-tools.js 独占读写，不在 clearAllData 清空范围
+ * （与 map_* / plan_* / app_settings 同类）；usage_* / cost_* / 汇总层与完成标记零改动，
+ * 不参与防重复统计与增量统计的任何写入路径。
  */
 
 import { DatabaseSync } from 'node:sqlite';
@@ -79,7 +84,7 @@ import { homedir } from 'node:os';
 import { SCORE_SEED } from './score-seed.js';
 import { localDateKey } from './parser.js';
 
-export const SCHEMA_VERSION = 19;
+export const SCHEMA_VERSION = 20;
 
 /** 运行数据根目录（测试可通过 envOverride 注入临时 HOME） */
 export function dataDir(envOverride = process.env) {
@@ -741,6 +746,23 @@ CREATE INDEX IF NOT EXISTS idx_hourly_tool_date ON usage_hourly (tool, local_dat
 `;
 
 /**
+ * 虚拟工具配置表（custom-scan-roots，schema v20）：纯用户配置，由 src/virtual-tools.js 独占读写。
+ * adapter_id 不设外键——适配器是代码层概念而非表，存在性校验在应用层（resolveScanInstances）；
+ * tool_id 即该统计工具的 tool 标识，进库后不可更改（沿袭 tool 标识不可变铁律）。
+ */
+const VIRTUAL_TOOLS_SQL = `
+CREATE TABLE IF NOT EXISTS virtual_tools (
+  tool_id        TEXT PRIMARY KEY,
+  adapter_id     TEXT NOT NULL,
+  root           TEXT NOT NULL,
+  enabled        INTEGER NOT NULL DEFAULT 1,
+  created_at_ms  INTEGER NOT NULL,
+  last_scan_ms   INTEGER,
+  last_scan_note TEXT
+);
+`;
+
+/**
  * 小时沉淀水位（hourly-archive-drilldown）：首次建库 / 首次迁移到 v19 时写入当日本地日期，
  * INSERT OR IGNORE 幂等 —— 重复迁移 / 重复调用都是空操作，此后永不改写（P1/P2：小时数据
  * 不追溯，早于水位的日期不产生也不补写小时行）。存 app_settings（纯配置 KV）而非
@@ -982,6 +1004,7 @@ export function migrate(db) {
     db.exec(MANUAL_DRAFT_SQL);
     db.exec(HOURLY_SQL);
     ensureHourlySince(db);
+    db.exec(VIRTUAL_TOOLS_SQL);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     return;
   }
@@ -1005,6 +1028,7 @@ export function migrate(db) {
   // v17→v18 quota_snapshots 补 source / end_ms / readings_json 三列 + 新增手动录入草稿表
   //（manual-quota-snapshot，幂等；source 存量行回填 'estimate'，另两列 NULL）
   // v18→v19 建每小时汇总表 + 索引 + 写小时沉淀水位（hourly-archive-drilldown，幂等纯新增）
+  // v19→v20 建虚拟工具配置表（custom-scan-roots，幂等纯新增）
   db.exec('PRAGMA foreign_keys = OFF');
   try {
     runInTransaction(db, () => {
@@ -1052,6 +1076,10 @@ export function migrate(db) {
         // 幂等纯新增，不改既有行数据；水位写一次永不改写）
         db.exec(HOURLY_SQL);
         ensureHourlySince(db);
+      }
+      if (current < 20) {
+        // 建虚拟工具配置表（custom-scan-roots，幂等纯新增，不改既有行数据）
+        db.exec(VIRTUAL_TOOLS_SQL);
       }
       db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     });

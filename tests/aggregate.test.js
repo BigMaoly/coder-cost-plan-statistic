@@ -784,10 +784,13 @@ test('覆盖模式不介入正常模式：无重建标记时复活等值丢弃�
   }
 });
 
-/** 空 sessions 目录 fixture：kimi 可用且扫描零文件，runMaintenance 链路可走通 */
+/** 含一个结构合法 wire.jsonl（无用量行）的 sessions fixture：kimi 样本级判定可用且零用量，
+ *  runMaintenance 链路可走通（custom-scan-roots：仅目录存在判为不足够，须命中来源文件） */
 function emptySessions(root) {
   const sessions = join(root, 'sessions-empty');
-  mkdirSync(sessions, { recursive: true });
+  const wire = join(sessions, 'wd', 'session_x', 'agents', 'main', 'wire.jsonl');
+  mkdirSync(join(sessions, 'wd', 'session_x', 'agents', 'main'), { recursive: true });
+  writeFileSync(wire, '{"type":"config.update","modelAlias":"kimi-code/kimi-for-coding"}\n');
   return sessions;
 }
 

@@ -10,7 +10,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'n
 import { tmpdir } from 'node:os';
 import { openDb } from '../src/store.js';
 import { localDateKey } from '../src/parser.js';
-import { scanCodex, listRolloutFiles, isCodexAvailable, adapter } from '../src/scanners/codex.js';
+import { scanCodex, listRolloutFiles, isCodexAvailable, adapter, codexSessionsRoot } from '../src/scanners/codex.js';
 import { ADAPTERS, availableAdapters } from '../src/scanners/index.js';
 
 function makeFixture() {
@@ -446,6 +446,36 @@ test('listRolloutFiles：递归嵌套目录、只认 rollout-*.jsonl、排序稳
     assert.equal(files.length, 2);
     assert.ok(files[0].relPath < files[1].relPath);
     assert.ok(files.every((f) => f.relPath.includes('rollout-')));
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+/* ===== custom-scan-roots：defaultRoot / resolveRoot 推导与 toolId 注入 ===== */
+
+test('custom-scan-roots：codex defaultRoot / resolveRoot 推导与既有 codexSessionsRoot 一致', () => {
+  assert.equal(adapter.defaultRoot({ env: { HOME: '/h' } }), join('/h', '.codex'));
+  const resolved = adapter.resolveRoot(join('/h', '.codex'));
+  assert.equal(resolved.paths.codexSessionsRoot, join('/h', '.codex', 'sessions'));
+  assert.equal(resolved.primaryPath, resolved.paths.codexSessionsRoot);
+  assert.equal(resolved.kind, 'dir');
+  assert.equal(adapter.resolveRoot(''), null);
+  assert.equal(codexSessionsRoot({ HOME: '/h' }), join('/h', '.codex', 'sessions'));
+});
+
+test('custom-scan-roots：codex scan 尊重 options.toolId（虚拟工具命名空间隔离）', () => {
+  const fx = makeFixture();
+  try {
+    writeFileSync(rolloutPath(fx), [
+      metaLine(),
+      turnContextLine('glm-5.3'),
+      tokenCountLine('2026-09-02T03:01:00.000Z', usage(100, 0, 0, 10))
+    ].join('\n') + '\n');
+    const db = openDb(join(fx.root, 'statistic.db'));
+    const summary = scanCodex(db, { codexSessionsRoot: fx.sessions, toolId: 'x-test' });
+    assert.equal(summary.changedFiles, 1);
+    assert.equal(db.prepare('SELECT tool FROM usage_records').get().tool, 'x-test');
+    assert.equal(db.prepare('SELECT tool FROM file_index').get().tool, 'x-test');
   } finally {
     rmSync(fx.root, { recursive: true, force: true });
   }

@@ -681,7 +681,7 @@ export function discardReconcileEntries(db, ids) {
  *                             applied: number[], stale: number[]}}}
  */
 export function runMaintenance(db, options) {
-  const { sessionsRoot, configTomlPath, codexSessionsRoot, zcodeDbPath, ccsclaudeDbPath, dshSessionsRoot, full, overwriteIncrease } = options;
+  const { sessionsRoot, configTomlPath, codexSessionsRoot, zcodeDbPath, ccsclaudeDbPath, dshSessionsRoot, full, overwriteIncrease, resolveDefaults } = options;
   const today = options.today || todayKey();
 
   // 小时沉淀水位（hourly-archive-drilldown）：开头读一次，rollupDaily 逐日循环复用
@@ -691,7 +691,8 @@ export function runMaintenance(db, options) {
   const quotaReaped = reapStaleRuns(db, today);
 
   // 步骤 1：遍历适配器增量扫描（每个适配器各自事务，失败不阻塞）
-  const tools = runAdapters(db, { sessionsRoot, configTomlPath, codexSessionsRoot, zcodeDbPath, ccsclaudeDbPath, dshSessionsRoot, full });
+  // resolveDefaults 透传（custom-scan-roots）：生产入口经此启用默认根回落，测试不注入则保持封闭
+  const tools = runAdapters(db, { sessionsRoot, configTomlPath, codexSessionsRoot, zcodeDbPath, ccsclaudeDbPath, dshSessionsRoot, full, resolveDefaults });
 
   // 步骤 1.5：固化宽限集合（来自各适配器待补结算队列）
   const graceByTool = new Map();

@@ -565,3 +565,24 @@ test('接线：runMaintenance 全链路注入 dshSessionsRoot 生效（防白名
     rmSync(fx.root, { recursive: true, force: true });
   }
 });
+
+/* ===== custom-scan-roots：defaultRoot / resolveRoot 推导与 toolId 注入 ===== */
+
+test('custom-scan-roots：dsh defaultRoot / resolveRoot 推导与既有默认一致；scan 尊重 toolId', () => {
+  assert.equal(adapter.defaultRoot({ env: { HOME: '/h' } }), join('/h', '.dsh'));
+  const resolved = adapter.resolveRoot(join('/h', '.dsh'));
+  assert.equal(resolved.paths.dshSessionsRoot, join('/h', '.dsh', 'sessions'));
+  assert.equal(resolved.primaryPath, resolved.paths.dshSessionsRoot);
+  assert.equal(resolved.kind, 'dir');
+  assert.equal(adapter.resolveRoot(''), null);
+
+  const fx = makeDb();
+  try {
+    writeSession(fx.root, '--p--', 'a', containerOf([batch1()]));
+    scanSessions(fx.db, fx.root, { toolId: 'x-test' });
+    assert.equal(fx.db.prepare('SELECT tool FROM usage_records').get().tool, 'x-test');
+    assert.equal(fx.db.prepare('SELECT tool FROM file_index').get().tool, 'x-test');
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});

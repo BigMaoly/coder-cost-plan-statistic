@@ -334,3 +334,28 @@ test('可用性：库缺失/表缺失/缺列 → 不可用；注册表元数据�
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ===== custom-scan-roots：defaultRoot / resolveRoot 推导与 toolId 注入 ===== */
+
+test('custom-scan-roots：zcode defaultRoot / resolveRoot 推导与既有默认一致；scan 尊重 toolId', () => {
+  assert.equal(adapter.defaultRoot({ env: { HOME: '/h' } }), join('/h', '.zcode'));
+  const resolved = adapter.resolveRoot(join('/h', '.zcode'));
+  assert.equal(resolved.paths.zcodeDbPath, join('/h', '.zcode', 'cli', 'db', 'db.sqlite'));
+  assert.equal(resolved.primaryPath, resolved.paths.zcodeDbPath);
+  assert.equal(resolved.kind, 'file');
+  assert.equal(adapter.resolveRoot(''), null);
+
+  const fx = makeFixture();
+  const { root, db } = makeDb();
+  try {
+    fx.ins.run('r1', 'p', 'm', 'zcode-agent', 'main_turn', 'completed', T0, 10, 1, 0, 0);
+    const summary = scanZcode(db, { zcodeDbPath: fx.sourcePath, toolId: 'x-test' });
+    assert.equal(summary.changedFiles, 1);
+    assert.equal(db.prepare('SELECT tool FROM usage_records').get().tool, 'x-test');
+    assert.equal(db.prepare('SELECT tool FROM file_index').get().tool, 'x-test');
+  } finally {
+    fx.src.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});

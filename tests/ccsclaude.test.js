@@ -322,3 +322,28 @@ test('adapter-config 目录在扫描时自动生成于 dataDirOverride 之下（
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ===== custom-scan-roots：defaultRoot / resolveRoot 推导与 toolId 注入 ===== */
+
+test('custom-scan-roots：ccsclaude defaultRoot / resolveRoot 推导与既有默认一致；scan 尊重 toolId', () => {
+  assert.equal(adapter.defaultRoot({ env: { HOME: '/h' } }), join('/h', '.cc-switch'));
+  const resolved = adapter.resolveRoot(join('/h', '.cc-switch'));
+  assert.equal(resolved.paths.ccsclaudeDbPath, join('/h', '.cc-switch', 'cc-switch.db'));
+  assert.equal(resolved.primaryPath, resolved.paths.ccsclaudeDbPath);
+  assert.equal(resolved.kind, 'file');
+  assert.equal(adapter.resolveRoot(''), null);
+
+  const fx = makeFixture();
+  const { root, db } = makeDb();
+  try {
+    insertLog(fx, proxyRow());
+    const summary = scanCcsclaude(db, { ccsclaudeDbPath: fx.sourcePath, dataDirOverride: root, toolId: 'x-test' });
+    assert.equal(summary.changedFiles, 1);
+    assert.equal(db.prepare('SELECT tool FROM usage_records').get().tool, 'x-test');
+    assert.equal(db.prepare('SELECT tool FROM file_index').get().tool, 'x-test');
+  } finally {
+    fx.src.close();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});

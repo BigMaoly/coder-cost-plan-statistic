@@ -47,9 +47,27 @@ export function zcodeDbPath(env = process.env) {
   return join(env.HOME || homedir(), '.zcode', 'cli', 'db', 'db.sqlite');
 }
 
+/** 默认软件根（custom-scan-roots）：重复检测的基准，也是默认层实例化的根 */
+export function defaultRoot(options = {}) {
+  const env = options?.env || process.env;
+  return join(env.HOME || homedir(), '.zcode');
+}
+
+/** 软件根 → 扫描参数 + 探测主路径（纯推导，不做存在性判断；falsy 根返回 null） */
+export function resolveRoot(root) {
+  if (!root) return null;
+  return {
+    paths: { zcodeDbPath: join(root, 'cli', 'db', 'db.sqlite') },
+    primaryPath: join(root, 'cli', 'db', 'db.sqlite'),
+    kind: 'file'
+  };
+}
+
 export const adapter = {
   id: TOOL,
   label: 'ZCode',
+  defaultRoot,
+  resolveRoot,
   isAvailable(options) {
     return isZcodeAvailable(options?.zcodeDbPath);
   },
@@ -89,11 +107,11 @@ function openSource(path) {
   }
 }
 
-/** 读待补结算队列：[{rid, startedAt}]；损坏/缺失按空队列处理 */
-function readPendingQueue(db) {
+/** 读待补结算队列：[{rid, startedAt}]；损坏/缺失按空队列处理（队列按 tool 隔离） */
+function readPendingQueue(db, tool) {
   const row = db.prepare(
     'SELECT value FROM maintenance_state WHERE kind = ? AND tool = ? AND period = ?'
-  ).get(PENDING_KIND, TOOL, PENDING_PERIOD);
+  ).get(PENDING_KIND, tool, PENDING_PERIOD);
   if (!row?.value) return [];
   try {
     const parsed = JSON.parse(row.value);
@@ -105,11 +123,11 @@ function readPendingQueue(db) {
   }
 }
 
-function writePendingQueue(db, queue) {
+function writePendingQueue(db, tool, queue) {
   db.prepare(
     `INSERT INTO maintenance_state (kind, tool, period, done_at_ms, value) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(kind, tool, period) DO UPDATE SET done_at_ms = excluded.done_at_ms, value = excluded.value`
-  ).run(PENDING_KIND, TOOL, PENDING_PERIOD, Date.now(), JSON.stringify(queue));
+  ).run(PENDING_KIND, tool, PENDING_PERIOD, Date.now(), JSON.stringify(queue));
 }
 
 /**
@@ -120,6 +138,8 @@ function writePendingQueue(db, queue) {
  *            pendingCount: number, queueDrop: number, pendingDays: string[]}}
  */
 export function scanZcode(db, options = {}) {
+  // tool 维度值 = 注入的工具标识（虚拟工具实例化），未注入回落自身标识（custom-scan-roots）
+  const tool = options.toolId ?? TOOL;
   const sourcePath = options.zcodeDbPath || zcodeDbPath();
   const src = openSource(sourcePath);
   const staleBefore = Date.now() - STALE_RUNNING_MS;
@@ -138,13 +158,13 @@ export function scanZcode(db, options = {}) {
     // 核心入口先整库快照（失败即抛错中止），再清空本工具明细/水位/待补队列并置
     // 重建模式标记；日/月汇总与完成标记只读不动（rebuild-rollup-protection D1）。
     const prevIndex = db.prepare('SELECT scanned_lines FROM file_index WHERE tool = ? AND path = ?')
-      .get(TOOL, SOURCE_PATH);
+      .get(tool, SOURCE_PATH);
     const prevWatermark = prevIndex ? Number(prevIndex.scanned_lines) : 0;
     const maxRowProbe = src.prepare('SELECT MAX(rowid) AS max_id, COUNT(*) AS total FROM model_usage').get();
     const probeMaxId = maxRowProbe?.max_id == null ? 0 : Number(maxRowProbe.max_id);
     const rebuilt = probeMaxId < prevWatermark;
     if (rebuilt) {
-      beginToolRebuild(db, TOOL);
+      beginToolRebuild(db, tool);
     }
 
     runInTransaction(db, () => {
@@ -153,7 +173,7 @@ export function scanZcode(db, options = {}) {
       summary.totalFiles = Number(maxRowProbe?.total || 0);
       let from = watermark;
       // 仍 running 的僵尸队列行（本轮继续保留）；重建后轮次队列已被核心入口清空
-      let queue = readPendingQueue(db);
+      let queue = readPendingQueue(db, tool);
 
       // 待补结算复查：上轮越过的僵尸 running 行，定型即补扫入库一次
       if (queue.length > 0) {
@@ -176,7 +196,7 @@ export function scanZcode(db, options = {}) {
             nextQueue.push(entry); // 仍未定型，继续跟踪
             continue;
           }
-          settleRow(db, row, summary);
+          settleRow(db, tool, row, summary);
         }
         queue = nextQueue;
       }
@@ -219,14 +239,14 @@ export function scanZcode(db, options = {}) {
           continue;
         }
         insertRecord.run(
-          TOOL, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
+          tool, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
           record.inputOther, record.cacheRead, record.cacheCreation, record.output, record.isSubagent ? 1 : 0
         );
         summary.changedFiles += 1;
       }
 
-      writePendingQueue(db, queue);
-      upsertIndex.run(TOOL, SOURCE_PATH, maxId, to, to);
+      writePendingQueue(db, tool, queue);
+      upsertIndex.run(tool, SOURCE_PATH, maxId, to, to);
       summary.pendingCount = queue.length;
       summary.pendingDays = [...new Set(queue.map((e) => localDateKey(e.startedAt)))];
       summary.oldestPendingStartedAt = queue.length ? Math.min(...queue.map((e) => e.startedAt)) : null;
@@ -238,8 +258,8 @@ export function scanZcode(db, options = {}) {
   }
 }
 
-/** 待补结算复查中的定型行入库（与增量循环同一套换算与主键） */
-function settleRow(db, row, summary) {
+/** 待补结算复查中的定型行入库（与增量循环同一套换算与主键；tool 维度随实例注入） */
+function settleRow(db, tool, row, summary) {
   // 定型后仍是标题旁路调用则直接出队不计用量（与增量口径一致）
   if (row.query_source === 'session_title') return;
   const record = toRecord(row);
@@ -253,7 +273,7 @@ function settleRow(db, row, summary) {
         input_other, cache_read, cache_creation, output, is_subagent)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
-    TOOL, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
+    tool, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
     record.inputOther, record.cacheRead, record.cacheCreation, record.output, record.isSubagent ? 1 : 0
   );
   summary.changedFiles += 1;

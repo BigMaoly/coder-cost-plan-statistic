@@ -1684,3 +1684,73 @@ test('schema v19：v18 存量库递进建表写水位（幂等，值不变），
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/* ===== schema v20（custom-scan-roots）：虚拟工具配置表 ===== */
+
+test('schema v20：全新库建 virtual_tools 表，clearAllData 不清空该配置表', () => {
+  const root = makeRoot();
+  try {
+    const db = openDb(join(root, 'statistic.db'));
+    assert.equal(SCHEMA_VERSION, 20);
+    assert.equal(db.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols = db.prepare('PRAGMA table_info(virtual_tools)').all().map((c) => c.name);
+    for (const col of ['tool_id', 'adapter_id', 'root', 'enabled', 'created_at_ms', 'last_scan_ms', 'last_scan_note']) {
+      assert.ok(cols.includes(col), 'virtual_tools 应含 ' + col + ' 列');
+    }
+    // 写入一条配置后 clearAllData：统计表清空、配置保留（用户配置不在清空范围）
+    db.prepare(
+      `INSERT INTO virtual_tools (tool_id, adapter_id, root, enabled, created_at_ms)
+       VALUES ('kimicode-win', 'kimi', '/tmp/x/.kimi-code', 1, 1)`
+    ).run();
+    db.prepare(
+      `INSERT INTO usage_records (tool, file_path, line_no, model, provider, ts_ms, local_date,
+         input_other, cache_read, cache_creation, output, is_subagent)
+       VALUES ('kimicode-win', 'f', 1, 'm', 'p', 0, '2026-09-02', 1, 0, 0, 0, 0)`
+    ).run();
+    clearAllData(db);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM usage_records').get().c, 0);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 1);
+    // clearToolData 对虚拟工具同样按 tool 精确（此处验证内置工具不受虚拟配置影响）
+    clearToolData(db, 'kimicode-win');
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 1);
+    db.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('schema v20：v19 存量库递进建 virtual_tools（幂等），存量数据无损', () => {
+  const root = makeRoot();
+  try {
+    const dbPath = join(root, 'statistic.db');
+    // 先用当前代码建库写样本，再降级为 v19 形态（无 virtual_tools）
+    const db = openDb(dbPath);
+    db.prepare(
+      `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', '2026-09-02', 'p', 'm', 10, 100, 0, 20, 2)`
+    ).run();
+    db.close();
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('DROP TABLE virtual_tools; PRAGMA user_version = 19;');
+    raw.close();
+
+    // 首次迁移：建表
+    const migrated = openDb(dbPath);
+    assert.equal(migrated.prepare('PRAGMA user_version').get().user_version, SCHEMA_VERSION);
+    const cols = migrated.prepare('PRAGMA table_info(virtual_tools)').all().map((c) => c.name);
+    assert.ok(cols.includes('tool_id') && cols.includes('adapter_id') && cols.includes('root'));
+    const daily = migrated.prepare('SELECT input_other FROM usage_daily').get();
+    assert.equal(daily.input_other, 10); // 存量无损
+    migrated.close();
+
+    // 幂等：写一行配置后降版本重开，迁移重跑不清数据
+    const seed = new DatabaseSync(dbPath);
+    seed.exec("INSERT INTO virtual_tools (tool_id, adapter_id, root, enabled, created_at_ms) VALUES ('v', 'kimi', '/tmp/v', 1, 1); PRAGMA user_version = 19;");
+    seed.close();
+    const again = openDb(dbPath);
+    assert.equal(again.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 1);
+    again.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

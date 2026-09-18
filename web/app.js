@@ -356,7 +356,12 @@
       for (const t of data.tools || []) toolLabels[t.id] = t.label;
       toolLabels.all = '全部平台';
       toolIds = (data.tools || []).map((t) => t.id);
-      toolMsel.setOptions(toolIds.map((id) => ({ value: id, label: toolLabels[id] || id })));
+      // 停用的虚拟工具仍在列表（历史数据可查），下拉项标注「已停用」（custom-scan-roots）
+      const disabled = new Set((data.tools || []).filter((t) => t.enabled === false).map((t) => t.id));
+      toolMsel.setOptions(toolIds.map((id) => ({
+        value: id,
+        label: (toolLabels[id] || id) + (disabled.has(id) ? '（已停用）' : '')
+      })));
     } catch (error) {
       console.error('平台列表加载失败', error);
       toolLabels.kimi = toolLabels.kimi || 'Kimi Code';
@@ -954,7 +959,8 @@
       },
       /**
        * 图表主体外部左侧的固定信息浮窗（半透明、不跟随鼠标、不遮挡柱体）：
-       * 默认态 = 本范围各维度构成；悬浮态 = 该小时各维度「名称：用量（占本时段 xx%）」+ 本时段总量。
+       * 默认态 = 本范围各维度四列构成（名称含出现小时数缀 | 平均/h | 总 token | 占比，hourly-avg-active-hours）；
+       * 悬浮态 = 该小时各维度「名称：用量（占本时段 xx%）」+ 本时段总量；框选态 = 选中范围构成。
        */
       renderTip() {
         const tip = $(cfg.tipId);
@@ -969,6 +975,17 @@
           '<div class="ht-row"><span class="ht-sw" style="background:' + color + '"></span>' +
           '<span class="ht-name" title="' + esc(name) + '">' + esc(name) + '</span>' +
           '<span class="ht-avg">' + HR.fmtPerHour(hours > 0 ? v / hours : 0) + '</span>' +
+          '<span class="ht-val ht-fixed">' + fmtFull(v) + '</span>' +
+          '<span class="ht-pct">' + share(v, t) + '</span></div>';
+        // 默认态行（hourly-avg-active-hours）：名称（带出现小时数缀）| 平均/h | 总 token | 占比 ——
+        // 分母 = 该维度当天出现（有用量）的不同小时数（各行不同：kimi 8/9/13/15 点 → 4；glm 8/11/14 → 3）；
+        // 平均/h 单元格悬浮给精确算式，名称格悬浮给「出现 n 个小时」；0 小时 → fmtPerHour 占位符，不除零
+        const defRow = (name, color, v, t, hours) =>
+          '<div class="ht-row"><span class="ht-sw" style="background:' + color + '"></span>' +
+          '<span class="ht-name ht-name-hours" title="' + esc(name) + ' · 出现 ' + hours + ' 个小时">' +
+          '<span class="t">' + esc(name) + '</span><span class="h">' + hours + 'h</span></span>' +
+          '<span class="ht-avg" title="' + esc(fmtFull(v)) + ' ÷ ' + hours + ' 小时">' +
+          HR.fmtPerHour(hours > 0 ? v / hours : 0) + '</span>' +
           '<span class="ht-val ht-fixed">' + fmtFull(v) + '</span>' +
           '<span class="ht-pct">' + share(v, t) + '</span></div>';
         // 框选模式（拖拽中或已锁定）：浮窗固定展示选中范围的整体构成，悬浮已停用
@@ -991,14 +1008,16 @@
             '<div class="ht-list">' + rows.map((r) => rangeRow(r.key, r.color, r.v, vSum, hours)).join('') + '</div>';
           return;
         }
+        // 默认态（非框选、非悬浮，hourly-avg-active-hours）：四列构成 —— 分母 = 该维度出现的不同小时数
+        // （HR.activeHoursOf，与柱状图同一份 matrix），列头行与框选态同构；不放操作说明文字行
         if (block.hoverIndex === null || block.hoverIndex === undefined) {
           const total = block.totalsByDim.reduce((acc, v) => acc + v, 0);
           const rows = block.dims
-            .map((d, i) => ({ key: d.key, color: d.color, v: block.totalsByDim[i] }))
+            .map((d, i) => ({ key: d.key, color: d.color, v: block.totalsByDim[i], hours: HR.activeHoursOf(block.matrix[i]) }))
             .sort((a, b) => b.v - a.v);
           tip.innerHTML = '<div class="ht-head">本范围构成</div>' +
-            '<div class="ht-hint">悬浮柱体 → 该时段构成<br>拖时间轴 → 收窄下方汇总</div>' +
-            '<div class="ht-list">' + rows.map((r) => row(r.key, r.color, r.v, total)).join('') + '</div>';
+            '<div class="ht-cols"><span class="ht-name">构成项</span><span class="ht-avg">平均/h</span><span class="ht-val ht-fixed">总 token</span><span class="ht-pct">占比</span></div>' +
+            '<div class="ht-list">' + rows.map((r) => defRow(r.key, r.color, r.v, total, r.hours)).join('') + '</div>';
           return;
         }
         const i = block.hoverIndex;
@@ -1577,6 +1596,7 @@
     // 套餐 / 费用模板 meta 容错加载：失败不阻塞设置框打开
     loadPlans().then(renderPlanBadge).catch((e) => console.error('套餐配置加载失败', e));
     loadTemplates().then(renderTemplateBadge).catch((e) => console.error('费用模板加载失败', e));
+    if (window.scanRoots) window.scanRoots.refreshMeta(); // 自定义扫描目录条数（custom-scan-roots）
     $('settingsModal').hidden = false;
   }
   function closeSettingsModal() {

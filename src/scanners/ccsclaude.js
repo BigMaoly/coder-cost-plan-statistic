@@ -48,9 +48,27 @@ export function ccswitchDbPath(env = process.env) {
   return join(env.HOME || homedir(), '.cc-switch', 'cc-switch.db');
 }
 
+/** 默认软件根（custom-scan-roots）：重复检测的基准，也是默认层实例化的根 */
+export function defaultRoot(options = {}) {
+  const env = options?.env || process.env;
+  return join(env.HOME || homedir(), '.cc-switch');
+}
+
+/** 软件根 → 扫描参数 + 探测主路径（纯推导，不做存在性判断；falsy 根返回 null） */
+export function resolveRoot(root) {
+  if (!root) return null;
+  return {
+    paths: { ccsclaudeDbPath: join(root, 'cc-switch.db') },
+    primaryPath: join(root, 'cc-switch.db'),
+    kind: 'file'
+  };
+}
+
 export const adapter = {
   id: TOOL,
   label: 'CCS Claude',
+  defaultRoot,
+  resolveRoot,
   isAvailable(options) {
     return isCcsclaudeAvailable(options || {});
   },
@@ -95,10 +113,10 @@ function openSource(path) {
   }
 }
 
-function readAnchor(db) {
+function readAnchor(db, tool) {
   const row = db.prepare(
     'SELECT value FROM maintenance_state WHERE kind = ? AND tool = ? AND period = ?'
-  ).get(ANCHOR_KIND, TOOL, ANCHOR_PERIOD);
+  ).get(ANCHOR_KIND, tool, ANCHOR_PERIOD);
   if (!row?.value) return null;
   try {
     const parsed = JSON.parse(row.value);
@@ -109,11 +127,11 @@ function readAnchor(db) {
   }
 }
 
-function writeAnchor(db, watermarkRowid, lastRequestId) {
+function writeAnchor(db, tool, watermarkRowid, lastRequestId) {
   db.prepare(
     `INSERT INTO maintenance_state (kind, tool, period, done_at_ms, value) VALUES (?, ?, ?, ?, ?)
      ON CONFLICT(kind, tool, period) DO UPDATE SET done_at_ms = excluded.done_at_ms, value = excluded.value`
-  ).run(ANCHOR_KIND, TOOL, ANCHOR_PERIOD, Date.now(), JSON.stringify({ watermarkRowid, lastRequestId }));
+  ).run(ANCHOR_KIND, tool, ANCHOR_PERIOD, Date.now(), JSON.stringify({ watermarkRowid, lastRequestId }));
 }
 
 /**
@@ -125,6 +143,8 @@ function writeAnchor(db, watermarkRowid, lastRequestId) {
  *            rebuilt: boolean, benignGap: boolean, filteredSessionRows: number}}
  */
 export function scanCcsclaude(db, options = {}) {
+  // tool 维度值 = 注入的工具标识（虚拟工具实例化），未注入回落自身标识（custom-scan-roots）
+  const tool = options.toolId ?? TOOL;
   const sourcePath = options.ccsclaudeDbPath || ccswitchDbPath();
   const { config, warnings } = loadAdapterClaudeConfig(options.dataDirOverride || undefined);
   const summary = {
@@ -141,9 +161,9 @@ export function scanCcsclaude(db, options = {}) {
   try {
     // ---- 事务外健康检查（三判据，design D7；重建委托核心编排，先快照后清明细）----
     const prevIndex = db.prepare('SELECT scanned_lines FROM file_index WHERE tool = ? AND path = ?')
-      .get(TOOL, SOURCE_PATH);
+      .get(tool, SOURCE_PATH);
     const prevWatermark = prevIndex ? Number(prevIndex.scanned_lines) : 0;
-    const anchor = readAnchor(db);
+    const anchor = readAnchor(db, tool);
     const probe = src.prepare('SELECT MAX(rowid) AS max_id, COUNT(*) AS total FROM proxy_request_logs').get();
     const maxId = probe?.max_id == null ? 0 : Number(probe.max_id);
     summary.totalFiles = Number(probe?.total || 0);
@@ -164,7 +184,7 @@ export function scanCcsclaude(db, options = {}) {
     }
     if (rebuilt) {
       summary.rebuilt = true;
-      beginToolRebuild(db, TOOL);
+      beginToolRebuild(db, tool);
     }
 
     // ---- 可选列探测（版本漂移降级：pricing_model / input_token_semantics）----
@@ -245,19 +265,19 @@ export function scanCcsclaude(db, options = {}) {
           continue;
         }
         insertRecord.run(
-          TOOL, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
+          tool, SOURCE_PATH, Number(row.rid), record.model, record.provider, record.tsMs, record.localDate,
           record.inputOther, record.cacheRead, record.cacheCreation, record.output, record.isSubagent ? 1 : 0
         );
         summary.changedFiles += 1;
       }
 
       // 水位推进到本轮探测的全表 max rowid（含非 claude 行；上界封顶防止探针后新插入行的 PK 冲突）
-      upsertIndex.run(TOOL, SOURCE_PATH, maxId, maxId, maxId);
+      upsertIndex.run(tool, SOURCE_PATH, maxId, maxId, maxId);
       // 锚点与水位同事务写入：水位处行的 request_id 是下轮判据二/三的比对基准（与 app_type 无关）
       const anchorRow = maxId > 0
         ? src.prepare('SELECT request_id FROM proxy_request_logs WHERE rowid = ?').get(maxId)
         : null;
-      writeAnchor(db, maxId, anchorRow ? String(anchorRow.request_id) : null);
+      writeAnchor(db, tool, maxId, anchorRow ? String(anchorRow.request_id) : null);
     });
 
     summary.skippedFiles = summary.failures.length;

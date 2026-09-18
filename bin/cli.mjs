@@ -14,37 +14,51 @@
 
 import { Command, Option } from 'commander';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
-import { homedir } from 'node:os';
-import { openDb, clearAllData, snapshotDb, clearToolData } from '../src/store.js';
+import { existsSync } from 'node:fs';
+import { DatabaseSync } from 'node:sqlite';
+import { openDb, clearAllData, snapshotDb, clearToolData, dbFilePath } from '../src/store.js';
 import { runMaintenance } from '../src/aggregate.js';
-import { ADAPTERS, availableAdapters, implementedAdapters } from '../src/scanners/index.js';
+import { availableAdapters, implementedAdapters } from '../src/scanners/index.js';
+import { dynamicToolWhitelist } from '../src/virtual-tools.js';
 import { startWebCommand, stopWebCommand, statusWebCommand } from '../src/daemon.js';
 
 const require = createRequire(import.meta.url);
 const PKG_VERSION = require('../package.json').version;
 
-const SESSIONS_DIR = join(homedir(), '.kimi-code', 'sessions');
-const CONFIG_TOML = join(homedir(), '.kimi-code', 'config.toml');
-const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
-const DSH_SESSIONS_DIR = join(homedir(), '.dsh', 'sessions');
+// 默认层路径不再在启动期固化（custom-scan-roots）：适配器在每轮维护时按当前状态
+// 经 defaultRoot → resolveRoot 自行解析；resolveDefaults = true 是生产入口的显式启用标记
+// （既有测试不注入该标记，保持其封闭性，绝不触碰真实数据源）。
+const MAINTENANCE_OPTIONS = { resolveDefaults: true };
 
-/** 全部平台数据源都不可用时的中文报错退出（任一可用即放行，可用性差异由摘要提示） */
+/** 全部平台数据源都不可用时的中文报错退出（任一可用即放行，可用性差异由摘要提示）。
+ *  报错遍历与默认层实例同口径（implementedAdapters，占位适配器不再单独提示）。 */
 function ensureAnyAdapterAvailable() {
-  const maintenanceOptions = { sessionsRoot: SESSIONS_DIR, configTomlPath: CONFIG_TOML, codexSessionsRoot: CODEX_SESSIONS_DIR, dshSessionsRoot: DSH_SESSIONS_DIR };
-  if (availableAdapters(maintenanceOptions).length > 0) return maintenanceOptions;
+  if (availableAdapters(MAINTENANCE_OPTIONS).length > 0) return MAINTENANCE_OPTIONS;
   console.error('错误：未找到任何可统计的平台数据源：');
-  for (const adapter of ADAPTERS) {
-    if (adapter.implemented === false) {
-      console.error(`  - ${adapter.label}（${adapter.id}）：尚未实现`);
-      continue;
-    }
+  for (const adapter of implementedAdapters()) {
     let available = false;
-    try { available = adapter.isAvailable(maintenanceOptions); } catch { available = false; }
+    try { available = adapter.isAvailable(MAINTENANCE_OPTIONS); } catch { available = false; }
     console.error(`  - ${adapter.label}（${adapter.id}）：${available ? '可用' : '数据源不可用'}`);
   }
   console.error('请确认已安装并使用过相应工具后再试。');
   process.exit(1);
+}
+
+/** 帮助文案的可用工具列表（动态：注册表已实现工具 ∪ 虚拟工具配置）。
+ *  只读打开既有库，避免 --help 产生建库/迁移副作用；任何失败回落静态注册表。 */
+function listToolIdsForHelp() {
+  try {
+    const file = dbFilePath();
+    if (!existsSync(file)) return implementedAdapters().map((a) => a.id);
+    const db = new DatabaseSync(file, { readOnly: true });
+    try {
+      return dynamicToolWhitelist(db).filter((id) => id !== 'all');
+    } finally {
+      db.close();
+    }
+  } catch {
+    return implementedAdapters().map((a) => a.id);
+  }
 }
 
 /** 条目五数值合计（tokens 总量，展示用） */
@@ -120,14 +134,20 @@ const data = program.command('data').description('统计数据管理');
 data
   .command('init')
   .description('全量重建统计数据（首次安装或需要重新全量覆盖扫描时使用）')
-  .addOption(
-    // 取值来自适配器注册表：帮助自动列出已实现工具，新增适配器注册后自动出现
-    new Option('-t, --tool <工具>', '只重建指定工具的统计数据（其余工具不受影响）')
-      .choices(implementedAdapters().map((a) => a.id))
-  )
+  // 取值动态 = 注册表已实现工具 ∪ 虚拟工具配置（custom-scan-roots）：构造期无 DB，
+  // 故不用 .choices()，改为 action 内经 dynamicToolWhitelist 校验，--help 尾部动态列出
+  .option('-t, --tool <工具>', '只重建指定工具的统计数据（其余工具不受影响，可选值见 --help 尾部）')
+  .addHelpText('after', () => `\n可用工具标识（-t）：${listToolIdsForHelp().join(' / ')}（含当前已配置的虚拟工具）`)
   .action((opts) => {
     const maintenanceOptions = ensureAnyAdapterAvailable();
     const db = openDb();
+    if (opts.tool) {
+      const whitelist = dynamicToolWhitelist(db);
+      if (!whitelist.includes(opts.tool)) {
+        console.error(`错误：未知工具 ${opts.tool}（可选 ${whitelist.join(' / ')}）`);
+        process.exit(1);
+      }
+    }
     // 一切清空类操作无快照不执行（rebuild-rollup-protection）
     const snapshot = snapshotDb(db);
     console.log(`已完成整库快照：${snapshot}`);
@@ -166,7 +186,7 @@ data
 const web = program.command('web').description('启动本地统计面板服务（后台运行，不阻塞前台）');
 web
   .action(() => {
-    startWebCommand({ sessionsRoot: SESSIONS_DIR, configTomlPath: CONFIG_TOML, codexSessionsRoot: CODEX_SESSIONS_DIR, dshSessionsRoot: DSH_SESSIONS_DIR });
+    startWebCommand({ ...MAINTENANCE_OPTIONS });
   });
 web
   .command('stop')

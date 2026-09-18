@@ -14,6 +14,7 @@
 import { createHash } from 'node:crypto';
 import { openSync, readSync, closeSync, statSync, readdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { parseUsageLine, extractModelAlias, splitProvider, readSecondaryModelAliasFromToml } from '../parser.js';
 import { runInTransaction } from '../store.js';
 
@@ -21,14 +22,67 @@ export const TOOL = 'kimi';
 
 const READ_CHUNK_BYTES = 1024 * 1024;
 
+/** 默认软件根（custom-scan-roots）：重复检测的基准，也是默认层实例化的根 */
+export function defaultRoot(options = {}) {
+  const env = options?.env || process.env;
+  return join(env.HOME || homedir(), '.kimi-code');
+}
+
+/** 软件根 → 扫描参数 + 探测主路径（纯推导，不做存在性判断；falsy 根返回 null） */
+export function resolveRoot(root) {
+  if (!root) return null;
+  return {
+    paths: { sessionsRoot: join(root, 'sessions'), configTomlPath: join(root, 'config.toml') },
+    primaryPath: join(root, 'sessions'),
+    kind: 'dir'
+  };
+}
+
+/** 路径解析三级优先（custom-scan-roots D4）：① 显式注入（CLI/测试）② 默认根（生产入口
+ *  以 options.resolveDefaults 显式启用回落）——不启用时不回落，保证既有测试封闭性 */
+function pathsFor(options) {
+  const opts = options || {};
+  if (opts.sessionsRoot) return { sessionsRoot: opts.sessionsRoot, configTomlPath: opts.configTomlPath };
+  if (!opts.resolveDefaults) return null;
+  const root = defaultRoot(opts);
+  return root ? resolveRoot(root).paths : null;
+}
+
+/** 样本级可用性：早退遍历命中任一「session_ 目录 / agents 子目录 / wire.jsonl」即可用
+ *  （D5：仅目录存在判为不足够，否则跨适配器误配会得到 0 数据僵尸条目） */
+function hasWireSample(sessionsRoot) {
+  if (!sessionsRoot || !existsSync(sessionsRoot)) return false;
+  for (const workspace of readdirSafe(sessionsRoot)) {
+    const workspaceDir = join(sessionsRoot, workspace);
+    for (const session of readdirSafe(workspaceDir)) {
+      if (!session.startsWith('session_')) continue;
+      const agentsDir = join(workspaceDir, session, 'agents');
+      for (const agent of readdirSafe(agentsDir)) {
+        const wirePath = join(agentsDir, agent, 'wire.jsonl');
+        if (!existsSync(wirePath)) continue;
+        try {
+          if (statSync(wirePath).isFile()) return true;
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 export const adapter = {
   id: TOOL,
   label: 'Kimi Code',
+  defaultRoot,
+  resolveRoot,
   isAvailable(options) {
-    return Boolean(options?.sessionsRoot) && existsSync(options.sessionsRoot);
+    const paths = pathsFor(options);
+    return Boolean(paths?.sessionsRoot) && hasWireSample(paths.sessionsRoot);
   },
   scan(db, options) {
-    return scanSessions(db, options.sessionsRoot, options);
+    const paths = pathsFor(options);
+    return scanSessions(db, paths?.sessionsRoot, options);
   }
 };
 
@@ -165,10 +219,12 @@ export function scanWireFile(absPath, prev, stat) {
  * @returns {{totalFiles, changedFiles, skippedFiles, failures: string[], secondaryUnresolved: number}}
  */
 export function scanSessions(db, sessionsRoot, options = {}) {
+  // tool 维度值 = 注入的工具标识（虚拟工具实例化），未注入回落自身标识（custom-scan-roots）
+  const tool = options.toolId ?? TOOL;
   const wireFiles = listWireFiles(sessionsRoot);
   const previous = new Map(
     db.prepare('SELECT path, size, mtime_ms, content_hash, scanned_offset, scanned_lines, failed FROM file_index WHERE tool = ?')
-      .all(TOOL)
+      .all(tool)
       .map((row) => [row.path, row])
   );
   // config.toml 兜底：文件内无 modelAlias 时用于 __secondary__ 还原
@@ -213,7 +269,7 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         stat = { size: Number(st.size), mtimeMs: Number(st.mtimeMs) };
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
@@ -232,7 +288,7 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         hash = sha256File(entry.absPath);
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
@@ -240,7 +296,7 @@ export function scanSessions(db, sessionsRoot, options = {}) {
       // （如备份恢复仅改动 mtime）→ 仅刷新索引，不删也不重建明细，统计零变化。
       // 正确性不依赖此分支（核心固化层的复活明细对账兜底），它是纯性能优化。
       if (prev && !prev.failed && prev.content_hash === hash) {
-        upsertIndex.run(TOOL, entry.relPath, stat.size, stat.mtimeMs, hash, prev.scanned_offset, prev.scanned_lines, 0);
+        upsertIndex.run(tool, entry.relPath, stat.size, stat.mtimeMs, hash, prev.scanned_offset, prev.scanned_lines, 0);
         continue;
       }
 
@@ -248,7 +304,7 @@ export function scanSessions(db, sessionsRoot, options = {}) {
         const { records, fileAlias, index } = scanWireFile(entry.absPath, prev, { ...stat, hash });
         // 文件级替换语义：非追加（重建）先删该文件全部明细，杜绝叠加
         if (!isPureAppend(prev, stat)) {
-          db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(TOOL, entry.relPath);
+          db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(tool, entry.relPath);
         }
         // 文件内无 alias 时用 config.toml 兜底（scanWireFile 已处理文件内 alias）
         let unresolved = 0;
@@ -260,17 +316,17 @@ export function scanSessions(db, sessionsRoot, options = {}) {
           }
           if (record.model === '__secondary__') unresolved += 1;
           insertRecord.run(
-            TOOL, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
+            tool, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
             record.inputOther, record.cacheRead, record.cacheCreation, record.output, entry.isSubagent ? 1 : 0
           );
         }
         summary.secondaryUnresolved += unresolved;
-        upsertIndex.run(TOOL, entry.relPath, index.size, index.mtime_ms, index.content_hash, index.scanned_offset, index.scanned_lines, index.failed);
+        upsertIndex.run(tool, entry.relPath, index.size, index.mtime_ms, index.content_hash, index.scanned_offset, index.scanned_lines, index.failed);
         summary.changedFiles += 1;
       } catch (error) {
         // 读取中途失败：保留旧索引并打 failed，下次不再被短路
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
       }
     }
 
@@ -278,8 +334,8 @@ export function scanSessions(db, sessionsRoot, options = {}) {
     const present = new Set(wireFiles.map((f) => f.relPath));
     for (const path of previous.keys()) {
       if (!present.has(path)) {
-        db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(TOOL, path);
-        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(TOOL, path);
+        db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(tool, path);
+        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(tool, path);
         summary.changedFiles += 1;
       }
     }

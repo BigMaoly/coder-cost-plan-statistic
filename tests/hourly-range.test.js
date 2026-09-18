@@ -128,6 +128,28 @@ test('fmtPerHour：平均每小时消耗自适应 token 单位（hourly-bar-drag
   assert.equal(HR.fmtPerHour(1.91e6 / 7), '272.86K/h');
 });
 
+test('activeHoursOf：维度出现（有用量）的不同小时数（hourly-avg-active-hours 默认态「平均/h」分母）', () => {
+  const zeros = new Array(24).fill(0);
+  // 全零行 → 0（渲染层配合 fmtPerHour 显示占位符，不除零）
+  assert.equal(HR.activeHoursOf(zeros), 0);
+  assert.equal(HR.activeHoursOf(null), 0);
+  assert.equal(HR.activeHoursOf(undefined), 0);
+  // 全 24 槽非零 → 24（理论情形）
+  assert.equal(HR.activeHoursOf(new Array(24).fill(1)), 24);
+  // 稀疏：kimi 出现在 8/9/13/15 点 → 4；glm 出现在 8/11/14 点 → 3（每行分母不同）
+  const kimi = zeros.slice();
+  [8, 9, 13, 15].forEach((h) => { kimi[h] = 1200 + h; });
+  assert.equal(HR.activeHoursOf(kimi), 4);
+  const glm = zeros.slice();
+  [8, 11, 14].forEach((h) => { glm[h] = 900; });
+  assert.equal(HR.activeHoursOf(glm), 3);
+  // 连续段同样按格计数；0 值槽不算出现（v > 0 判定）
+  const mixed = zeros.slice();
+  [7, 8, 9, 10, 11].forEach((h) => { mixed[h] = 500; });
+  mixed[12] = 0;
+  assert.equal(HR.activeHoursOf(mixed), 5);
+});
+
 test('静态契约：纯函数引擎无 DOM / 网络依赖，只挂 window.HourlyRange', () => {
   const src = readFileSync(join(webRoot, 'hourly-range.js'), 'utf8');
   assert.ok(!src.includes('document.'));

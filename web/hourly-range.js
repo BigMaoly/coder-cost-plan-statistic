@@ -103,6 +103,19 @@ window.HourlyRange = (function () {
   }
 
   /**
+   * 该维度在全 24 小时中出现（有用量，v > 0）的不同小时数（hourly-avg-active-hours）。
+   * 默认态「平均/h」的分母：kimi 出现在 8/9/13/15 点 → 4 小时；glm 出现在 8/11/14 点 → 3 小时
+   * （每行分母不同，各行按各自出现小时数均摊）。框选态不使用（框选分母恒为选区宽度 b−a+1）。
+   * @param {Array<number>} row 该维度 24 槽的用量矩阵行（block.matrix[i]）
+   * @returns {number} 非零槽数（0 ≤ n ≤ 24）
+   */
+  function activeHoursOf(row) {
+    let n = 0;
+    for (const v of row || []) if (v > 0) n++;
+    return n;
+  }
+
+  /**
    * 平均每小时消耗的自适应 token 单位文案（框选模式信息面板「平均/h」列，hourly-bar-drag-select）。
    * 自适应规则：≥1B → 'n.nnB/h'；≥1M → 'n.nnM/h'；≥1K → 'n.nnK/h'；不足 1K → 整数 + '/h'；
    * 0 / 非有限数 → '–'（与既有占位符风格一致）。除法（总量 ÷ 小时数）由调用侧完成。
@@ -115,5 +128,5 @@ window.HourlyRange = (function () {
     return Math.round(v) + '/h';
   }
 
-  return { HOURS, totals, agg, buildSlots, sumRange, slotTitle, rangeText, tickText, tickVisible, sumLabel, fmtPerHour };
+  return { HOURS, totals, agg, buildSlots, sumRange, slotTitle, rangeText, tickText, tickVisible, sumLabel, activeHoursOf, fmtPerHour };
 })();

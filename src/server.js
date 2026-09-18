@@ -24,8 +24,12 @@ import { readFile } from 'node:fs/promises';
 import { join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { todayKey, localDateAddDays, runMaintenance, applyReconcileEntries, discardReconcileEntries } from './aggregate.js';
-import { toolWhitelist, availableTools } from './scanners/index.js';
+import { toolWhitelist, availableTools, implementedAdapters, isRootUsable } from './scanners/index.js';
 import { runInTransaction, dataDir } from './store.js';
+import {
+  listVirtualTools, createVirtualTool, setVirtualToolEnabled, deleteVirtualTool,
+  hasData, dynamicToolWhitelist, normalizeRoot, checkDuplicate
+} from './virtual-tools.js';
 import {
   loadMappings, isMappingEnabled, setMappingEnabled,
   applyMappings, matchFilter, saveMapping, deleteMapping, listCandidates, reorderMappings
@@ -96,12 +100,13 @@ function readBody(req) {
 /**
  * tool 参数解析（多选筛选）：重复 query key + getAll；缺省等效 ['kimi']。
  * 'all' 仅单值合法（与具体平台混用返回 null → 400）；任一值不在白名单返回 null（调用方回 400）。
+ * 白名单动态化（custom-scan-roots）：静态注册表 ∪ 虚拟工具标识。
  */
-function parseTools(url) {
+function parseTools(db, url) {
   const values = [...new Set(url.searchParams.getAll('tool').filter(Boolean))];
   if (values.length === 0) return ['kimi'];
   if (values.length > 1 && values.includes('all')) return null;
-  const whitelist = toolWhitelist();
+  const whitelist = dynamicToolWhitelist(db);
   return values.every((t) => whitelist.includes(t)) ? values : null;
 }
 
@@ -110,9 +115,9 @@ function isAllTools(tools) {
   return !Array.isArray(tools) || tools.length === 0 || tools.includes('all');
 }
 
-/** 非法 tool 参数的 400 错误文案（多值时逐个列出原值） */
-function badToolError(url) {
-  return `不支持的 tool：${url.searchParams.getAll('tool').join('、') || '（空）'}（可选 ${toolWhitelist().join(' / ')}）`;
+/** 非法 tool 参数的 400 错误文案（多值时逐个列出原值；可选值含虚拟工具） */
+function badToolError(db, url) {
+  return `不支持的 tool：${url.searchParams.getAll('tool').join('、') || '（空）'}（可选 ${dynamicToolWhitelist(db).join(' / ')}）`;
 }
 
 /** 汇总计算：命中率 = 缓存命中输入 ÷ 总输入（三分量之和） */
@@ -528,12 +533,16 @@ function annotateLabel(toolSet, tool, provider) {
 
 /**
  * 分布下钻费用：按展示分组键（与 groupByDisplay 同构）汇总。
- * 冻结行（费用表，原始粒度）映射归并后按键累加；无任何冻结行时 fallbackRows 回退折算；
- * 明细行（含 ts_ms）一律实时算并并入（滞留明细口径）。
+ * 回退判定为逐 key 口径（breakdown-fallback-per-day，与 composeCostByKey 的 frozenKeys 同语义）：
+ * 冻结覆盖的 key（费用表出现过的 keyOf）以冻结值为准，其余 fallbackRows 全部实时折算——
+ * 某一 key 有没有冻结费用行，只影响该 key 的取数方式，不影响其它 key；不双算、不遗漏。
+ * 判定基于 costRows 原始行，与映射归并 / 筛选解耦；两类行的 key 选择器由调用方按数据分支粒度传入：
+ * 日分支 keyOfCost = keyOfFallback = local_date；月 / 年分支分别为 cost_monthly.month（'YYYY-MM'）
+ * 与 usage_monthly 的 year + 数字 month 拼接。明细行（含 ts_ms）一律实时算并并入（滞留明细口径）。
  * filter（多选下钻）：provider / model 数组经 matchFilter 与用量路径同口径收窄（冻结 / 回退 / 实时三路一致）。
  * @returns {{prov: Map, model: Map}} 键：提供商组键 / 提供商组键+'\0'+展示模型名
  */
-function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, recordRows, filter = {} }) {
+function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, recordRows, filter = {}, keyOfCost, keyOfFallback }) {
   const prov = new Map();
   const model = new Map();
   if (!pricing) return { prov, model };
@@ -546,9 +555,10 @@ function breakdownCostMaps({ pricing, maps, mappingOn, costRows, fallbackRows, r
     const mk = pk + '\0' + dm;
     addCost(model.get(mk) ?? model.set(mk, zeroCost()).get(mk), c);
   };
+  const frozenKeys = new Set(costRows.map((r) => keyOfCost(r)));
   const frozen = applyMappings(costRows, maps, mappingOn).filter(pass);
   for (const r of frozen) add(r.tool, r.dp, r.dm, r);
-  const liveRows = [...(frozen.length > 0 ? [] : fallbackRows), ...recordRows];
+  const liveRows = [...fallbackRows.filter((r) => !frozenKeys.has(keyOfFallback(r))), ...recordRows];
   if (liveRows.length > 0) {
     for (const g of calcCost(applyMappings(liveRows, maps, mappingOn).filter(pass), pricing.priceIndex, maps, { enabled: mappingOn })) {
       add(g.tool, g.provider, g.model, g);
@@ -599,9 +609,10 @@ function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo },
     } else {
       // 历史日：固化数据 ∪ 现存明细（含晚到未合并部分，
       // 两源不重叠——变更 zcode-usage-loss-prevention）
+      // local_date 列供费用回退的逐 key 判定使用（breakdown-fallback-per-day）
       const dailyRows = db
         .prepare(
-          `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
+          `SELECT tool, local_date, provider, model, input_other, cache_read, cache_creation, output
            FROM usage_daily WHERE ${cond}`
         )
         .all(...params);
@@ -622,7 +633,7 @@ function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo },
     toolCond(where, params);
     rows = db
       .prepare(
-        `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
+        `SELECT tool, year, month, provider, model, input_other, cache_read, cache_creation, output
          FROM usage_monthly WHERE ${where.join(' AND ')}`
       )
       .all(...params);
@@ -634,9 +645,10 @@ function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo },
     const params = [from, to];
     toolCond(where, params);
     const cond = where.join(' AND ');
+    // local_date 列供费用回退的逐 key 判定使用（breakdown-fallback-per-day）
     const dailyRows = db
       .prepare(
-        `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
+        `SELECT tool, local_date, provider, model, input_other, cache_read, cache_creation, output
          FROM usage_daily WHERE ${cond}`
       )
       .all(...params);
@@ -657,9 +669,10 @@ function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo },
     if (monthFrom) { where.push('month >= ?'); params.push(monthFrom); }
     if (monthTo) { where.push('month <= ?'); params.push(monthTo); }
     toolCond(where, params);
+    // year / month 列供费用回退的逐 key 判定使用（breakdown-fallback-per-day）
     rows = db
       .prepare(
-        `SELECT tool, provider, model, input_other, cache_read, cache_creation, output
+        `SELECT tool, year, month, provider, model, input_other, cache_read, cache_creation, output
          FROM usage_monthly WHERE ${where.join(' AND ')}`
       )
       .all(...params);
@@ -677,7 +690,14 @@ function queryBreakdown(db, { date, month, from, to, year, monthFrom, monthTo },
   const groups = groupByDisplay(merged);
   const labels = displayLabels(groups);
   const costMaps = breakdownCostMaps({
-    pricing: loadPricingContext(db), maps, mappingOn, costRows, fallbackRows, recordRows, filter
+    pricing: loadPricingContext(db), maps, mappingOn, costRows, fallbackRows, recordRows, filter,
+    // key 选择器按数据分支粒度（两类行字段名不同，分开传入）：日分支冻结行取 cost_daily.date、
+    // 回退行取 dailyRows.local_date（查询列已在各分支补齐）；月 / 年分支冻结行取 cost_monthly.month
+    //（'YYYY-MM'）、回退行取 usage_monthly 的 year + 数字 month 拼接
+    keyOfCost: (from || date) ? ((r) => r.date) : ((r) => r.month),
+    keyOfFallback: (from || date)
+      ? ((r) => r.local_date)
+      : ((r) => r.year + '-' + String(r.month).padStart(2, '0'))
   });
 
   const providers = groups
@@ -833,15 +853,155 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         return res.end();
       }
 
-      // 可用平台列表（面板「统计工具」下拉选项来源）
+      // 可用平台列表 + 虚拟工具（面板「统计工具」下拉选项来源）。
+      // 语义差异（custom-scan-roots D9）：内置平台数据源不可用时不出现（从未有数据）；
+      // 虚拟工具恒出现（可能有历史数据），额外带 enabled 供面板标注「已停用」。
       if (req.method === 'GET' && path === '/api/tools') {
-        return sendJson(res, 200, { tools: availableTools(maintenance) });
+        const builtin = availableTools(maintenance).map((t) => ({ ...t, layer: 'default' }));
+        const virtual = listVirtualTools(db).map((row) => ({
+          id: row.tool_id,
+          label: row.tool_id,
+          layer: 'virtual',
+          enabled: Boolean(row.enabled)
+        }));
+        return sendJson(res, 200, { tools: [...builtin, ...virtual] });
+      }
+
+      // ---- custom-scan-roots：自定义扫描目录（虚拟工具）配置 API ----
+      // 列出配置 + 默认层只读信息（含每条 hasData / 数据源当前可用性）
+      if (req.method === 'GET' && path === '/api/scan-roots') {
+        const defaults = implementedAdapters().map((a) => {
+          const root = typeof a.defaultRoot === 'function' ? a.defaultRoot(maintenance) : null;
+          const resolved = root ? a.resolveRoot(root) : null;
+          return {
+            tool: a.id,
+            label: a.label,
+            adapter: a.id,
+            root,
+            paths: resolved?.paths ?? null,
+            primaryPath: resolved?.primaryPath ?? null,
+            kind: resolved?.kind ?? null,
+            available: isRootUsable(a, root, maintenance)
+          };
+        });
+        const items = listVirtualTools(db).map((row) => {
+          const adapter = implementedAdapters().find((a) => a.id === row.adapter_id) || null;
+          const resolved = adapter ? adapter.resolveRoot(row.root) : null;
+          return {
+            toolId: row.tool_id,
+            adapterId: row.adapter_id,
+            root: row.root,
+            enabled: Boolean(row.enabled),
+            createdAtMs: row.created_at_ms,
+            lastScanMs: row.last_scan_ms,
+            lastScanNote: row.last_scan_note,
+            hasData: hasData(db, row.tool_id),
+            // 适配器下线视为数据源不可用（配置保留，扫描时跳过并告警）
+            adapterMissing: !adapter,
+            sourceAvailable: adapter ? isRootUsable(adapter, row.root) : false,
+            paths: resolved?.paths ?? null,
+            primaryPath: resolved?.primaryPath ?? null
+          };
+        });
+        return sendJson(res, 200, { defaults, items });
+      }
+
+      // 探测：规范化（notes 回显）→ 重复检测（命中早退，不白趟探测）→ 样本级可用性判定
+      //（isRootUsable：遍历起点恒为推导出的数据源路径，命中即返回）。
+      // 探测失败时附「其它适配器命中提示」，帮助识别跨适配器误配。
+      if (req.method === 'POST' && path === '/api/scan-roots/probe') {
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        const adapterId = String(body?.adapter ?? '').trim();
+        const adapter = implementedAdapters().find((a) => a.id === adapterId);
+        if (!adapter) return sendJson(res, 400, { error: `未知适配器：${adapterId || '（空）'}` });
+        const { path: root, notes, error } = normalizeRoot(body?.root);
+        if (error) {
+          return sendJson(res, 200, { ok: true, usable: false, reason: error, root: null, notes, paths: null, primaryPath: null, duplicate: null, otherAdapterHits: [] });
+        }
+        const resolved = adapter.resolveRoot(root);
+        const duplicate = checkDuplicate(db, adapterId, root);
+        let usable = false;
+        let reason = null;
+        if (duplicate) {
+          reason = duplicate.kind === 'default'
+            ? `与默认扫描位置重复：${root} 是内置工具 ${duplicate.occupant} 的默认根，无需配置`
+            : `与已有条目重复：该根目录已被虚拟工具 ${duplicate.occupant} 占用`;
+        } else {
+          usable = isRootUsable(adapter, root);
+          if (!usable) {
+            reason = resolved?.primaryPath
+              ? `在该根目录下未找到 ${adapter.label} 可识别的数据源（期望的数据源：${resolved.primaryPath}）`
+              : `在该根目录下未找到 ${adapter.label} 可识别的数据源`;
+          }
+        }
+        const otherAdapterHits = (usable || duplicate)
+          ? []
+          : implementedAdapters()
+              .filter((a) => a.id !== adapterId && isRootUsable(a, root))
+              .map((a) => ({ adapter: a.id, label: a.label }));
+        return sendJson(res, 200, {
+          ok: true, usable, reason, root, notes,
+          paths: resolved?.paths ?? null,
+          primaryPath: resolved?.primaryPath ?? null,
+          kind: resolved?.kind ?? null,
+          duplicate, otherAdapterHits
+        });
+      }
+
+      // 创建：服务端重新执行一次完整校验（名称 / 适配器 / 规范化 / 重复 / 样本级探测），
+      // 不信任前端探测结果；任一步失败 400 中文原因，不产生配置
+      if (req.method === 'POST' && path === '/api/scan-roots') {
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          const item = createVirtualTool(db, { tool: body?.tool, adapter: body?.adapter, root: body?.root });
+          return sendJson(res, 200, { ok: true, item });
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
+      // 停用 / 启用：只改 enabled 标志，统计数据零改动，下一轮维护生效
+      if (req.method === 'PUT' && path.startsWith('/api/scan-roots/')) {
+        const toolId = decodeURIComponent(path.slice('/api/scan-roots/'.length));
+        let body;
+        try {
+          body = await readBody(req);
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+        try {
+          const item = setVirtualToolEnabled(db, toolId, Boolean(body?.enabled));
+          return sendJson(res, 200, { ok: true, item });
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
+      }
+
+      // 删除：仅无任何统计数据时允许（有数据 400 引导停用）；删除本身不触碰任何统计表
+      if (req.method === 'DELETE' && path.startsWith('/api/scan-roots/')) {
+        const toolId = decodeURIComponent(path.slice('/api/scan-roots/'.length));
+        try {
+          deleteVirtualTool(db, toolId);
+          return sendJson(res, 200, { ok: true });
+        } catch (error) {
+          return sendJson(res, 400, { error: error.message });
+        }
       }
 
       if (req.method === 'GET' && path === '/api/stats') {
         const range = url.searchParams.get('range') || '7d';
-        const tools = parseTools(url);
-        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        const tools = parseTools(db, url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(db, url) });
         // 多选筛选（multi-select-filters-and-filtered-drilldown）：provider / model 重复 query key 多值
         const filter = {
           tools,
@@ -866,8 +1026,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
       }
 
       if (req.method === 'GET' && path === '/api/today') {
-        const tools = parseTools(url);
-        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        const tools = parseTools(db, url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(db, url) });
         return sendJson(res, 200, {
           ...queryToday(db, tools, loadPricingContext(db), loadMappings(db), isMappingEnabled(db)),
           currency: getBillingCurrency(db)
@@ -883,8 +1043,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         const year = url.searchParams.get('year');
         const monthFrom = url.searchParams.get('month_from');
         const monthTo = url.searchParams.get('month_to');
-        const tools = parseTools(url);
-        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        const tools = parseTools(db, url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(db, url) });
         const modes = [Boolean(date), Boolean(month), Boolean(from || to), Boolean(year)].filter(Boolean).length;
         if (modes !== 1) {
           return sendJson(res, 400, { error: 'date / month / from+to / year 参数必须四选一' });
@@ -935,8 +1095,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
         if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
           return sendJson(res, 400, { error: 'date 必填，格式应为 YYYY-MM-DD' });
         }
-        const tools = parseTools(url);
-        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        const tools = parseTools(db, url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(db, url) });
         return sendJson(res, 200, {
           ...queryHourly(db, date, tools, loadMappings(db), isMappingEnabled(db), {
             // 与 /api/breakdown 同构的多值筛选（provider / model，展示名编码）
@@ -949,8 +1109,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
 
       if (req.method === 'GET' && path === '/api/filter-options') {
         const range = url.searchParams.get('range') || '7d';
-        const tools = parseTools(url);
-        if (!tools) return sendJson(res, 400, { error: badToolError(url) });
+        const tools = parseTools(db, url);
+        if (!tools) return sendJson(res, 400, { error: badToolError(db, url) });
         const year = url.searchParams.get('year');
         const maps = loadMappings(db);
         const mappingOn = isMappingEnabled(db);
@@ -1597,7 +1757,8 @@ export function createApp({ db, maintenance, modelPriceDir: backupDir, scoreBack
           '/quota-benchmark-compare.js': 'quota-benchmark-compare.js',
           '/link-solve.js': 'link-solve.js', '/tier-alloc.js': 'tier-alloc.js',
           '/token-snap.js': 'token-snap.js',
-          '/manual-entry.js': 'manual-entry.js'
+          '/manual-entry.js': 'manual-entry.js',
+          '/scan-roots.js': 'scan-roots.js'
         };
         const file = allow[path];
         if (file) {

@@ -283,14 +283,172 @@ test('tool 参数：缺省 kimi、指定过滤、all 合并、复合提供商锁
   }
 });
 
-test('/api/tools：数据源缺失时为空，目录存在时含 kimi 且不含 codex 占位', async () => {
+test('/api/tools：数据源缺失时为空，目录存在且含来源文件时含 kimi 且不含 codex 占位', async () => {
   const { root, db, handle, maintenance } = makeApp();
   try {
     const empty = await call(handle, '/api/tools');
     assert.deepEqual(empty.body, { tools: [] });
-    mkdirSync(maintenance.sessionsRoot, { recursive: true });
+    // custom-scan-roots：kimi 判定升级为样本级——目录存在且命中来源文件才算可用
+    mkdirSync(join(maintenance.sessionsRoot, 'wd', 'session_a', 'agents', 'main'), { recursive: true });
+    writeFileSync(join(maintenance.sessionsRoot, 'wd', 'session_a', 'agents', 'main', 'wire.jsonl'), '{}\n');
     const ok = await call(handle, '/api/tools');
-    assert.deepEqual(ok.body.tools, [{ id: 'kimi', label: 'Kimi Code' }]);
+    assert.deepEqual(ok.body.tools, [{ id: 'kimi', label: 'Kimi Code', layer: 'default' }]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/* ===== custom-scan-roots：扫描目录配置 API 与虚拟工具下拉 ===== */
+
+/** 造一个含 kimi 来源文件的软件根（探测可命中） */
+function seedKimiRoot(root, name) {
+  const kimiRoot = join(root, name, '.kimi-code');
+  const wire = join(kimiRoot, 'sessions', 'wd', 'session_a', 'agents', 'main', 'wire.jsonl');
+  mkdirSync(join(kimiRoot, 'sessions', 'wd', 'session_a', 'agents', 'main'), { recursive: true });
+  writeFileSync(wire, '{}\n');
+  return kimiRoot;
+}
+
+test('/api/tools：虚拟工具恒在列表（含停用标注），且 ?tool=<虚拟工具> 通过校验、非法值 400 列出虚拟工具', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const kimiRoot = seedKimiRoot(root, 'win');
+    const created = await callBody(handle, 'POST', '/api/scan-roots', { tool: 'kimicode-win', adapter: 'kimi', root: kimiRoot });
+    assert.equal(created.status, 200);
+    await callBody(handle, 'PUT', '/api/scan-roots/kimicode-win', { enabled: false });
+
+    const tools = await call(handle, '/api/tools');
+    assert.deepEqual(tools.body.tools, [
+      { id: 'kimicode-win', label: 'kimicode-win', layer: 'virtual', enabled: false }
+    ]);
+    // 停用虚拟工具仍可通过 ?tool= 校验（历史数据可查）
+    const stats = await call(handle, '/api/stats?range=7d&tool=kimicode-win');
+    assert.equal(stats.status, 200);
+    const bad = await call(handle, '/api/stats?range=7d&tool=nosuchtool');
+    assert.equal(bad.status, 400);
+    assert.match(bad.body.error, /kimicode-win/, '错误文案应列出虚拟工具名');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/api/scan-roots GET：默认层只读信息 + 条目 hasData / 数据源可用性', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    const kimiRoot = seedKimiRoot(root, 'win');
+    await callBody(handle, 'POST', '/api/scan-roots', { tool: 'v1', adapter: 'kimi', root: kimiRoot });
+    // 造一条已用量的条目
+    const v2Root = seedKimiRoot(root, 'win2');
+    await callBody(handle, 'POST', '/api/scan-roots', { tool: 'v2', adapter: 'kimi', root: v2Root });
+    db.prepare(
+      `INSERT INTO usage_records (tool, file_path, line_no, model, provider, ts_ms, local_date, input_other, cache_read, cache_creation, output, is_subagent)
+       VALUES ('v2', 'f', 1, 'm', 'p', 0, '2026-09-02', 1, 0, 0, 0, 0)`
+    ).run();
+
+    const res = await call(handle, '/api/scan-roots');
+    assert.equal(res.status, 200);
+    assert.equal(res.body.defaults.length, 5);
+    for (const d of res.body.defaults) {
+      assert.ok(d.tool && d.label && d.root, '默认层条目带工具名 / 显示名 / 默认根');
+      assert.ok(d.paths && d.primaryPath, '默认层带解析出的数据源路径');
+      assert.equal(typeof d.available, 'boolean');
+    }
+    assert.deepEqual(res.body.items.map((i) => [i.toolId, i.hasData, i.sourceAvailable]),
+      [['v1', false, true], ['v2', true, true]]);
+    assert.ok(res.body.items.every((i) => i.enabled === true));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/api/scan-roots/probe：成功 / 数据源缺失 / 路径不存在 / 重复（默认根与条目）/ 非绝对路径', async () => {
+  const { root, handle } = makeApp();
+  try {
+    const kimiRoot = seedKimiRoot(root, 'win');
+    const ok = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: kimiRoot });
+    assert.equal(ok.body.usable, true);
+    assert.equal(ok.body.primaryPath, join(kimiRoot, 'sessions'));
+
+    // 会话目录存在但无 kimi 来源（跨适配器误配同理：把它配给 codex 也在探测层拒绝）
+    const bare = join(root, 'bare', '.kimi-code');
+    mkdirSync(join(bare, 'sessions'), { recursive: true });
+    const bareProbe = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: bare });
+    assert.equal(bareProbe.body.usable, false);
+    assert.match(bareProbe.body.reason, /未找到 Kimi Code 可识别的数据源/);
+
+    // 跨适配器误配：kimi 数据根提交给 codex → 拒绝
+    const codexOnKimi = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'codex', root: kimiRoot });
+    assert.equal(codexOnKimi.body.usable, false);
+
+    // 路径不存在
+    const missing = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: join(root, 'nope') });
+    assert.equal(missing.body.usable, false);
+
+    // 与默认根重复（默认根来自真实 HOME；探测同样拒绝并说明）
+    const def = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: join(process.env.HOME, '.kimi-code') });
+    assert.equal(def.body.usable, false);
+    assert.match(def.body.reason, /与默认扫描位置重复|未找到/);
+
+    // 与已有条目重复（含 Windows 反斜杠写法归一后命中）
+    await callBody(handle, 'POST', '/api/scan-roots', { tool: 'v1', adapter: 'kimi', root: kimiRoot });
+    const dup = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: kimiRoot.replace(/\//g, '\\') });
+    assert.equal(dup.body.usable, false);
+    assert.match(dup.body.reason, /与已有条目重复/);
+    assert.deepEqual(dup.body.duplicate, { kind: 'virtual', occupant: 'v1' });
+
+    // 非绝对路径
+    const rel = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'kimi', root: 'relative/path' });
+    assert.equal(rel.body.usable, false);
+    assert.match(rel.body.reason, /绝对路径/);
+
+    // 未知适配器 → 400
+    const badAdapter = await callBody(handle, 'POST', '/api/scan-roots/probe', { adapter: 'nope', root: '/tmp/x' });
+    assert.equal(badAdapter.status, 400);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('/api/scan-roots 写操作：创建被拒不产生配置（绕过前端直提未校验根）；停用零改动；删除规则', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    // 创建被拒：空数据源（探测层在服务端重新校验，不信任前端）
+    const bare = join(root, 'bare', '.kimi-code');
+    mkdirSync(join(bare, 'sessions'), { recursive: true });
+    const rejected = await callBody(handle, 'POST', '/api/scan-roots', { tool: 'bad', adapter: 'kimi', root: bare });
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.body.error, /未找到/);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 0, '失败不产生配置');
+
+    // 创建成功 → 有数据 → 停用（统计数据零改动）→ 删除被拒
+    const kimiRoot = seedKimiRoot(root, 'win');
+    const created = await callBody(handle, 'POST', '/api/scan-roots', { tool: 'v1', adapter: 'kimi', root: kimiRoot });
+    assert.equal(created.status, 200);
+    assert.equal(created.body.item.tool_id, 'v1');
+    db.prepare(
+      `INSERT INTO usage_records (tool, file_path, line_no, model, provider, ts_ms, local_date, input_other, cache_read, cache_creation, output, is_subagent)
+       VALUES ('v1', 'f', 1, 'm', 'p', 0, '2026-09-02', 5, 0, 0, 0, 0)`
+    ).run();
+    const off = await callBody(handle, 'PUT', '/api/scan-roots/v1', { enabled: false });
+    assert.equal(off.status, 200);
+    assert.equal(db.prepare('SELECT enabled FROM virtual_tools WHERE tool_id = ?').get('v1').enabled, 0);
+    assert.equal(db.prepare("SELECT COUNT(*) c FROM usage_records WHERE tool = 'v1'").get().c, 1, '停用不删数据');
+    const delBusy = await callBody(handle, 'DELETE', '/api/scan-roots/v1', null);
+    assert.equal(delBusy.status, 400);
+    assert.match(delBusy.body.error, /已有统计数据/);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 1, '有数据删除被拒后配置不变');
+
+    // 无数据条目可删，且统计表零改动
+    const v2Root = seedKimiRoot(root, 'win2');
+    await callBody(handle, 'POST', '/api/scan-roots', { tool: 'v2', adapter: 'kimi', root: v2Root });
+    const del = await callBody(handle, 'DELETE', '/api/scan-roots/v2', null);
+    assert.equal(del.status, 200);
+    assert.equal(db.prepare('SELECT COUNT(*) c FROM virtual_tools').get().c, 1);
+    assert.equal(db.prepare("SELECT COUNT(*) c FROM usage_records WHERE tool = 'v1'").get().c, 1);
+
+    // 不存在的条目 400
+    const missing = await callBody(handle, 'DELETE', '/api/scan-roots/ghost', null);
+    assert.equal(missing.status, 400);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -2658,4 +2816,133 @@ test('token-snap tmp：草稿载荷携带 tokenSnap 被服务端剥离，既有�
     const row = db.prepare('SELECT payload_json FROM quota_manual_drafts').get();
     assert.equal(row.payload_json.includes('tokenSnap'), false);
   });
+});
+
+/* ===== breakdown-fallback-per-day：窗口费用逐 key 回退（部分冻结覆盖） ===== */
+
+test('breakdown 窗口费用：区间内费用表部分覆盖时，冻结天用冻结值、未冻结天回退折算，两段都计入且不双算', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    // 映射 K3 = kimi/kimi-code/k3，并配置直调价（M 单位：未命中输入 1.00/百万）
+    await callBody(handle, 'PUT', '/api/mappings/K3', {
+      bindings: [{ tool: 'kimi', provider: 'kimi-code' }],
+      modelMaps: [{ name: 'k3', sources: [{ tool: 'kimi', provider: 'kimi-code', model: 'k3' }] }]
+    });
+    // 映射全局开关打开（价格索引按映射名匹配，calcCost 需 active 归并才命中 K3\0k3）
+    await callBody(handle, 'PUT', '/api/settings/mapping-enabled', { enabled: true });
+    await callBody(handle, 'PUT', '/api/plans/K3', {
+      plans: [{ name: '默认套餐', cycleDays: 30, monthlyFee: 0, quotaMode: 'percent', limitPeriod: 'monthly', totalPoints: 100 }],
+      prices: [{ model: 'k3', unit: 'M', inputHit: 0.5, inputMiss: 1, output: 2 }]
+    });
+    // 两天固化历史用量：09-01 = 100 万 input（回退折算 1.00）、09-02 = 200 万（冻结 6.00）
+    const insDaily = db.prepare(
+      `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', ?, 'kimi-code', 'k3', ?, 0, 0, 0, 1)`
+    );
+    insDaily.run('2026-09-01', 1_000_000);
+    insDaily.run('2026-09-02', 2_000_000);
+    // 费用表只覆盖 09-02（部分覆盖），两日均已固化（无现存明细）
+    db.prepare(
+      `INSERT INTO cost_daily (tool, local_date, provider, model, cost, priced_tokens, unpriced_tokens)
+       VALUES ('kimi', '2026-09-02', 'kimi-code', 'k3', 6.00, 2000000, 0)`
+    ).run();
+    db.prepare("INSERT INTO maintenance_state (kind, tool, period, done_at_ms) VALUES ('daily_done', 'kimi', '2026-09-01', 1)").run();
+    db.prepare("INSERT INTO maintenance_state (kind, tool, period, done_at_ms) VALUES ('daily_done', 'kimi', '2026-09-02', 1)").run();
+
+    const win = await call(handle, '/api/breakdown?from=2026-09-01&to=2026-09-02');
+    assert.equal(win.status, 200);
+    const winK3 = win.body.providers.find((p) => p.label === 'K3');
+    assert.ok(winK3, '窗口应含 K3');
+    // 逐 key 口径：冻结 6.00 + 回退 1.00 = 7.00（缺陷口径只会显示 6.00）
+    assert.equal(Math.round(winK3.cost.cost * 100) / 100, 7.00);
+
+    // 单日下钻：各自正确，且窗口 = 单日之和
+    const d1 = await call(handle, '/api/breakdown?date=2026-09-01');
+    const d2 = await call(handle, '/api/breakdown?date=2026-09-02');
+    const c1 = d1.body.providers.find((p) => p.label === 'K3').cost.cost;
+    const c2 = d2.body.providers.find((p) => p.label === 'K3').cost.cost;
+    assert.equal(Math.round(c1 * 100) / 100, 1.00, '未冻结日回退折算');
+    assert.equal(Math.round(c2 * 100) / 100, 6.00, '冻结日用冻结值');
+    assert.equal(Math.round((c1 + c2) * 100) / 100, Math.round(winK3.cost.cost * 100) / 100, '窗口 = 单日之和');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('breakdown 窗口费用：冻结 key 不被回退双算、不被实时价重算（改价后冻结值不变）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    await callBody(handle, 'PUT', '/api/mappings/K3', {
+      bindings: [{ tool: 'kimi', provider: 'kimi-code' }],
+      modelMaps: [{ name: 'k3', sources: [{ tool: 'kimi', provider: 'kimi-code', model: 'k3' }] }]
+    });
+    // 映射全局开关打开（价格索引按映射名匹配，calcCost 需 active 归并才命中 K3\0k3）
+    await callBody(handle, 'PUT', '/api/settings/mapping-enabled', { enabled: true });
+    await callBody(handle, 'PUT', '/api/plans/K3', {
+      plans: [{ name: '默认套餐', cycleDays: 30, monthlyFee: 0, quotaMode: 'percent', limitPeriod: 'monthly', totalPoints: 100 }],
+      prices: [{ model: 'k3', unit: 'M', inputHit: 0.5, inputMiss: 1, output: 2 }]
+    });
+    const insDaily = db.prepare(
+      `INSERT INTO usage_daily (tool, local_date, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', ?, 'kimi-code', 'k3', ?, 0, 0, 0, 1)`
+    );
+    insDaily.run('2026-09-02', 2_000_000); // 冻结 6.00；若按实时价重算应为 2.00
+    db.prepare(
+      `INSERT INTO cost_daily (tool, local_date, provider, model, cost, priced_tokens, unpriced_tokens)
+       VALUES ('kimi', '2026-09-02', 'kimi-code', 'k3', 6.00, 2000000, 0)`
+    ).run();
+    db.prepare("INSERT INTO maintenance_state (kind, tool, period, done_at_ms) VALUES ('daily_done', 'kimi', '2026-09-02', 1)").run();
+
+    const win = await call(handle, '/api/breakdown?from=2026-09-02&to=2026-09-02');
+    const winK3 = win.body.providers.find((p) => p.label === 'K3');
+    assert.equal(Math.round(winK3.cost.cost * 100) / 100, 6.00, '冻结 key 只取冻结值（不与回退叠加、不按实时价重算）');
+
+    // 改价后冻结值仍不变（write-once 冻结语义的展示一致性）
+    // 映射全局开关打开（价格索引按映射名匹配，calcCost 需 active 归并才命中 K3\0k3）
+    await callBody(handle, 'PUT', '/api/settings/mapping-enabled', { enabled: true });
+    await callBody(handle, 'PUT', '/api/plans/K3', {
+      plans: [{ name: '默认套餐', cycleDays: 30, monthlyFee: 0, quotaMode: 'percent', limitPeriod: 'monthly', totalPoints: 100 }],
+      prices: [{ model: 'k3', unit: 'M', inputHit: 0.5, inputMiss: 99, output: 99 }]
+    });
+    const win2 = await call(handle, '/api/breakdown?from=2026-09-02&to=2026-09-02');
+    const win2K3 = win2.body.providers.find((p) => p.label === 'K3');
+    assert.equal(Math.round(win2K3.cost.cost * 100) / 100, 6.00, '改价后冻结 key 仍按冻结值展示');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('breakdown 窗口费用：年视图月粒度部分覆盖同构生效（cost_monthly 月 key）', async () => {
+  const { root, db, handle } = makeApp();
+  try {
+    await callBody(handle, 'PUT', '/api/mappings/K3', {
+      bindings: [{ tool: 'kimi', provider: 'kimi-code' }],
+      modelMaps: [{ name: 'k3', sources: [{ tool: 'kimi', provider: 'kimi-code', model: 'k3' }] }]
+    });
+    // 映射全局开关打开（价格索引按映射名匹配，calcCost 需 active 归并才命中 K3\0k3）
+    await callBody(handle, 'PUT', '/api/settings/mapping-enabled', { enabled: true });
+    await callBody(handle, 'PUT', '/api/plans/K3', {
+      plans: [{ name: '默认套餐', cycleDays: 30, monthlyFee: 0, quotaMode: 'percent', limitPeriod: 'monthly', totalPoints: 100 }],
+      prices: [{ model: 'k3', unit: 'M', inputHit: 0.5, inputMiss: 1, output: 2 }]
+    });
+    // 两个月汇总行；cost_monthly 仅覆盖 08 月（30.00）
+    const insMonthly = db.prepare(
+      `INSERT INTO usage_monthly (tool, year, month, provider, model, input_other, cache_read, cache_creation, output, turn_count)
+       VALUES ('kimi', 2026, ?, 'kimi-code', 'k3', ?, 0, 0, 0, 1)`
+    );
+    insMonthly.run(7, 1_000_000);  // 回退折算 1.00
+    insMonthly.run(8, 30_000_000); // 冻结 30.00（若误回退为 30.00 折算 = 30.00，仅以来源可辨）
+    db.prepare(
+      `INSERT INTO cost_monthly (tool, month, provider, model, cost, priced_tokens, unpriced_tokens)
+       VALUES ('kimi', '2026-08', 'kimi-code', 'k3', 30.00, 30000000, 0)`
+    ).run();
+
+    const year = await call(handle, '/api/breakdown?year=2026');
+    const yearK3 = year.body.providers.find((p) => p.label === 'K3');
+    assert.ok(yearK3, '年视图应含 K3');
+    // 逐月口径：08 冻结 30.00 + 07 回退 1.00 = 31.00（缺陷口径只显示 30.00）
+    assert.equal(Math.round(yearK3.cost.cost * 100) / 100, 31.00);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -260,3 +260,41 @@ test('scanWireFile 纯函数：startLine 行号续计', () => {
     rmSync(fx.root, { recursive: true, force: true });
   }
 });
+
+/* ===== custom-scan-roots：适配器统一接口（defaultRoot / resolveRoot / 样本级判定 / toolId 注入） ===== */
+
+import { defaultRoot, resolveRoot, adapter as kimiAdapter } from '../src/scanners/kimi.js';
+
+test('custom-scan-roots：kimi defaultRoot / resolveRoot 推导与既有默认扫描位置一致', () => {
+  assert.equal(defaultRoot({ env: { HOME: '/h' } }), join('/h', '.kimi-code'));
+  const resolved = resolveRoot(join('/h', '.kimi-code'));
+  assert.equal(resolved.paths.sessionsRoot, join('/h', '.kimi-code', 'sessions'));
+  assert.equal(resolved.paths.configTomlPath, join('/h', '.kimi-code', 'config.toml'));
+  assert.equal(resolved.primaryPath, join('/h', '.kimi-code', 'sessions'));
+  assert.equal(resolved.kind, 'dir');
+  assert.equal(resolveRoot(''), null);
+});
+
+test('custom-scan-roots：kimi isAvailable 样本级判定——空 sessions 不可用，命中一个 wire.jsonl 即可用', () => {
+  const fx = makeFixture(); // 只建目录不写文件
+  try {
+    assert.equal(kimiAdapter.isAvailable({ sessionsRoot: fx.sessions }), false);
+    writeFileSync(fx.wire, turnJson(1) + '\n');
+    assert.equal(kimiAdapter.isAvailable({ sessionsRoot: fx.sessions }), true);
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});
+
+test('custom-scan-roots：kimi scan 尊重 options.toolId（虚拟工具命名空间隔离）', () => {
+  const fx = makeFixture();
+  try {
+    writeFileSync(fx.wire, turnJson(1) + '\n');
+    const db = openDb(join(fx.root, 'statistic.db'));
+    scan(db, fx, { toolId: 'x-test' });
+    assert.equal(db.prepare('SELECT tool FROM usage_records').get().tool, 'x-test');
+    assert.equal(db.prepare('SELECT tool FROM file_index').get().tool, 'x-test');
+  } finally {
+    rmSync(fx.root, { recursive: true, force: true });
+  }
+});

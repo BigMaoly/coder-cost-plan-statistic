@@ -28,18 +28,47 @@ import { sha256File, isPureAppend, readCompleteLines } from './kimi.js';
 
 export const TOOL = 'codex';
 
+/** 默认软件根（custom-scan-roots）：重复检测的基准，也是默认层实例化的根 */
+export function defaultRoot(options = {}) {
+  const env = options?.env || process.env;
+  return join(env.HOME || homedir(), '.codex');
+}
+
+/** 软件根 → 扫描参数 + 探测主路径（纯推导，不做存在性判断；falsy 根返回 null） */
+export function resolveRoot(root) {
+  if (!root) return null;
+  return {
+    paths: { codexSessionsRoot: join(root, 'sessions') },
+    primaryPath: join(root, 'sessions'),
+    kind: 'dir'
+  };
+}
+
+/** 路径解析三级优先（custom-scan-roots D4）：显式注入优先；默认根回落仅生产入口以
+ *  options.resolveDefaults 显式启用——不启用时不回落，保持与既有行为逐字节一致 */
+function pathsFor(options) {
+  const opts = options || {};
+  if (opts.codexSessionsRoot) return { codexSessionsRoot: opts.codexSessionsRoot };
+  if (!opts.resolveDefaults) return null;
+  const root = defaultRoot(opts);
+  return root ? resolveRoot(root).paths : null;
+}
+
 export function codexSessionsRoot(env = process.env) {
-  return join(env.HOME || homedir(), '.codex', 'sessions');
+  return resolveRoot(defaultRoot({ env })).paths.codexSessionsRoot;
 }
 
 export const adapter = {
   id: TOOL,
   label: 'Codex CLI',
+  defaultRoot,
+  resolveRoot,
   isAvailable(options) {
-    return isCodexAvailable(options?.codexSessionsRoot);
+    return isCodexAvailable(pathsFor(options)?.codexSessionsRoot);
   },
   scan(db, options) {
-    return scanCodex(db, options || {});
+    const paths = pathsFor(options);
+    return scanCodex(db, { ...(options || {}), codexSessionsRoot: paths?.codexSessionsRoot });
   }
 };
 
@@ -224,10 +253,12 @@ export function scanRolloutFile(absPath, prev, stat) {
  * @returns {{totalFiles, changedFiles, skippedFiles, failures: string[], secondaryUnresolved: number}}
  */
 export function scanCodex(db, options = {}) {
+  // tool 维度值 = 注入的工具标识（虚拟工具实例化），未注入回落自身标识（custom-scan-roots）
+  const tool = options.toolId ?? TOOL;
   const rolloutFiles = listRolloutFiles(options.codexSessionsRoot);
   const previous = new Map(
     db.prepare('SELECT path, size, mtime_ms, content_hash, scanned_offset, scanned_lines, failed FROM file_index WHERE tool = ?')
-      .all(TOOL)
+      .all(tool)
       .map((row) => [row.path, row])
   );
 
@@ -267,7 +298,7 @@ export function scanCodex(db, options = {}) {
         stat = { size: Number(st.size), mtimeMs: Number(st.mtimeMs) };
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
@@ -286,7 +317,7 @@ export function scanCodex(db, options = {}) {
         hash = sha256File(entry.absPath);
       } catch (error) {
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
         continue;
       }
 
@@ -294,20 +325,20 @@ export function scanCodex(db, options = {}) {
         const { records, index } = scanRolloutFile(entry.absPath, prev, { ...stat, hash });
         // 文件级替换语义：非追加（重建）先删该文件全部明细，杜绝叠加
         if (!isPureAppend(prev, stat)) {
-          db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(TOOL, entry.relPath);
+          db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(tool, entry.relPath);
         }
         for (const record of records) {
           insertRecord.run(
-            TOOL, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
+            tool, entry.relPath, record.lineNo, record.model, record.provider, record.tsMs, record.localDate,
             record.inputOther, record.cacheRead, record.cacheCreation, record.output
           );
         }
-        upsertIndex.run(TOOL, entry.relPath, index.size, index.mtime_ms, index.content_hash, index.scanned_offset, index.scanned_lines, index.failed);
+        upsertIndex.run(tool, entry.relPath, index.size, index.mtime_ms, index.content_hash, index.scanned_offset, index.scanned_lines, index.failed);
         summary.changedFiles += 1;
       } catch (error) {
         // 读取中途失败：保留旧索引并打 failed，下次不再被短路
         summary.failures.push(`${entry.relPath}：${error?.message || error}`);
-        if (prev) keepFailedIndex.run(TOOL, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
+        if (prev) keepFailedIndex.run(tool, entry.relPath, prev.size, prev.mtime_ms, prev.content_hash, prev.scanned_offset, prev.scanned_lines);
       }
     }
 
@@ -315,8 +346,8 @@ export function scanCodex(db, options = {}) {
     const present = new Set(rolloutFiles.map((f) => f.relPath));
     for (const path of previous.keys()) {
       if (!present.has(path)) {
-        db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(TOOL, path);
-        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(TOOL, path);
+        db.prepare('DELETE FROM usage_records WHERE tool = ? AND file_path = ?').run(tool, path);
+        db.prepare('DELETE FROM file_index WHERE tool = ? AND path = ?').run(tool, path);
         summary.changedFiles += 1;
       }
     }

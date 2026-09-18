@@ -665,3 +665,52 @@ test('小时柱柱体拖拽框选：两级 mode-badge 与框选态列元素齐�
   assert.ok(!ctrlSrc.includes('fetch(') && !ctrlSrc.includes('XMLHttpRequest'), '控制器不应有网络依赖');
   assert.ok(!ctrlSrc.includes('innerHTML'), '控制器不应生成自有 DOM');
 });
+
+test('默认态平均/h 按出现小时数计算：activeHoursOf 纯函数 + 默认态四列结构（hourly-avg-active-hours）', () => {
+  // 纯函数：hourly-range.js 导出 activeHoursOf（默认态「平均/h」分母，各行分母不同）
+  assert.match(hourlyRangeJs, /function activeHoursOf\(/, 'hourly-range.js 应有 activeHoursOf 纯函数');
+  assert.match(hourlyRangeJs, /activeHoursOf, fmtPerHour/, 'activeHoursOf 应加入 HourlyRange 导出');
+  // app.js：默认态分母取自维度 24 槽矩阵行（与柱状图同一 matrix），除零守卫
+  assert.match(appJs, /HR\.activeHoursOf\(block\.matrix\[i\]\)/, '默认态分母应为 activeHoursOf(matrix 行)');
+  assert.match(appJs, /hours > 0 \? v \/ hours : 0/, '平均/h 计算应有除零守卫');
+  // 默认态行结构：名称带出现小时数缀（ht-name-hours），行内列序 = 名称 → 平均/h → 总 token → 占比
+  assert.match(appJs, /ht-name-hours/, '默认态行名称格应为 ht-name-hours 结构（.t 名称 + .h 小时缀）');
+  const defRowSrc = appJs.slice(appJs.indexOf('const defRow'), appJs.indexOf('框选模式（拖拽中或已锁定）'));
+  assert.ok(defRowSrc.includes('ht-name-hours'), '应能定位 defRow 源码段');
+  assert.ok(defRowSrc.indexOf('class="h">') > defRowSrc.indexOf('class="t">'), '小时缀应在名称文本之后');
+  assert.ok(defRowSrc.indexOf('ht-avg') > defRowSrc.indexOf('ht-name-hours'), '平均/h 列应在名称格之后');
+  assert.ok(defRowSrc.indexOf('ht-fixed') > defRowSrc.indexOf('ht-avg'), '总 token 列应在平均/h 之后');
+  // index.html：默认态小时缀样式（.t 省略号 + .h 弱化色缀，flex 行为与 .ht-name 一致）
+  assert.match(indexHtml, /\.ht-name\.ht-name-hours/, '应有默认态小时缀样式 .ht-name-hours');
+  // 默认态不放操作说明文字行；框选态提示保留（回归锚）
+  assert.ok(!appJs.includes('悬浮柱体 → 该时段构成'), '默认态不应有操作说明文字行（hourly-avg-active-hours）');
+  assert.ok(appJs.includes('框选模式：悬浮已停用'), '框选态提示应保留（hourly-bar-drag-select 回归锚）');
+});
+
+/* ===== custom-scan-roots：自定义扫描目录入口 / 弹窗 / 停用标注 ===== */
+
+const scanRootsJs = readFileSync(join(webRoot, 'scan-roots.js'), 'utf8');
+
+test('自定义扫描目录：设置入口与配置弹窗骨架', () => {
+  assert.match(indexHtml, /id="settingsItemRoots"/, '设置弹窗应有「自定义扫描目录」入口');
+  assert.match(indexHtml, /id="settingsRootsMeta"/, '入口应显示条数 meta');
+  assert.match(indexHtml, /id="scanRootsModal"/, '应有近全屏配置弹窗');
+  assert.match(indexHtml, /id="srList"/, '弹窗应有左列表容器');
+  assert.match(indexHtml, /id="srEditor"/, '弹窗应有右编辑器容器');
+  assert.match(indexHtml, /<script src="\.\/scan-roots\.js"><\/script>/, '应引入 scan-roots.js');
+});
+
+test('自定义扫描目录：scan-roots.js 调用配置 API 并导出入口', () => {
+  assert.ok(scanRootsJs.includes('window.scanRoots = { open, refreshMeta }'), '应导出 window.scanRoots 入口');
+  assert.ok(scanRootsJs.includes("'/api/scan-roots'") || scanRootsJs.includes('"/api/scan-roots"'), '应调用 GET /api/scan-roots');
+  for (const ep of ["'/api/scan-roots/probe'", "'/api/scan-roots/'"]) {
+    assert.ok(scanRootsJs.includes(ep), '应调用 ' + ep);
+  }
+  assert.match(scanRootsJs, /已停用/, '条目状态应含「已停用」标注');
+  assert.match(scanRootsJs, /hasData/, '删除按钮应受 hasData 约束');
+});
+
+test('自定义扫描目录：工具下拉对停用虚拟工具标注「已停用」', () => {
+  assert.match(appJs, /已停用/, 'app.js 下拉项应支持「已停用」标注');
+  assert.match(appJs, /filter\(\(t\) => t\.enabled === false\)/, '应按 enabled === false 识别停用项');
+});
